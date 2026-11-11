@@ -8,6 +8,6 @@
 void peanuts_tick(void);
 
 // The newest snapshot as text lines "key=value\n" (frames, build, the chains file's state, then each named value; a chain that fails reads "?"): the length written
-size_t nxhost_peanuts_snapshot(char *out, size_t n);
+__attribute__((visibility("default"))) size_t nxhost_peanuts_snapshot(char *out, size_t n);   // exported like the launcher interface (libnxhost.map nxhost_*; the host builds hidden)
 
 #endif
