@@ -46,6 +46,14 @@ typedef struct PnRtPad {
     void (*set_stick)(void* user, size_t player, int stick, float x, float y);
 } PnRtPad;
 
+/// Optional haptics: at most one pulse per pn_rt_tick (the runtime's own one-haptic-per-tick
+/// rule), already turned into an amplitude/duration pair (PnRtHaptics::pulse) from the
+/// manifest's HapticStrength/HapticKind. NULL = none (haptics are silently dropped).
+typedef struct PnRtHaptics {
+    void* user;
+    void (*pulse)(void* user, float amplitude_0_1, uint32_t ms);
+} PnRtHaptics;
+
 typedef void (*PnRtLogFn)(int level, const char* where, const char* message);
 
 typedef struct PnRtConfig {
@@ -64,8 +72,9 @@ typedef struct PnRtConfig {
     uint32_t panel_w;
     uint32_t panel_h;
     PnRtMemory memory;
-    PnRtUiSink ui;   /* all fields may be NULL */
-    PnRtPad pad;     /* all fields may be NULL */
+    PnRtUiSink ui;       /* all fields may be NULL */
+    PnRtPad pad;         /* all fields may be NULL */
+    PnRtHaptics haptics; /* pulse may be NULL = no haptics */
     PnRtLogFn log;   /* NULL = stderr (and logcat on Android) */
     int log_level;   /* 0 trace .. 5 critical; messages below it are dropped (default 2 = info) */
     /// System language for "msbt:" texts: 0 = default (American English), else 1 + Eden's
@@ -89,7 +98,10 @@ void pn_rt_tick(PnRt* rt);
 /// than the previous call's was copied, 0 when nothing new (or nothing published yet).
 int pn_rt_frame(PnRt* rt, uint32_t* w, uint32_t* h, uint32_t* out_rgba, size_t out_capacity);
 
-/// Touch input in panel pixels. No-op for now (gesture handling is not lifted in R1).
+/// Touch input in panel pixels (scaled to the manifest's canvas size internally, as Eden's own
+/// hosts do). Call once per finger per tick; the runtime tracks every live finger_id across calls
+/// and feeds the full current set to the aux touch mailbox, so multi-finger gestures (pinch-zoom,
+/// drag-and-drop) work exactly as on a real second screen. `down` false removes that finger.
 void pn_rt_touch(PnRt* rt, uint32_t finger_id, uint32_t x, uint32_t y, int down);
 
 /// Switches to the page with this manifest id (e.g. "gear"). Returns 1 when found.

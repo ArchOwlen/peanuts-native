@@ -139,6 +139,59 @@ PnRtConfig MakeConfig(FakeMemory& mem, const std::string& package_dir, const cha
     return cfg;
 }
 
+/// Records every haptic pulse the runtime asks for (PnRtHaptics -> pn_rt_touch tests).
+struct HapticLog {
+    struct Pulse {
+        float amplitude;
+        uint32_t ms;
+    };
+    std::vector<Pulse> pulses;
+    static void Fn(void* user, float amplitude, uint32_t ms) {
+        static_cast<HapticLog*>(user)->pulses.push_back({amplitude, ms});
+    }
+};
+
+/// Settles a few ticks (16ms apart) without touching the page; used after a touch so the redraw
+/// worker has a chance to republish.
+void Settle(PnRt* rt, int ticks = 20) {
+    for (int i = 0; i < ticks; ++i) {
+        pn_rt_tick(rt);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+}
+
+/// One tap at canvas-space (x,y): finger down for one tick, then released for one tick -- the
+/// minimum UpdateGestures needs to see a press-and-release with no travel as a tap (mod_input.cpp
+/// DrainTaps runs synchronously inside the same pn_rt_tick that sees the release).
+void Tap(PnRt* rt, uint32_t finger, uint32_t x, uint32_t y) {
+    pn_rt_touch(rt, finger, x, y, 1);
+    pn_rt_tick(rt);
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    pn_rt_touch(rt, finger, x, y, 0);
+    pn_rt_tick(rt);
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+}
+
+/// Grabs whatever frame is current (ticking a little first if none has been published yet) and
+/// writes it to `out`.
+bool CapturePng(PnRt* rt, const std::filesystem::path& out) {
+    uint32_t w{}, h{};
+    std::vector<uint32_t> pixels;
+    for (int tick = 0; tick < 120; ++tick) {
+        uint32_t fw{}, fh{};
+        if (pn_rt_frame(rt, &fw, &fh, nullptr, 0)) {
+            pixels.resize(static_cast<size_t>(fw) * fh);
+            if (pn_rt_frame(rt, &w, &h, pixels.data(), pixels.size())) {
+                return WritePng(out, w, h, pixels);
+            }
+        }
+        pn_rt_tick(rt);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    std::fprintf(stderr, "rt_test: CapturePng: no frame for %s\n", out.string().c_str());
+    return false;
+}
+
 /// A minimal package whose one page prints the two fake values with the built-in font.
 std::string WriteProbePackage(const std::filesystem::path& out_dir) {
     const auto pkg = out_dir / "probe_package";
@@ -201,6 +254,85 @@ int main(int argc, char** argv) {
             return 1;
         }
         failures += !RenderPage(rt, nullptr, out_dir / "probe.png");
+        pn_rt_destroy(rt);
+    }
+    // --- R2 interaction: touch -> AuxRouting -> mod_input.cpp/mod_actions.cpp, on the real LA
+    // package. The panel is set to the manifest's own canvas size (1240x1080) so the touch
+    // coordinates handed to pn_rt_touch equal canvas pixels exactly (to_canvas_x/y is then the
+    // identity), which is all that matters for hitting these two widgets.
+    const auto interact_dir = out_dir / "out-romfs2";
+    std::filesystem::create_directories(interact_dir);
+    HapticLog haptics;
+    {
+        // (a) Tap the gear page's "Close" button (rect [30,962,1180,118], on_tap "page_map_from_gear"):
+        // must switch the current page away from "gear".
+        PnRtConfig cfg = MakeConfig(mem, package_dir, romfs_dir);
+        cfg.panel_w = 1240;
+        cfg.panel_h = 1080;
+        cfg.haptics = {&haptics, &HapticLog::Fn};
+        PnRt* rt = pn_rt_create(&cfg);
+        if (rt == nullptr) {
+            std::fprintf(stderr, "rt_test: pn_rt_create failed for the touch test\n");
+            return 1;
+        }
+        failures += !RenderPage(rt, "gear", interact_dir / "gear_before_close.png");
+        char status[256];
+        pn_rt_status(rt, status, sizeof(status));
+        std::printf("rt_test: before Close tap: %s\n", status);
+
+        Tap(rt, /*finger=*/1, /*x=*/30 + 1180 / 2, /*y=*/962 + 118 / 2); // (620, 1021)
+        Settle(rt, 10);
+
+        pn_rt_status(rt, status, sizeof(status));
+        std::printf("rt_test: after Close tap: %s\n", status);
+        const bool page_switched = std::strstr(status, "page=map") != nullptr;
+        if (!page_switched) {
+            std::fprintf(stderr, "rt_test: FAILED: Close tap did not switch off the gear page\n");
+        }
+        failures += !page_switched;
+        failures += !CapturePng(rt, interact_dir / "gear_after_close.png");
+        std::printf("rt_test: haptic pulses so far: %zu\n", haptics.pulses.size());
+        pn_rt_destroy(rt);
+    }
+    {
+        // (b) On the gear page: tap item disc "cell_8" (ItemMagicPowder, payload 8, select_group
+        // "gear"), then tap the X slot ("drop_X", drop_action "equip_x", accept_group "gear").
+        // The tap-then-tap path in DrainTaps (mod_input.cpp) carries the selection into RunAction's
+        // ActionKind::Write for "equip_x" (point "equip_x" = main+0x1CC0783, u8), which must write
+        // the fake memory through PnRtMemory.write.
+        mem.Poke<uint8_t>(MainBase + 0x1CC0783, 0xFF);        // X slot: "empty" sentinel
+        mem.Poke<uint32_t>(MainBase + 0x1CC0788, 1u << 8);    // own_8 (bit 8): the Magic Powder is owned
+
+        PnRtConfig cfg = MakeConfig(mem, package_dir, romfs_dir);
+        cfg.panel_w = 1240;
+        cfg.panel_h = 1080;
+        PnRt* rt = pn_rt_create(&cfg);
+        if (rt == nullptr) {
+            std::fprintf(stderr, "rt_test: pn_rt_create failed for the equip test\n");
+            return 1;
+        }
+        failures += !RenderPage(rt, "gear", interact_dir / "gear_before_equip.png");
+
+        uint8_t before{};
+        FakeMemory::Read(&mem, MainBase + 0x1CC0783, &before, sizeof(before));
+        std::printf("rt_test: main+0x1CC0783 (equip_x) before = 0x%02X\n", before);
+
+        Tap(rt, 1, 85 + 164 / 2, 137 + 164 / 2);     // cell_8 center (167, 219): select payload 8
+        Settle(rt, 2);
+        Tap(rt, 1, 1040 + 196 / 2, 211 + 204 / 2);   // drop_X center (1138, 313): tap-drop equip_x
+        Settle(rt, 10);
+
+        uint8_t after{};
+        FakeMemory::Read(&mem, MainBase + 0x1CC0783, &after, sizeof(after));
+        std::printf("rt_test: main+0x1CC0783 (equip_x) after  = 0x%02X\n", after);
+        const bool equipped = after == 8;
+        if (!equipped) {
+            std::fprintf(stderr,
+                         "rt_test: FAILED: equip_x was not written (expected 0x08, got 0x%02X)\n",
+                         after);
+        }
+        failures += !equipped;
+        failures += !CapturePng(rt, interact_dir / "gear_after_equip.png");
         pn_rt_destroy(rt);
     }
     std::printf("rt_test: %s\n", failures == 0 ? "OK" : "FAILED");

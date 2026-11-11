@@ -28,7 +28,9 @@ file(MAKE_DIRECTORY ${PNRT_INC_ROOT}/core)
 file(CREATE_LINK ${PNRT_DIR}/mods ${PNRT_INC_ROOT}/core/mods SYMBOLIC)
 
 set(PNRT_LIFTED
+  mods/mod_actions.cpp
   mods/mod_assets.cpp
+  mods/mod_input.cpp
   mods/mod_load_plan.cpp
   mods/mod_manifest.cpp
   mods/mod_map.cpp

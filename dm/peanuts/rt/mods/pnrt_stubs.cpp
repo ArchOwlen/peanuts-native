@@ -1,8 +1,11 @@
-// PNRT: stubs for the ModRuntime members whose defining files are NOT lifted in R1
-// (mod_actions.cpp, mod_input.cpp, mod_guest_bridge.cpp, mod_module*.cpp, engine_*.cpp). Each is the smallest body that keeps the lifted callers
-// correct: "nothing happened" results (no-op, nullptr, nullopt, false, Skipped). The one
-// exception is RunAction's Page case, copied from mod_actions.cpp so that the manifest's
-// page_binds (mod_pages.cpp) can still switch pages. See PORT.md for the full list.
+// PNRT: stubs for the ModRuntime members whose defining files are NOT lifted
+// (mod_guest_bridge.cpp, mod_module*.cpp, engine_*.cpp). Each is the smallest body that keeps the
+// lifted callers correct: "nothing happened" results (no-op, nullptr, nullopt, false, Skipped).
+// mod_actions.cpp and mod_input.cpp are lifted as of R2 (interaction); the three guest-bridge /
+// module entry points RunAction still reaches (Call, Sequence, Module) are stubbed here, each
+// logging "unsupported on this host" and otherwise doing nothing -- RunAction itself still
+// reports ActionResult::Done for them (fire-and-forget, as in Eden). See PORT.md for the full
+// list.
 
 #include <algorithm>
 #include <chrono>
@@ -18,93 +21,16 @@
 
 namespace Core::Mods {
 
-
-// --- mod_actions.cpp ---------------------------------------------------------------------------
-InputCommon::VirtualGamepad::VirtualButton ParseButton(const std::string& name, bool& ok) {
-    using VB = InputCommon::VirtualGamepad::VirtualButton;
-    ok = true;
-    if (name == "A") return VB::ButtonA;
-    if (name == "B") return VB::ButtonB;
-    if (name == "X") return VB::ButtonX;
-    if (name == "Y") return VB::ButtonY;
-    if (name == "L") return VB::TriggerL;
-    if (name == "R") return VB::TriggerR;
-    if (name == "ZL") return VB::TriggerZL;
-    if (name == "ZR") return VB::TriggerZR;
-    if (name == "Plus") return VB::ButtonPlus;
-    if (name == "Minus") return VB::ButtonMinus;
-    if (name == "DUp") return VB::ButtonUp;
-    if (name == "DDown") return VB::ButtonDown;
-    if (name == "DLeft") return VB::ButtonLeft;
-    if (name == "DRight") return VB::ButtonRight;
-    ok = false;
-    return VB::ButtonA;
+// --- mod_guest_bridge.cpp (guest-call sequences / RunAction's Call & Sequence kinds) -----------
+void ModRuntime::StartSequence(const std::string& name, const CallSequence&,
+                               const StateSnapshot&) {
+    LOG_WARNING(Core, "DSMod: sequence '{}' unsupported on this host (no guest-call bridge)",
+               name);
 }
-
-ModRuntime::ActionResult ModRuntime::RunAction(const Action& action, const StateSnapshot& snapshot,
-                                               std::optional<s64> payload,
-                                               const std::array<s32, 4>* tap_origin) {
-    // Only ActionKind::Page is served (verbatim from mod_actions.cpp, minus the explicit
-    // "origin" widget lookup, which needs FindWidgetRect); every other kind is Skipped.
-    if (action.kind != ActionKind::Page) {
-        return ActionResult::Skipped;
-    }
-    const size_t before = current_page;
-    bool found = false;
-    for (size_t i = 0; i < manifest.pages.size(); ++i) {
-        if (manifest.pages[i].id == action.page) {
-            current_page = i;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        return ActionResult::Skipped;
-    }
-    if (current_page != before && action.transition != PageTransition::None &&
-        action.duration_ms > 0) {
-        std::array<s32, 4> origin{};
-        if ((action.transition == PageTransition::Grow ||
-             action.transition == PageTransition::Shrink) &&
-            action.origin.empty() && tap_origin != nullptr) {
-            origin = *tap_origin;
-        }
-        page_anim_request = PageAnimRequest{before,          current_page,  action.transition,
-                                            action.duration_ms, action.easing, action.shadow,
-                                            origin};
-    } else if (current_page != before) {
-        page_anim_request.reset();
-    }
-    return ActionResult::Done;
+void ModRuntime::RequestCall(const Action& action, const StateSnapshot&) {
+    LOG_WARNING(Core, "DSMod: call action '{}' unsupported on this host (no guest-call bridge)",
+               action.name);
 }
-void ModRuntime::UpdateHeldButtons() {}
-void ModRuntime::ReleaseHeldInputs() {}
-void ModRuntime::DriveInputScript() {}
-void ModRuntime::DriveLiveInput() {}
-
-// --- mod_input.cpp -----------------------------------------------------------------------------
-void ModRuntime::DrainTaps(const StateSnapshot&) {}
-void ModRuntime::PublishMapState(StateSnapshot&) {}
-void ModRuntime::PublishScroll(StateSnapshot&, bool) {}
-void ModRuntime::PublishInteraction(StateSnapshot&) {}
-void ModRuntime::UpdateGestures(const StateSnapshot&, std::span<const VideoCore::DSMod::AuxTouchPoint>,
-                                size_t, u32, u32, u32, u32) {}
-void ModRuntime::ReturnIdleViews() {}
-void ModRuntime::ApplyViewCorrections() {}
-void ModRuntime::ResetInteraction(const char*) {}
-void ModRuntime::FlushHaptic() {
-    pending_haptic = {};
-}
-void ModRuntime::DriveCmdDrag(u32, u32, u32, u32) {}
-ViewState ModRuntime::GetViewState() const {
-    std::scoped_lock lock{view_mutex};
-    return view_state;
-}
-bool ModRuntime::GlideViews() {
-    return false;
-}
-
-// --- mod_guest_bridge.cpp ----------------------------------------------------------------------
 void ModRuntime::ArmSpies() {}
 void ModRuntime::ApplyPatches() {}
 void ModRuntime::DrainGuestBridgeResults() {}
@@ -144,6 +70,9 @@ std::vector<u8> ModRuntime::ExtractArchiveMember(std::span<const u8>, const std:
 
 // --- mod_module.cpp / mod_module_host.cpp / mod_module_services.cpp ----------------------------
 GameModule::~GameModule() = default;
+void ModRuntime::RunModuleAction(const std::string& name, s64) {
+    LOG_WARNING(Core, "DSMod: module action '{}' unsupported on this host (no game module)", name);
+}
 void ModRuntime::InitializeGameModule() {
     game_module.reset();
     game_module_instance = nullptr;

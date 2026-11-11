@@ -54,12 +54,18 @@ struct PnRt {
     PnRtConfig config{};
     PnRtMemory memory{};
     PnRtPad pad{};
+    PnRtHaptics haptics{};
     Core::System system;
     std::optional<Core::Mods::ModRuntime> runtime;
     std::string last_error;
     u64 frame_serial{0};
     u64 frames_taken{0};
     std::vector<u32> frame_scratch;
+    // Live fingers (pn_rt_touch), fed to the aux touch mailbox as the full current set each call,
+    // exactly as Eden's SDL3/Android hosts do (yuzu_cmd/emu_window/emu_window_sdl3_aux.cpp,
+    // android/.../native_input.cpp: one SetTouch per input event, carrying every finger still
+    // down, bit0 set only for a finger just starting).
+    std::vector<VideoCore::DSMod::AuxTouchPoint> live_touches;
 };
 
 namespace {
@@ -84,6 +90,19 @@ void PadStick(void* user, std::size_t player, int stick, float x, float y) {
     auto* const p = static_cast<PnRtPad*>(user);
     if (p->set_stick) p->set_stick(p->user, player, stick, x, y);
 }
+
+// Eden's HapticEvent{strength, kind, flags} -> amplitude/duration. Eden itself hands this exact
+// triple to a frontend callback (android/.../native.cpp PlayAuxHaptic -> NativeLibrary.onAuxHaptic)
+// and lets Kotlin pick an amplitude/duration from the Android Vibrator API; there is no portable
+// C++ table to lift, so this is PNRT's own reasonable mapping (not reproduced from Eden).
+constexpr std::array<std::pair<float, uint32_t>, 6> kHapticAmplitudeMs{{
+    {0.0f, 0u},   // Off
+    {0.20f, 18u}, // Light
+    {0.35f, 22u}, // Click
+    {0.50f, 32u}, // Confirm
+    {0.80f, 45u}, // Heavy
+    {0.65f, 55u}, // Reject
+}};
 
 std::array<u8, 0x20> ParseBuildId(const char* hex) {
     std::array<u8, 0x20> out{};
@@ -121,6 +140,7 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
     rt->config = *config;
     rt->memory = config->memory;
     rt->pad = config->pad;
+    rt->haptics = config->haptics;
     auto& sys = rt->system;
     sys.title_id = config->title_id;
     sys.memory.SetBackend({&rt->memory, &MemRead, &MemWrite, &MemPointer});
@@ -138,6 +158,17 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
     aux.present.store(true);
     aux.SetUiSink({config->ui.user, config->ui.publish_ui, config->ui.publish_ui_partial,
                    config->ui.clear_ui});
+    aux.SetHapticSink([haptics = &rt->haptics](const VideoCore::DSMod::AuxRouting::HapticEvent& e) {
+        if (haptics->pulse == nullptr) {
+            return;
+        }
+        const size_t idx = std::min<size_t>(e.strength, kHapticAmplitudeMs.size() - 1);
+        const auto [amplitude, ms] = kHapticAmplitudeMs[idx];
+        if (amplitude <= 0.0f || ms == 0) {
+            return;
+        }
+        haptics->pulse(haptics->user, amplitude, ms);
+    });
 
     const auto build_id = ParseBuildId(config->build_id_hex);
     auto manifest = Core::Mods::ModRuntime::Discover(sys, config->title_id, build_id);
@@ -190,10 +221,30 @@ void pn_rt_touch(PnRt* rt, uint32_t finger_id, uint32_t x, uint32_t y, int down)
     if (rt == nullptr) {
         return;
     }
-    // Fed to the aux touch mailbox; the gesture consumers (mod_input.cpp) are stubs in R1, so this
-    // is a no-op in effect until they are lifted.
-    VideoCore::DSMod::AuxTouchPoint point{finger_id, x, y, down ? 1u : 2u, 0};
-    rt->system.gpu.DSModAux().SetTouch(std::span<const VideoCore::DSMod::AuxTouchPoint>{&point, 1});
+    auto& touches = rt->live_touches;
+    const auto it = std::find_if(touches.begin(), touches.end(), [&](const auto& p) {
+        return p.finger_id == finger_id;
+    });
+    if (!down) {
+        // Matches Eden's own hosts (yuzu_cmd SDL3 aux window, Android native_input.cpp): a
+        // released finger is simply left out of the next SetTouch call, never flagged with
+        // attribute bit1 ("end") -- that bit is for a guest-side touch pass-through, unused here.
+        if (it != touches.end()) {
+            touches.erase(it);
+        }
+    } else if (it == touches.end()) {
+        // Newly down: attribute bit0 marks the start, exactly once (AuxRouting::GetTouch's latch
+        // rule clears it for the runtime after the first poll that sees it).
+        touches.push_back(VideoCore::DSMod::AuxTouchPoint{finger_id, x, y, 1u, 0});
+    } else {
+        it->x = x;
+        it->y = y;
+        it->attributes = 0u; // already down: a move, not a new start
+    }
+    if (touches.size() > VideoCore::DSMod::AuxRouting::MaxTouch) {
+        touches.resize(VideoCore::DSMod::AuxRouting::MaxTouch);
+    }
+    rt->system.gpu.DSModAux().SetTouch(touches);
 }
 
 int pn_rt_set_page(PnRt* rt, const char* page_id) {

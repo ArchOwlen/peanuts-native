@@ -28,7 +28,7 @@ hunks listed below (`diff -u ~/eden/src/core/mods/X mods/X` shows exactly them).
 
 ## Lifted (compiled) files
 
-mod_assets.cpp, mod_load_plan.cpp, mod_manifest.cpp, mod_map.cpp, mod_msbt.cpp, mod_pages.cpp,
+mod_actions.cpp (R2), mod_assets.cpp, mod_input.cpp (R2), mod_load_plan.cpp, mod_manifest.cpp, mod_map.cpp, mod_msbt.cpp, mod_pages.cpp,
 mod_nx_assets.cpp, mod_nx_runtime.cpp (R1b), mod_redraw.cpp, mod_runtime.cpp, mod_state.cpp, mod_ui.cpp, mod_ui_canvas.cpp, mod_ui_expand.cpp,
 mod_ui_image.cpp, mod_ui_map_widget.cpp, mod_ui_scroll.cpp, mod_ui_text.cpp,
 mod_ui_transitions.cpp, mod_ui_widget_state.cpp; headers mod_types*.h, mod_ui*.h, mod_msbt.h,
@@ -76,11 +76,19 @@ Everything else in `mods/` is byte-identical to Eden.
 
 ## Stubs (mods/pnrt_stubs.cpp): members of files not lifted
 
-- **mod_actions.cpp**: `ParseButton` (copied verbatim), `RunAction` (ONLY `ActionKind::Page` served, copied from Eden minus the `origin` widget lookup; other kinds return Skipped -- so page_binds work, taps/writes/calls do not), `UpdateHeldButtons`, `ReleaseHeldInputs`, `DriveInputScript`, `DriveLiveInput` (no-ops).
-- **mod_input.cpp**: `DrainTaps`, `PublishMapState`, `PublishScroll`, `PublishInteraction`, `UpdateGestures`, `ReturnIdleViews`, `ApplyViewCorrections`, `ResetInteraction`, `FlushHaptic`, `DriveCmdDrag` (no-ops); `GetViewState` (returns view_state), `GlideViews` (false). Touch is therefore a no-op end to end (pn_rt_touch fills the aux mailbox; nothing consumes it).
-- **mod_guest_bridge.cpp**: `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences` (no-ops), `ScanPattern` (nullopt).
+mod_actions.cpp and mod_input.cpp are fully lifted as of R2 -- see "Verified R2" below. What
+remains stubbed:
+
+- **mod_guest_bridge.cpp** (also: RunAction's Call/Sequence kinds, mod_actions.cpp): `RequestCall`,
+  `StartSequence` (log "unsupported on this host", no-op; RunAction still returns `Done`),
+  `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences` (no-ops), `ScanPattern`
+  (nullopt).
 - **engine_il2cpp/mercury/ichigo.cpp**: `FindClassSlotByName`, `DetectMethodsOffset`, `FindPlayerNode` (nullopt); `DecodeBctex`, `DecodeSosXtx`, `ParseMfnt`, `ParseSosFont` (false); `DecodeLzss`, `ExtractArchiveMember` (empty).
-- **mod_module*.cpp**: `GameModule::~GameModule`, `InitializeGameModule` (module = none), `ShutdownGameModule`, `RunGameModule`, `DrainModuleImages`, `InstallModuleAreas`, `ApplyPendingMapUpdates` (no-ops), `LoadModuleData` (empty), `GetModuleImage` (nullptr), `LoadModuleImageSync` (false), `LockMapStateUnlessRaster` (copied verbatim: it is generic).
+- **mod_module*.cpp** (also: RunAction's Module kind, mod_actions.cpp): `RunModuleAction` (log
+  "unsupported on this host", no-op), `GameModule::~GameModule`, `InitializeGameModule` (module =
+  none), `ShutdownGameModule`, `RunGameModule`, `DrainModuleImages`, `InstallModuleAreas`,
+  `ApplyPendingMapUpdates` (no-ops), `LoadModuleData` (empty), `GetModuleImage` (nullptr),
+  `LoadModuleImageSync` (false), `LockMapStateUnlessRaster` (copied verbatim: it is generic).
 - **mod_nx_runtime.cpp / mod_nx_assets.cpp**: no stubs since R1b (both lifted as-is).
 - Dev tools (`mod_re_tools.cpp`, `mod_console.cpp`): compiled out by `EDEN_DSMOD_BUILD_DEV_TOOLS=0` (the shells in mod_runtime.cpp are already empty then).
 
@@ -106,12 +114,50 @@ Awakening logo and the bomb/rupee/heart icons (SARC -> BNTX, ASTC/BC decoded on 
 item discs and X/Y slots (composites `cell_disc`/`slot_disc`/`tab_cap`), rupee icon + live 123.
 Without a romfs dir the behaviour is as in R1a (logged "not found", blank). arm64 lib rebuilt.
 
-## Known gaps / R1c candidates
+## Verified R2 (host, 2026-11-11): interaction
 
-- No touch/gestures/actions beyond page switches: mod_input.cpp and mod_actions.cpp depend only
-  on the aux/pad shims already written; lifting them replaces most of pnrt_stubs.cpp.
+mod_input.cpp and mod_actions.cpp are now lifted byte-identical (no PNRT hunks needed -- every
+symbol they call was already in mods/ or the shims). `pnrt_stubs.cpp` keeps only the guest-bridge
+(mod_guest_bridge.cpp), module (mod_module*.cpp) and engine (engine_*.cpp) stubs; `RequestCall`,
+`StartSequence` and `RunModuleAction` (RunAction's Call/Sequence/Module kinds) are now real stub
+bodies that log "unsupported on this host" and otherwise no-op (RunAction still reports `Done`,
+fire-and-forget, as Eden does for these kinds). `ParseButton` and the Page-only `RunAction` that
+used to live in pnrt_stubs.cpp are gone -- mod_actions.cpp's real versions took over.
+
+`pn_rt_touch` now tracks every live finger_id (`PnRt::live_touches`) across calls and feeds
+`AuxRouting::SetTouch` the full current set each time, attribute bit0 set only on the tick a
+finger first appears (matches Eden's own hosts: yuzu_cmd/emu_window/emu_window_sdl3_aux.cpp,
+android/.../native_input.cpp -- neither ever sets bit1 "end"; a released finger is just left out
+of the next call). `PnRtHaptics` (new in peanuts_rt.h) is wired to `AuxRouting::SetHapticSink` in
+pn_rt_create: Eden's `HapticEvent{strength,kind,flags}` is turned into an amplitude/duration pair
+by a small table in peanuts_rt.cpp (`kHapticAmplitudeMs`) -- this table is PNRT's own, not lifted
+from Eden (Eden hands the raw triple to the Android frontend, which picks amplitude/duration in
+Kotlin; no portable C++ table exists to copy).
+
+`rt_test <LA package> <out> <romfs>` (out-romfs2/): tapping the gear page's "Close" button (rect
+[30,962,1180,118], canvas pixels, `on_tap`→`page_map_from_gear`) switches `pn_rt_status`'s page
+from `gear` to `map` (gear_before_close.png / gear_after_close.png) and raises one haptic pulse.
+Tapping item disc `cell_8` (payload 8, select_group "gear") then the X slot `drop_X`
+(drop_action `equip_x`, accept_group "gear") runs the tap-then-tap path in DrainTaps into
+`RunAction`'s `ActionKind::Write` for `equip_x` (point `equip_x` = main+0x1CC0783, u8): the fake
+guest memory at that address goes from the "empty" sentinel 0xFF to 0x08 through
+`PnRtMemory.write`, exactly as the manifest's action describes it (gear_before_equip.png /
+gear_after_equip.png). ASan build (Linux, `-fsanitize=address -fno-omit-frame-pointer`): clean run
+of the whole test binary (which exercises every touch path), no reports. arm64 Android rebuilds
+clean (same toolchain as R1/R1b) with all three new/changed symbols present.
+
+Not reproduced: the pan/pinch-zoom gesture path (`UpdateGestures`'s two-finger branch) is lifted
+but untested -- the LA package's map page uses `pan_zoom` on its map widget, so it should work,
+but rt_test does not drive a second finger (optional per the R2 task). The haptic amplitude/
+duration table is PNRT's own invention, not a lift of Eden's Android-side mapping (see above).
+
+## Known gaps / R2c candidates
+
 - `Core::System::ApplicationProcess()` is nullptr: heap-region sweeps (ArrayFind/PlayerFind
   points) use the fixed fallback window; hosts can fill `System::process` later.
 - The page is published at ~30 Hz (every other tick) from the runtime's own redraw worker
   thread; the host must keep calling pn_rt_tick for frames to appear.
-- `Settings::IsNceEnabled()` = true permanently: no BRK guest bridge, by design.
+- `Settings::IsNceEnabled()` = true permanently: no BRK guest bridge, by design -- Call/Sequence/
+  Module actions are logged "unsupported on this host" and otherwise no-op.
+- No pan/pinch-zoom or drag-and-drop coverage in rt_test (optional for R2; the code path is
+  lifted and should work, matching Eden's UpdateGestures).

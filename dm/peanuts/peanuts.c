@@ -311,6 +311,26 @@ static uint8_t *rt_mem_pointer(void *u, uint64_t addr, size_t len) {   // guest 
     if (!len || plat_mem_read(addr, &b, 1) || plat_mem_read(addr + len - 1, &b, 1)) return NULL;
     return (uint8_t *)(uintptr_t)addr;
 }
+// The companion's virtual pad: the host's keyboard/touch/scripted source (dm_input_set), ORed with player 1's real controller by the HID service — the same semantics as
+// Eden Duo's virtual gamepad. The runtime's button ids are nn::hid::NpadButton bit order (dm_input.h), sticks -1..1 → ±DM_STICK_MAX
+#include "../host/dm_input.h"
+static uint64_t g_vpad_btn; static int32_t g_vpad[4];
+static pthread_mutex_t g_vpad_mu = PTHREAD_MUTEX_INITIALIZER;
+static void rt_pad_button(void *u, size_t player, int button, int pressed) {
+    (void)u; if (player != 0 || button < 0 || button > 15) return;
+    pthread_mutex_lock(&g_vpad_mu);
+    if (pressed) g_vpad_btn |= 1ull << button; else g_vpad_btn &= ~(1ull << button);
+    dm_input_set(g_vpad_btn, g_vpad[0], g_vpad[1], g_vpad[2], g_vpad[3]);
+    pthread_mutex_unlock(&g_vpad_mu);
+}
+static void rt_pad_stick(void *u, size_t player, int stick, float x, float y) {
+    (void)u; if (player != 0 || stick < 0 || stick > 1) return;
+    pthread_mutex_lock(&g_vpad_mu);
+    g_vpad[stick * 2] = (int32_t)(x * DM_STICK_MAX); g_vpad[stick * 2 + 1] = (int32_t)(y * DM_STICK_MAX);
+    dm_input_set(g_vpad_btn, g_vpad[0], g_vpad[1], g_vpad[2], g_vpad[3]);
+    pthread_mutex_unlock(&g_vpad_mu);
+}
+
 static void rt_log(int level, const char *where, const char *msg) {
     __android_log_print(level >= 4 ? ANDROID_LOG_ERROR : level == 3 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "peanuts", "[rt] %s: %s", where ? where : "", msg ? msg : "");
 }
@@ -361,13 +381,18 @@ static void rt_start(void) {
     c.main_size = m->size;
     c.panel_w = 1240; c.panel_h = 1080;
     c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer;
+    c.pad.set_button = rt_pad_button; c.pad.set_stick = rt_pad_stick;
     c.log = rt_log; c.log_level = 2;
     g_rt = pn_rt_create(&c);
     __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s (title %016" PRIx64 ", build %s, romfs %s): %s", dir, title, m->build_id, c.romfs_dir ? c.romfs_dir : "none", g_rt ? "loaded" : "not loaded");
 }
 
-static void rt_tick(void) {
-    if (!g_rt) { if (!g_rt_tried && g_nmod > 0) rt_start(); return; }
+// The runtime ticks on a thread of its own, once per presented frame (the present thread only signals), so its sampling and page logic never cost the game a frame
+static pthread_mutex_t g_tick_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tick_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t g_tick_signalled, g_tick_done;
+
+static void rt_tick_once(void) {
     pn_rt_tick(g_rt);
     uint32_t w = 0, h = 0;
     pn_rt_frame(g_rt, &w, &h, NULL, 0);
@@ -376,6 +401,35 @@ static void rt_tick(void) {
     if (w != g_frame_w || h != g_frame_h) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_frame_w = w; g_frame_h = h; }
     if (g_frame && pn_rt_frame(g_rt, &w, &h, g_frame, (size_t)w * h)) g_frame_new = 1;
     pthread_mutex_unlock(&g_frame_mu);
+}
+
+static void *rt_thread(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "peanuts-tick");
+    for (;;) {
+        pthread_mutex_lock(&g_tick_mu);
+        while (g_tick_done == g_tick_signalled) {   // at most one tick per presented frame; a stalled present (the game paused) still ticks at 20 Hz for the page's own animations
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 50000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            if (pthread_cond_timedwait(&g_tick_cv, &g_tick_mu, &ts)) break;
+        }
+        g_tick_done = g_tick_signalled;
+        pthread_mutex_unlock(&g_tick_mu);
+        rt_tick_once();
+    }
+    return NULL;
+}
+
+static void rt_tick(void) {
+    if (!g_rt) {
+        if (g_rt_tried || g_nmod <= 0) return;
+        rt_start();
+        if (!g_rt) return;
+        pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&th, &at, rt_thread, NULL)) __android_log_print(ANDROID_LOG_ERROR, "peanuts", "tick thread failed");
+        pthread_attr_destroy(&at);
+        return;
+    }
+    pthread_mutex_lock(&g_tick_mu); g_tick_signalled++; pthread_cond_signal(&g_tick_cv); pthread_mutex_unlock(&g_tick_mu);
 }
 
 void nxhost_peanuts_frame_size(int *w, int *h) {
