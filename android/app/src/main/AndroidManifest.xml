@@ -23,6 +23,7 @@
         android:largeHeap="true"
         android:appCategory="game"
         android:hasFragileUserData="true">
+        <activity android:name="dev.peanuts.CatalogActivity" android:label="Peanuts Companions" android:exported="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>   <!-- PEANUTS: the companion catalog -->
         <activity
             android:name=".MainActivity"
             android:theme="@style/Theme.Banana"
