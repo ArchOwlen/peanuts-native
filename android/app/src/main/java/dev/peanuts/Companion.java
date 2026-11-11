@@ -17,6 +17,7 @@ public final class Companion {
     static final String TAG = "peanuts";
     private static CompanionPresentation shown;
     private static DisplayManager.DisplayListener listener;
+    private static android.content.Context held;   // the game hold's context while it runs (GameHold)
 
     private Companion() {}
 
@@ -31,9 +32,12 @@ public final class Companion {
         };
         dm.registerDisplayListener(listener, null);
         show(game, gameName, dm);
+        GameHold.start(game, gameName);
+        held = game.getApplicationContext();
     }
 
     public static void stop() {
+        if (held != null) { GameHold.stop(held); held = null; }
         if (shown != null) { try { shown.dismiss(); } catch (RuntimeException ignored) {} shown = null; }
         listener = null;   // the DisplayManager drops it with the activity's context
     }

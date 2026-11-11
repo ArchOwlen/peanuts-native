@@ -3,6 +3,8 @@
     <!-- All files access: the host opens the game folder and the pack folder by their /storage paths (POSIX open, not the Storage Access Framework) -->
     <!-- Vibrate: the game's rumble on the phone's motor when the controller has none (Rumble.java) -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />   <!-- PEANUTS: the game hold (dev.peanuts.GameHold) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />   <!-- PEANUTS -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <!-- Internet: the launcher's driver download (DriverFetch), on the user's tap, and the release app's update check (Updater) -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -25,6 +27,7 @@
         android:hasFragileUserData="true">
         <activity android:name="dev.peanuts.ui.LibraryActivity" android:label="Peanuts Native" android:exported="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>   <!-- PEANUTS: the library (home) -->
         <activity android:name="dev.peanuts.ui.SetupActivity" android:label="Setup" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />   <!-- PEANUTS: first-run setup -->
+        <service android:name="dev.peanuts.GameHold" android:exported="false" android:process=":game" android:foregroundServiceType="mediaPlayback" />   <!-- PEANUTS: keeps the game's process in the foreground group while the Thor's lid is closed -->
         <activity android:name="dev.peanuts.CatalogActivity" android:label="Peanuts Companions" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />   <!-- PEANUTS: the companion catalog (from the library's menu) -->
         <activity
             android:name=".MainActivity"
