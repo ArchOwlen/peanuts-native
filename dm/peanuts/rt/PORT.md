@@ -252,6 +252,42 @@ duration table is PNRT's own invention, not a lift of Eden's Android-side mappin
   `Core::Mods::GameModule::Load`, `ModRuntime::InitializeGameModule`, `SetModuleCacheDirectory`,
   `Common::DynamicLibrary::Open`, `SHA256` as defined `T` symbols. Not run on device.
 
+## R6 (2026-11-12): the game's RomFS from a .nup container (provider callbacks)
+
+C API, additive: `PnRtRomfs {user, open, read, close, list}` and `PnRtConfig::romfs` (last field).
+Used only when `romfs_dir` is NULL (or not a directory) and `open` + `read` are set; `list` is
+optional (NULL = no enumeration: only known paths open, `GetSubdirectory` is nullptr). Paths are
+RomFS-relative, '/'-separated, no leading slash; callbacks must be thread-safe (asset workers +
+tick thread). Shim: `FileSys::OpenProviderDirectory(const PnRtRomfs&)` (vfs.h / shim.cpp):
+`ProviderDir` / `ProviderFile` -- a file holds its handle for the VfsFile's life and reads ranges
+through `read` (no whole-image loads); `pn_rt_create` sets `System::romfs_root` to it, so
+"romfs:" and "base:" (BuildBase = RomfsRoot) both resolve through it. No lifted file changed.
+
+Host side (dm/peanuts/peanuts_nup.{h,c}, C, over dm/host/nup_image.h): `pn_nup_open(spec)` opens
+the package DM_ROMFS names (`<game>.nup:update/<v>/romfs`) as layer 0 and, when the selector is
+not `base` (and not empty), `<game>.nup:base` as layer 1. A lookup (`open`, `list`) tries the
+update first, then the base; `list` merges the two directories, the base's children only where the
+update does not name them. An update package already holds a full RomFS (android/NUP.md), so the
+base is a safety net; a base without a RomFS (Pokopia) is simply absent ("+ base (none: ...)").
+Raw entries: pread at the extent; zstd entries: `nup_z_get` on open, held until `close`
+(`nup_z_put`), memcpy from the decompressed buffer. peanuts.c: a DM_ROMFS that `pn_nup_is_spec`
+accepts goes through the provider; a folder keeps the base-folder rule as before. peanuts_nup.c
+must be added to the Android host's HOST_C list (android/host/CMakeLists.txt, beside peanuts.c).
+
+Tests (work dir <work dir>/nup-romfs-work): `rt_test <LA pkg> out
+<romfs>` and `... --provider` (a POSIX open/pread/readdir provider over the same folder, rt_test.cpp
+`DirProvider`) give byte-identical PNGs for all 7 images (standby, gear, probe, the 4 interaction
+PNGs); the provider run reports `17 opens, 404 reads, 40 lists`. `nup_test <spec> [path]`
+(test/nup_test.cpp + peanuts_nup.c + zstddeclib.c, Linux only: peanuts_nup.c is compiled with
+`__ANDROID__`/`__aarch64__`/`_ASM_X86_SIGCONTEXT_H` predefined because plat.h refuses other
+targets; `plat_sha256` comes from the shim's SHA256): Pokopia.nup update/655360 lists 4 root
+entries and reads LD_C0_R.BIN (247,317,504 bytes, zstd, via the temp-file map) and LI_C0_R.IDX
+whole; a nup_pack.py fixture with base + update/1 proves the layering (common.txt = the update's
+bytes, only_base.txt and sub/a.txt from the base, zstd sub/b.txt 300,000 bytes, root listed once
+per name). ASan (detect_leaks=1) clean on all three. arm64 libpeanuts_rt.a builds with
+`OpenProviderDirectory` and all `pn_rt_*`; peanuts_nup.c compiles for aarch64-linux-android33
+(needs plat_sha256 and the ZSTD_* symbols the host already links).
+
 ## Known gaps (R5)
 
 - Controller focus mode (mod_nav.cpp) and `PadIsPushed` compile but never engage: the HID shim

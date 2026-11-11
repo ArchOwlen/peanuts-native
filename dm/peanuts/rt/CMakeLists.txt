@@ -105,4 +105,17 @@ if(PEANUTS_RT_TEST)
   add_executable(rt_test test/rt_test.cpp)
   target_link_libraries(rt_test PRIVATE peanuts_rt)
   target_include_directories(rt_test PRIVATE ${PNRT_THIRD_PARTY}/stb ${PNRT_THIRD_PARTY})
+  # R6: the host's .nup RomFS provider (dm/peanuts/peanuts_nup.c over dm/host/nup_image.h) read on this PC. nup_image.h
+  # includes dm/host/plat/plat.h, which refuses any target but Apple / Android arm64: the provider unit alone is compiled
+  # as if for Android (declarations only; nothing of plat.h is called but plat_sha256, which nup_test defines over the
+  # shim's SHA256), with the x86 asm/sigcontext.h guard predefined so plat.h's <asm/sigcontext.h> stays out.
+  if(NOT ANDROID AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(nup_test test/nup_test.cpp ${PNRT_DIR}/../peanuts_nup.c ${PNRT_DIR}/../../third_party/zstd/zstddeclib.c)
+    target_link_libraries(nup_test PRIVATE peanuts_rt)
+    target_include_directories(nup_test PRIVATE ${PNRT_DIR}/..)
+    set_source_files_properties(${PNRT_DIR}/../peanuts_nup.c PROPERTIES
+      COMPILE_DEFINITIONS "DM_NUP_ZSTD;PN_NUP_HOST_TEST;__ANDROID__=1;__aarch64__=1;_ASM_X86_SIGCONTEXT_H"
+      COMPILE_OPTIONS "-Wno-unused-function;-std=gnu11")
+    set_source_files_properties(${PNRT_DIR}/../../third_party/zstd/zstddeclib.c PROPERTIES COMPILE_OPTIONS "-O2;-w")
+  endif()
 endif()

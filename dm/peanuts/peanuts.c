@@ -299,11 +299,13 @@ void peanuts_tick(void) {
 
 // ---- the companion runtime (rt/, the Eden Duo DSMod runtime): one package per title, found beside the pack ----
 // The pack is <game>/<title ID>-work/android-pack (dm_module_dir); companion packages are <game>/<title ID>-work/peanuts/<Package>/{package.json,dualscreen/}.
-// The game's RomFS (DM_ROMFS) is the runtime's romfs root when it is a plain folder (a .nup's inner path is not, yet).
+// The game's RomFS (DM_ROMFS) is the runtime's romfs root: a plain folder as a directory, a .nup's inner path through the provider callbacks of peanuts_nup.c.
 #include <android/log.h>
 #include <dirent.h>
+#include "peanuts_nup.h"
 
 static int g_rt_tried;
+static pn_nup *g_nup;   // the .nup RomFS layers behind the runtime's "romfs:" (for the process's life, as the runtime is)
 static uint32_t *g_frame; static uint32_t g_frame_w, g_frame_h; static int g_frame_new;
 static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -394,16 +396,21 @@ static void rt_start(void) {
     char dir[768]; uint64_t title = 0;
     if (!rt_find_package(dir, sizeof dir, &title)) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "no companion package beside %s", dm_module_dir()); return; }
     // The runtime's romfs root: the game's base RomFS folder (an update's folder is only its overlay: a few changed files). DM_ROMFS names the running version's folder,
-    // <game>/updates/<v>/romfs or <game>/base/romfs; a .nup's inner path is not a folder (not read yet)
+    // <game>/updates/<v>/romfs or <game>/base/romfs. For a .nup ("<game>.nup:update/<v>/romfs") the container is read in place through the provider callbacks
+    // (peanuts_nup.c): the named package's RomFS, the container's base package under it
     const char *romfs = getenv("DM_ROMFS");
     static char base_romfs[768];
-    if (romfs && !strstr(romfs, ".nup:")) {
+    PnRtConfig c = {0};
+    if (romfs && pn_nup_is_spec(romfs)) {
+        char why[256] = "";
+        if ((g_nup = pn_nup_open(romfs, why, sizeof why))) pn_nup_provider(g_nup, &c.romfs);
+        else __android_log_print(ANDROID_LOG_WARN, "peanuts", "companion romfs: cannot open %s: %s (the \"romfs:\" assets stay blank)", romfs, why);
+    } else if (romfs) {
         const char *u = strstr(romfs, "/updates/");
         struct stat st;
         if (u) snprintf(base_romfs, sizeof base_romfs, "%.*s/base/romfs", (int)(u - romfs), romfs);
         if (!u || stat(base_romfs, &st)) snprintf(base_romfs, sizeof base_romfs, "%s", romfs);   // a dump whose update folder holds the whole RomFS (no base/romfs)
     }
-    PnRtConfig c = {0};
     c.package_dir = dir;
     c.romfs_dir = base_romfs[0] ? base_romfs : NULL;
     c.title_id = title;
@@ -429,7 +436,8 @@ static void rt_start(void) {
     c.ui.publish_ui = rt_ui_publish; c.ui.publish_ui_partial = rt_ui_publish_partial;
     c.log = rt_log; c.log_level = 2;
     g_rt = pn_rt_create(&c);
-    __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s (title %016" PRIx64 ", build %s, romfs %s): %s", dir, title, m->build_id, c.romfs_dir ? c.romfs_dir : "none", g_rt ? "loaded" : "not loaded");
+    __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s (title %016" PRIx64 ", build %s, romfs %s): %s", dir, title, m->build_id,
+                        c.romfs_dir ? c.romfs_dir : g_nup ? pn_nup_describe(g_nup) : "none", g_rt ? "loaded" : "not loaded");
 }
 
 // The runtime ticks on a thread of its own, once per presented frame (the present thread only signals), so its sampling and page logic never cost the game a frame

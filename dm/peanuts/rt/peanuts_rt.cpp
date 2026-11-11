@@ -67,6 +67,7 @@ struct PnRt {
     PnRtMemory memory{};
     PnRtPad pad{};
     PnRtHaptics haptics{};
+    PnRtRomfs romfs{}; // R6: the host's RomFS callbacks (copied; the VFS keeps its own copy too)
     Core::System system;
     std::optional<Core::Mods::ModRuntime> runtime;
     std::string last_error;
@@ -158,11 +159,18 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
     sys.memory.SetBackend({&rt->memory, &MemRead, &MemWrite, &MemPointer});
     sys.input.pad.SetSink({&rt->pad, &PadButton, &PadStick});
     sys.fs_controller.load_root = FileSys::MakeSyntheticDir("load", {config->package_dir});
+    rt->romfs = config->romfs;
     if (config->romfs_dir != nullptr) {
         sys.romfs_root = FileSys::OpenHostDirectory(config->romfs_dir);
         if (!sys.romfs_root) {
             LOG_WARNING(Core, "peanuts_rt: romfs_dir '{}' is not a directory", config->romfs_dir);
         }
+    }
+    // R6: a RomFS served by host callbacks (a .nup container) when there is no directory.
+    if (!sys.romfs_root && rt->romfs.open != nullptr && rt->romfs.read != nullptr) {
+        sys.romfs_root = FileSys::OpenProviderDirectory(rt->romfs);
+        LOG_INFO(Core, "peanuts_rt: game romfs served by the host's provider callbacks{}",
+                 rt->romfs.list != nullptr ? "" : " (no directory listing)");
     }
     if (config->save_dir != nullptr) {
         sys.save_root = FileSys::OpenHostDirectory(config->save_dir);

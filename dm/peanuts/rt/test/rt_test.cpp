@@ -1,8 +1,12 @@
 // rt_test: loads a real companion package through peanuts_rt with a fake guest memory and writes
 // the rendered pages to PNG files.
 //
-//   rt_test <package dir> <out dir> [romfs dir]
+//   rt_test <package dir> <out dir> [romfs dir [--provider]]
 //   rt_test --module <package dir> <out dir> <title id hex> <build id hex> [page id...]
+//
+// `--provider` (R6) hands the romfs dir to the runtime through PnRtRomfs callbacks (a fake provider
+// over POSIX open/pread/readdir, below) instead of PnRtConfig::romfs_dir: the PNGs must come out
+// the same, which proves the provider-backed VFS path the .nup host glue (peanuts_nup.c) uses.
 //
 // The second form (R5) drives a package that ships a native module (dualscreen/modules/
 // <platform>/<TITLEID>.so, e.g. Fire Emblem: Three Houses): the runtime must accept the package
@@ -15,6 +19,7 @@
 // fake memory's rupees (main+0x1CC0760 u32 = 123) and health (main+0x1CC0764 s16 = 48) with the
 // runtime's built-in font, which proves the sample -> bind -> text path end to end.
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -26,11 +31,68 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <stb_image_write.h>
 
 #include "peanuts_rt.h"
 
 namespace {
+
+/// R6: a fake RomFS provider over a directory on disk, through the PnRtRomfs callbacks only
+/// (open/pread/readdir): what peanuts_nup.c does over a .nup, here over the extracted folder.
+struct DirProvider {
+    std::string root;
+    std::atomic<int> opens{0}, reads{0}, lists{0}; // the asset workers call concurrently
+
+    std::string Full(const char* path) const {
+        return path != nullptr && path[0] != '\0' ? root + "/" + path : root;
+    }
+    static int Open(void* user, const char* path, uint64_t* size) {
+        auto* self = static_cast<DirProvider*>(user);
+        const std::string full = self->Full(path);
+        struct stat st {};
+        if (::stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+        const int fd = ::open(full.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return -1;
+        if (size) *size = static_cast<uint64_t>(st.st_size);
+        ++self->opens;
+        return fd;
+    }
+    static int64_t Read(void* user, int handle, uint64_t off, void* buf, uint64_t n) {
+        ++static_cast<DirProvider*>(user)->reads;
+        const ssize_t got = ::pread(handle, buf, static_cast<size_t>(n), static_cast<off_t>(off));
+        return got < 0 ? -1 : static_cast<int64_t>(got);
+    }
+    static void Close(void*, int handle) {
+        ::close(handle);
+    }
+    static int List(void* user, const char* path, void (*cb)(void*, const char*, int), void* cb_user) {
+        auto* self = static_cast<DirProvider*>(user);
+        ++self->lists;
+        DIR* d = ::opendir(self->Full(path).c_str());
+        if (d == nullptr) return 0;
+        if (cb != nullptr) {
+            while (const dirent* e = ::readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                struct stat st {};
+                const std::string child = self->Full(path) + "/" + e->d_name;
+                if (::stat(child.c_str(), &st) != 0) continue;
+                cb(cb_user, e->d_name, S_ISDIR(st.st_mode) ? 1 : 0);
+            }
+        }
+        ::closedir(d);
+        return 1;
+    }
+    PnRtRomfs Callbacks() {
+        return PnRtRomfs{this, &Open, &Read, &Close, &List};
+    }
+};
+
+DirProvider* g_provider = nullptr; // set by --provider: MakeConfig then hands callbacks, not a dir
 
 constexpr uint64_t MainBase = 0x0000008000000000ULL; // where the fake "main" module sits
 constexpr uint64_t MainSize = 0x2000000ULL;          // 32 MiB
@@ -135,7 +197,11 @@ bool RenderPage(PnRt* rt, const char* page, const std::filesystem::path& out) {
 PnRtConfig MakeConfig(FakeMemory& mem, const std::string& package_dir, const char* romfs_dir) {
     PnRtConfig cfg{};
     cfg.package_dir = package_dir.c_str();
-    cfg.romfs_dir = romfs_dir;
+    if (g_provider != nullptr && romfs_dir != nullptr) {
+        cfg.romfs = g_provider->Callbacks(); // R6: the same folder, through the callbacks only
+    } else {
+        cfg.romfs_dir = romfs_dir;
+    }
     cfg.title_id = TitleId;
     cfg.build_id_hex = BuildId;
     cfg.main_base = MainBase;
@@ -278,12 +344,18 @@ int main(int argc, char** argv) {
         return RunModuleMode(argc, argv);
     }
     if (argc < 3) {
-        std::fprintf(stderr, "usage: rt_test <package dir> <out dir> [romfs dir]\n");
+        std::fprintf(stderr, "usage: rt_test <package dir> <out dir> [romfs dir [--provider]]\n");
         return 2;
     }
     const std::string package_dir = argv[1];
     const std::filesystem::path out_dir = argv[2];
     const char* romfs_dir = argc > 3 ? argv[3] : nullptr;
+    DirProvider provider;
+    if (romfs_dir != nullptr && argc > 4 && std::strcmp(argv[4], "--provider") == 0) {
+        provider.root = romfs_dir;
+        g_provider = &provider;
+        std::printf("rt_test: romfs through PnRtRomfs callbacks over %s\n", romfs_dir);
+    }
     std::filesystem::create_directories(out_dir);
 
     FakeMemory mem;
@@ -392,6 +464,14 @@ int main(int argc, char** argv) {
         failures += !equipped;
         failures += !CapturePng(rt, interact_dir / "gear_after_equip.png");
         pn_rt_destroy(rt);
+    }
+    if (g_provider != nullptr) {
+        std::printf("rt_test: provider calls: %d opens, %d reads, %d lists\n", provider.opens.load(),
+                    provider.reads.load(), provider.lists.load());
+        if (provider.opens == 0 || provider.reads == 0) {
+            std::fprintf(stderr, "rt_test: FAILED: the provider callbacks were never used\n");
+            ++failures;
+        }
     }
     std::printf("rt_test: %s\n", failures == 0 ? "OK" : "FAILED");
     return failures == 0 ? 0 : 1;

@@ -25,6 +25,7 @@
 #include "common/thread.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/memory.h"
+#include "peanuts_rt.h" // PnRtRomfs (R6: OpenProviderDirectory)
 
 namespace Settings {
 Values values;
@@ -284,6 +285,145 @@ VirtualDir MakeSyntheticDir(std::string name, const std::vector<std::filesystem:
         }
     }
     return std::make_shared<SyntheticDir>(std::move(name), std::move(dirs));
+}
+
+// --- R6: a RomFS served by host callbacks (PnRtRomfs) -------------------------------------------
+namespace {
+
+/// The callback set, shared by every directory and file of one provider root.
+struct ProviderState {
+    PnRtRomfs cb;
+};
+
+std::string ProviderJoin(const std::string& dir, std::string_view name) {
+    return dir.empty() ? std::string{name} : dir + "/" + std::string{name};
+}
+std::string ProviderLeaf(const std::string& path) {
+    const auto slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+VirtualDir MakeProviderDir(std::shared_ptr<ProviderState> state, std::string path);
+
+/// One opened RomFS file: the handle is held for the object's life, reads go through `read`.
+class ProviderFile final : public VfsFile {
+public:
+    ProviderFile(std::shared_ptr<ProviderState> state_, std::string path_, int handle_, u64 size_)
+        : state{std::move(state_)}, path{std::move(path_)}, handle{handle_}, size{size_} {}
+    ~ProviderFile() override {
+        if (state->cb.close != nullptr) {
+            state->cb.close(state->cb.user, handle);
+        }
+    }
+    std::string GetName() const override {
+        return ProviderLeaf(path);
+    }
+    std::size_t GetSize() const override {
+        return static_cast<std::size_t>(size);
+    }
+    std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        if (offset >= size) {
+            return 0;
+        }
+        const u64 want = std::min<u64>(length, size - offset);
+        const int64_t got = state->cb.read(state->cb.user, handle, offset, data, want);
+        return got < 0 ? 0 : static_cast<std::size_t>(got);
+    }
+    VirtualDir GetContainingDirectory() const override {
+        const auto slash = path.rfind('/');
+        return MakeProviderDir(state, slash == std::string::npos ? "" : path.substr(0, slash));
+    }
+
+private:
+    std::shared_ptr<ProviderState> state;
+    std::string path;
+    int handle;
+    u64 size;
+};
+
+class ProviderDir final : public VfsDirectory {
+public:
+    ProviderDir(std::shared_ptr<ProviderState> state_, std::string path_)
+        : state{std::move(state_)}, path{std::move(path_)} {}
+    std::string GetName() const override {
+        return path.empty() ? "romfs" : ProviderLeaf(path);
+    }
+    std::vector<VirtualFile> GetFiles() const override {
+        std::vector<VirtualFile> out;
+        for (const auto& [name, is_dir] : List()) {
+            if (!is_dir) {
+                if (auto f = GetFile(name)) {
+                    out.push_back(std::move(f));
+                }
+            }
+        }
+        return out;
+    }
+    std::vector<VirtualDir> GetSubdirectories() const override {
+        std::vector<VirtualDir> out;
+        for (const auto& [name, is_dir] : List()) {
+            if (is_dir) {
+                out.push_back(MakeProviderDir(state, ProviderJoin(path, name)));
+            }
+        }
+        return out;
+    }
+    VirtualFile GetFile(std::string_view name) const override {
+        const std::string full = ProviderJoin(path, name);
+        u64 size = 0;
+        const int handle = state->cb.open(state->cb.user, full.c_str(), &size);
+        if (handle < 0) {
+            return nullptr;
+        }
+        return std::make_shared<ProviderFile>(state, full, handle, size);
+    }
+    VirtualDir GetSubdirectory(std::string_view name) const override {
+        if (state->cb.list == nullptr) {
+            return nullptr;
+        }
+        const std::string full = ProviderJoin(path, name);
+        if (!state->cb.list(state->cb.user, full.c_str(), nullptr, nullptr)) {
+            return nullptr;
+        }
+        return MakeProviderDir(state, full);
+    }
+    std::string GetFullPath() const override {
+        return "romfs:/" + path;
+    }
+
+private:
+    std::vector<std::pair<std::string, bool>> List() const {
+        std::vector<std::pair<std::string, bool>> out;
+        if (state->cb.list == nullptr) {
+            return out;
+        }
+        state->cb.list(
+            state->cb.user, path.c_str(),
+            [](void* user, const char* name, int is_dir) {
+                static_cast<std::vector<std::pair<std::string, bool>>*>(user)->emplace_back(
+                    name, is_dir != 0);
+            },
+            &out);
+        return out;
+    }
+
+    std::shared_ptr<ProviderState> state;
+    std::string path; // "" = the root, else "a/b" (no leading or trailing slash)
+};
+
+VirtualDir MakeProviderDir(std::shared_ptr<ProviderState> state, std::string path) {
+    return std::make_shared<ProviderDir>(std::move(state), std::move(path));
+}
+
+} // namespace
+
+VirtualDir OpenProviderDirectory(const PnRtRomfs& provider) {
+    if (provider.open == nullptr || provider.read == nullptr) {
+        return nullptr;
+    }
+    auto state = std::make_shared<ProviderState>();
+    state->cb = provider;
+    return MakeProviderDir(std::move(state), "");
 }
 
 } // namespace FileSys

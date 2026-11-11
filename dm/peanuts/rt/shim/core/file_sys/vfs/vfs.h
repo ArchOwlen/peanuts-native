@@ -13,6 +13,8 @@
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
 
+struct PnRtRomfs; // peanuts_rt.h: the host's RomFS callbacks (R6)
+
 namespace FileSys {
 
 class VfsFile {
@@ -69,5 +71,11 @@ public:
 /// skipped) and no files.
 [[nodiscard]] VirtualDir MakeSyntheticDir(std::string name,
                                           const std::vector<std::filesystem::path>& children);
+/// R6: the root of a RomFS served by host callbacks (PnRtRomfs, copied). Files read ranges on
+/// demand through `read`; a file stays open (handle held) for the VfsFile's life. Directories
+/// enumerate through `list` when the provider has one (else they are empty and every
+/// GetSubdirectory is nullptr -- only GetFile / GetFileRelative work). nullptr when `open` or
+/// `read` is missing.
+[[nodiscard]] VirtualDir OpenProviderDirectory(const PnRtRomfs& provider);
 
 } // namespace FileSys

@@ -56,6 +56,28 @@ typedef struct PnRtHaptics {
 
 typedef void (*PnRtLogFn)(int level, const char* where, const char* message);
 
+/// R6, optional: the game's RomFS served by host callbacks instead of a directory on disk (a game
+/// imported as a .nup container: dm/peanuts/peanuts_nup.h is the host's provider over nup_image.h).
+/// Used when `romfs_dir` is NULL (or not a directory) and `open` and `read` are both set. Paths are
+/// RomFS-relative with '/' separators and no leading slash ("Font/jpn_main.bffnt"); the runtime
+/// reads ranges on demand (the asset workers and the tick thread may call concurrently: every
+/// callback must be thread-safe). `user` must outlive the runtime.
+typedef struct PnRtRomfs {
+    void* user;
+    /// Opens a file: returns a handle >= 0 and stores its size, or -1 when there is no such file
+    /// (a directory is not a file).
+    int (*open)(void* user, const char* path, uint64_t* size);
+    /// Copies up to `n` bytes at `off` into `buf`; returns the count read (0 at or past the end),
+    /// or -1 on an I/O error.
+    int64_t (*read)(void* user, int handle, uint64_t off, void* buf, uint64_t n);
+    void (*close)(void* user, int handle);
+    /// Optional. Lists a directory ("" = the root): `cb(cb_user, name, is_dir)` once per child;
+    /// returns 1 when `path` is a directory, 0 when not. `cb` may be NULL (existence check only).
+    /// NULL = the runtime cannot enumerate or descend into directories, only open known paths.
+    int (*list)(void* user, const char* path, void (*cb)(void* cb_user, const char* name, int is_dir),
+                void* cb_user);
+} PnRtRomfs;
+
 typedef struct PnRtConfig {
     /// The package directory (contains package.json and dualscreen/). Required.
     const char* package_dir;
@@ -95,6 +117,9 @@ typedef struct PnRtConfig {
     /// 13 EnglishBritish, 14 FrenchCanadian, 15 SpanishLatin, 16 ChineseSimplified,
     /// 17 ChineseTraditional, 18 PortugueseBrazilian, 19 Polish, 20 Thai).
     int language;
+    /// R6, optional: the game's RomFS through callbacks when `romfs_dir` is NULL (see PnRtRomfs).
+    /// All fields NULL = none.
+    PnRtRomfs romfs;
 } PnRtConfig;
 
 /// Creates a runtime for `config`. NULL when the package has no usable manifest for the title

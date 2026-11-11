@@ -46,6 +46,7 @@ list(APPEND HOST_C ${HOST}/plat/plat_android.c ${HOST}/plat/movie_avc_android.c 
 file(GLOB HOST_ANDROID_C CONFIGURE_DEPENDS ${HOST}/android/*.c)
 list(APPEND HOST_C ${HOST_ANDROID_C})
 list(APPEND HOST_C ${ROOT}/dm/peanuts/peanuts.c)   # PEANUTS: the companion's reader (PEANUTS.md)
+list(APPEND HOST_C ${ROOT}/dm/peanuts/peanuts_nup.c)   # PEANUTS: the companion runtime's RomFS provider over a .nup (peanuts_nup.h)
 add_subdirectory(${ROOT}/dm/peanuts/rt ${CMAKE_CURRENT_BINARY_DIR}/peanuts_rt)   # PEANUTS: the companion runtime (C++), linked into every host below
 # dm/gfx without Metal: the NVN front (hle_nvn.c and its C helpers), nn::vi, nvdrv, the CPU texture code; android_stub.c answers for nvn_mtl.m, hle_vk.m, hle_gl.m and the other .m files
 file(GLOB GFX_C CONFIGURE_DEPENDS ${GFX}/*.c ${GFX}/nvn/*.c ${GFX}/tex/*.c ${GFX}/vk_android/*.c)   # vk_android: the NVN → Vulkan replay
