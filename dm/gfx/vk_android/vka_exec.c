@@ -1001,6 +1001,29 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
     g_stat_ops++;
     vka_barrier(g_cb);
 }
+// Scratch images of a real sRGB format for copy_t2t's sRGB ↔ linear conversions: one per format and size class, transfer use only, kept for the process (a 1080p one is 8 MiB;
+// at most SCONV_N, then the conversion is refused and the plain blit runs). Every transfer op is ordered after the previous one by the replay's barriers, so one image serves every copy
+enum { SCONV_N = 4 };
+static struct { VkImage img; VkDeviceMemory dm; VkFormat f; uint32_t w, h; } g_sconv[SCONV_N]; static int g_sconv_n;
+static VkImage sconv_image(VkFormat f, uint32_t w, uint32_t h) {
+    for (int i = 0; i < g_sconv_n; i++) if (g_sconv[i].f == f && g_sconv[i].w >= w && g_sconv[i].h >= h) return g_sconv[i].img;
+    if (g_sconv_n == SCONV_N) { VRED_ONCE("sRGB conversion copy: no scratch image left for %u (%ux%u): copied without the sRGB step", f, w, h); return VK_NULL_HANDLE; }
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img = VK_NULL_HANDLE; VkDeviceMemory dm = VK_NULL_HANDLE;
+    VkResult r = vk.vkCreateImage(V.dev, &ci, NULL, &img);
+    VkMemoryRequirements mr = {0}; if (!r) vk.vkGetImageMemoryRequirements(V.dev, img, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+    if (!r && ai.memoryTypeIndex == UINT32_MAX) r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!r) r = vk.vkAllocateMemory(V.dev, &ai, NULL, &dm);
+    if (!r) r = vk.vkBindImageMemory(V.dev, img, dm, 0);
+    if (r) { VRED_ONCE("sRGB conversion copy: scratch image %u %ux%u not made (%d): copied without the sRGB step", f, w, h, r); if (img) vk.vkDestroyImage(V.dev, img, NULL); if (dm) vk.vkFreeMemory(V.dev, dm, NULL); return VK_NULL_HANDLE; }
+    vka_img_barrier(g_cb, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    g_sconv[g_sconv_n++] = (typeof(g_sconv[0])){img, dm, f, w, h};
+    VLOG("sRGB conversion copy: scratch image %u %ux%u (%.1f MiB)", f, w, h, mr.size / 1048576.0);
+    return img;
+}
+
 static void copy_t2t(const p_copy_t2t *c) {
     if (!c->src || !c->dst) return;
     vka_img *s = vka_tex_get(c->src, g_cb), *d = vka_tex_get(c->dst, g_cb);
@@ -1022,7 +1045,7 @@ static void copy_t2t(const p_copy_t2t *c) {
         else VRED_ONCE("depth resolve is not on Vulkan yet");
     } else if (c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT))
                && s->samples == d->samples && s->f.bpb == d->f.bpb && s->f.bw == d->f.bw && s->f.bh == d->f.bh
-               && (s->f.vk == d->f.vk || sa != VK_IMAGE_ASPECT_COLOR_BIT || (s->f.kind && s->f.kind < 3 && d->f.kind && d->f.kind < 3))) {
+               && ((s->f.vk == d->f.vk && s->f.srgb == d->f.srgb) || sa != VK_IMAGE_ASPECT_COLOR_BIT || (s->f.kind && s->f.kind < 3 && d->f.kind && d->f.kind < 3))) {
         // A plain copy only between equal formats (or depth / stencil, or integer to integer, which a blit cannot convert): NVN's copy converts the texels when the formats differ,
         // as nvn_mtl.m's copy_t2t draws it. The Legend of Zelda: Link's Awakening copies its B10G11R11 frame into the RGBA8 window every frame, the same size and 4 bytes a texel:
         // copied bit for bit, the packed float bits showed as rainbow bands over the whole picture (Thor, 2026-11-11); the blit below converts them
@@ -1038,8 +1061,39 @@ static void copy_t2t(const p_copy_t2t *c) {
         VkImageBlit r = {ss, {{x0, y0, 0}, {x1, y1, 1}}, ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + c->dr.height, 1}}};
         VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, s->f.vk, &fp);
         VkFilter fl = (c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && sa == VK_IMAGE_ASPECT_COLOR_BIT && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        // One side sRGB, the other linear: 8-bit sRGB images are stored as their UNORM twin, so a blit between the VkImages neither encodes on the write nor decodes on the
+        // read, as the console's copy (and nvn_mtl.m's draw into the sRGB view) does. The blit goes through a scratch image of the real sRGB format: into it (the encode) and
+        // then its bytes copied raw into the destination, or the source's bytes copied raw into it and blitted out (the decode). Link's Awakening's frame copy into its sRGB
+        // window came out too dark without it (Thor, 2026-11-11)
+        if (s->f.srgb != d->f.srgb && sa == VK_IMAGE_ASPECT_COLOR_BIT && !s3 && !d3 && nz == 1) {
+            if (d->f.srgb) {
+                VkImage t = sconv_image(d->f.view, (uint32_t)c->dr.width, (uint32_t)c->dr.height);
+                if (t) {
+                    VkImageSubresourceLayers ts = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    VkImageBlit b = {ss, {{x0, y0, 0}, {x1, y1, 1}}, ts, {{0, 0, 0}, {c->dr.width, c->dr.height, 1}}};
+                    vk.vkCmdBlitImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, t, VK_IMAGE_LAYOUT_GENERAL, 1, &b, fl);
+                    vka_barrier(g_cb);
+                    VkImageCopy cp = {ts, {0, 0, 0}, ds, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->dr.width, (uint32_t)c->dr.height, 1}};
+                    vk.vkCmdCopyImage(g_cb, t, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+                    goto done;
+                }
+            } else {
+                VkImage t = sconv_image(s->f.view, (uint32_t)c->sr.width, (uint32_t)c->sr.height);
+                if (t) {
+                    VkImageSubresourceLayers ts = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    VkImageCopy cp = {ss, {c->sr.xoffset, c->sr.yoffset, 0}, ts, {0, 0, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
+                    vk.vkCmdCopyImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, t, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+                    vka_barrier(g_cb);
+                    int tx0 = x0 - c->sr.xoffset, tx1 = x1 - c->sr.xoffset, ty0 = y0 - c->sr.yoffset, ty1 = y1 - c->sr.yoffset;   // the mirrored source rectangle, moved to the scratch's origin
+                    VkImageBlit b = {ts, {{tx0, ty0, 0}, {tx1, ty1, 1}}, ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + c->dr.height, 1}}};
+                    vk.vkCmdBlitImage(g_cb, t, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, fl);
+                    goto done;
+                }
+            }
+        }
         vk.vkCmdBlitImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r, fl);
     }
+done:
     vka_img_written(d); g_stat_ops++;
     vka_barrier(g_cb);
 }
