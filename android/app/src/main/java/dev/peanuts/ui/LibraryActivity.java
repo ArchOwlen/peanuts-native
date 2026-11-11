@@ -78,6 +78,7 @@ public final class LibraryActivity extends Activity {
         cards = new Cards();
         grid.setAdapter(cards);
         grid.setOnItemClickListener((p, v, i, id) -> open(titles.get(i)));
+        grid.setOnItemLongClickListener((p, v, i, id) -> { sheet(titles.get(i)); return true; });   // a Ready game's sheet (Rebuild, its companion): a tap plays it
         root.addView(grid, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
     }
@@ -134,6 +135,10 @@ public final class LibraryActivity extends Activity {
 
     private void open(LibraryScanner.Title t) {
         if (t.status == LibraryScanner.Status.READY) { launch(t); return; }
+        sheet(t);
+    }
+
+    private void sheet(LibraryScanner.Title t) {
         GameSheet.show(this, t, CompanionPort.forTitle(catalog, t.titleId), () -> refresh(false));
     }
 
