@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Peanuts rebrand overlay: the peanut's silhouette for themed (monochrome) icons. Only the alpha counts.
+     Same resource name (ic_banana_mono) so this overrides src/main's banana silhouette. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFFFF" android:pathData="M54,20 C65,20 71,29 69,39 C68,46 62,50 58,54 C62,58 69,62 70,71 C72,82 65,90 54,90 C43,90 36,82 38,71 C39,62 46,58 50,54 C46,50 40,46 39,39 C37,29 43,20 54,20 Z" />
+</vector>

@@ -63,7 +63,7 @@ final class Signer {
     }
 
     /** The build tag without its mark: "Banana Native &lt;buildId&gt;" (play app), "Banana Native test · &lt;buildId&gt;" (test app) */
-    static String buildTag(boolean play, String buildId) { return "Banana Native " + (play ? "" : "test · ") + buildId; }
+    static String buildTag(boolean play, String buildId) { return "Peanuts Native " + (play ? "" : "test · ") + buildId; }   // PEANUTS: rebrand
 
     /** The build tag with its mark:"<tag> · official", "<tag> · unofficial build", or the tag alone (test app) */
     static String tag(String tag, boolean play, String[] signers) {

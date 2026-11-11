@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Peanuts rebrand overlay: a peanut (no game art), replacing Banana Native's banana. Same resource name
+     (ic_banana) so this file wins over src/main's when the peanuts source set is applied. Used for the adaptive
+     icon's foreground (via ic_banana_happy below) and the main screen's drifting background tile
+     (BananaBackgroundView draws R.drawable.ic_banana as-is). 108 x 108, inside the 66 dp safe circle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- shell -->
+    <path android:fillColor="#FFD9A066" android:pathData="M54,20 C65,20 71,29 69,39 C68,46 62,50 58,54 C62,58 69,62 70,71 C72,82 65,90 54,90 C43,90 36,82 38,71 C39,62 46,58 50,54 C46,50 40,46 39,39 C37,29 43,20 54,20 Z" />
+    <!-- shading, outer side -->
+    <path android:fillColor="#FFC08A52" android:pathData="M58,54 C62,58 69,62 70,71 C72,82 65,90 54,90 C49,90 45,88 42,85 C50,85 59,80 61,70 C63,62 60,56 58,54 Z" />
+    <!-- outline -->
+    <path android:fillColor="#00000000" android:strokeColor="#FF8C5A2B" android:strokeWidth="2" android:strokeLineJoin="round" android:pathData="M54,20 C65,20 71,29 69,39 C68,46 62,50 58,54 C62,58 69,62 70,71 C72,82 65,90 54,90 C43,90 36,82 38,71 C39,62 46,58 50,54 C46,50 40,46 39,39 C37,29 43,20 54,20 Z" />
+    <!-- waist crease -->
+    <path android:fillColor="#00000000" android:strokeColor="#FF8C5A2B" android:strokeWidth="1.6" android:strokeLineCap="round" android:pathData="M48,52 Q54,56 60,52" />
+    <!-- dimples -->
+    <path android:fillColor="#FF8C5A2B" android:pathData="M48,30 a2.2,2.8 0 1,0 4.4,0 a2.2,2.8 0 1,0 -4.4,0 Z" />
+    <path android:fillColor="#FF8C5A2B" android:pathData="M60,33 a1.8,2.3 0 1,0 3.6,0 a1.8,2.3 0 1,0 -3.6,0 Z" />
+    <path android:fillColor="#FF8C5A2B" android:pathData="M46,68 a1.8,2.3 0 1,0 3.6,0 a1.8,2.3 0 1,0 -3.6,0 Z" />
+    <path android:fillColor="#FF8C5A2B" android:pathData="M59,75 a2.2,2.8 0 1,0 4.4,0 a2.2,2.8 0 1,0 -4.4,0 Z" />
+</vector>

@@ -305,11 +305,39 @@ static int g_rt_tried;
 static uint32_t *g_frame; static uint32_t g_frame_w, g_frame_h; static int g_frame_new;
 static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static int rt_mem_read(void *u, uint64_t addr, void *buf, size_t len) { (void)u; return plat_mem_read(addr, buf, len) == 0; }
+// Guest memory for the runtime. Guest VA == host VA, so a read inside a mapped readable range is a memcpy; the ranges (the guest block's rw regions and the modules, from
+// /proc/self/maps) are cached and refreshed every 2 s and after any miss. Outside them process_vm_readv (plat_mem_read) decides, as before: a syscall per read was
+// the runtime's whole cost (profiled: 15 % of the process in peanuts-tick, mostly process_vm_readv, for ~700 point reads a tick)
+static range_t g_rd[512]; static int g_nrd; static time_t g_rd_at;
+static pthread_mutex_t g_rd_mu = PTHREAD_MUTEX_INITIALIZER;
+static int range_cmp(const void *a, const void *b) { uint64_t x = ((const range_t *)a)->a, y = ((const range_t *)b)->a; return x < y ? -1 : x > y; }
+static void rt_ranges_refresh(void) {
+    range_t r[512]; int n = scan_ranges(r, 512);
+    qsort(r, n, sizeof r[0], range_cmp);
+    pthread_mutex_lock(&g_rd_mu); memcpy(g_rd, r, n * sizeof r[0]); g_nrd = n; g_rd_at = time(NULL); pthread_mutex_unlock(&g_rd_mu);
+}
+static int rt_range_has(uint64_t addr, size_t len) {   // [addr, addr+len) inside one cached readable range
+    pthread_mutex_lock(&g_rd_mu);
+    int lo = 0, hi = g_nrd - 1, ok = 0;
+    while (lo <= hi) { int mid = (lo + hi) / 2; if (g_rd[mid].a > addr) hi = mid - 1; else if (g_rd[mid].b <= addr) lo = mid + 1; else { ok = addr + len <= g_rd[mid].b; break; } }
+    pthread_mutex_unlock(&g_rd_mu);
+    return ok;
+}
+static int rt_mem_read(void *u, uint64_t addr, void *buf, size_t len) {
+    (void)u;
+    if (time(NULL) - g_rd_at > 2) rt_ranges_refresh();
+    if (rt_range_has(addr, len)) { memcpy(buf, (const void *)(uintptr_t)addr, len); return 1; }
+    if (plat_mem_read(addr, buf, len)) return 0;
+    rt_ranges_refresh();   // readable but not in the cache: a new mapping
+    return 1;
+}
 static int rt_mem_write(void *u, uint64_t addr, const void *buf, size_t len) { (void)u; return plat_mem_write(addr, buf, len) == 0; }
-static uint8_t *rt_mem_pointer(void *u, uint64_t addr, size_t len) {   // guest VA == host VA: a pointer when both ends read (the guest block is contiguous between)
+static uint8_t *rt_mem_pointer(void *u, uint64_t addr, size_t len) {
     (void)u; uint8_t b;
-    if (!len || plat_mem_read(addr, &b, 1) || plat_mem_read(addr + len - 1, &b, 1)) return NULL;
+    if (!len) return NULL;
+    if (time(NULL) - g_rd_at > 2) rt_ranges_refresh();
+    if (rt_range_has(addr, len)) return (uint8_t *)(uintptr_t)addr;
+    if (plat_mem_read(addr, &b, 1) || plat_mem_read(addr + len - 1, &b, 1)) return NULL;   // both ends read: the guest block is contiguous between
     return (uint8_t *)(uintptr_t)addr;
 }
 // The companion's virtual pad: the host's keyboard/touch/scripted source (dm_input_set), ORed with player 1's real controller by the HID service — the same semantics as

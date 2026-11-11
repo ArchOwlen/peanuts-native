@@ -148,7 +148,7 @@ public final class MainActivity extends Activity {
 
     private void buildHome(LinearLayout content) {
         overlayRow = null;
-        content.addView(Ui.header(this, Ui.badge(this, 44), "Banana Native", Prefs.buildId(), Ui.iconButton(this, R.drawable.ic_settings, "Settings", Ui.Kind.TONAL, v -> page(true))));   // the build identifier under the title (Prefs.buildId, the part of the overlay's build tag after the app's name), so a screenshot of Home names its build; Settings › About has the full tag
+        content.addView(Ui.header(this, Ui.badge(this, 44), "Peanuts Native", Prefs.buildId(), Ui.iconButton(this, R.drawable.ic_settings, "Settings", Ui.Kind.TONAL, v -> page(true))));   // the build identifier under the title (Prefs.buildId, the part of the overlay's build tag after the app's name), so a screenshot of Home names its build; Settings › About has the full tag   // PEANUTS: rebrand
         accessCard = accessCard();
         Ui.add(content, accessCard, 16);
         Ondevice.attach(this, content, content.getChildCount());   // a game being prepared and its progress (hidden when there is none)
@@ -267,7 +267,7 @@ public final class MainActivity extends Activity {
                 if (!on) { Prefs.adbControl(this, false); return; }
                 b.setChecked(false);   // stays off until confirmed
                 Ui.confirmDanger(this, "Turn ADB control on?", "While it is on, adb, and any other app on this phone, can add games, start Prepare and install or pick a GPU "
-                        + "driver through Banana Native's launcher, without asking you. A GPU driver is code that runs inside the game. Turn it on only while you use adb, then off again.",
+                        + "driver through Peanuts Native's launcher, without asking you. A GPU driver is code that runs inside the game. Turn it on only while you use adb, then off again.",   // PEANUTS: rebrand
                         "Turn on", () -> { Prefs.adbControl(this, true); b.setChecked(true); });
             });
             help.addView(adb.view);
@@ -292,7 +292,7 @@ public final class MainActivity extends Activity {
     /** The settings rows' current values (after a dialog, on resume) */
     private void refreshSettings() {
         if (overlayRow == null) return;
-        updateRow.value("Banana Native " + Updater.version(this) + (Updater.available(this) ? "" : " · release app only"));
+        updateRow.value("Peanuts Native " + Updater.version(this) + (Updater.available(this) ? "" : " · release app only"));   // PEANUTS: rebrand
         boolean ov = Prefs.overlay(this);
         if (overlayRow.toggle.isChecked() != ov) overlayRow.toggle.setChecked(ov);
         int n = 0;

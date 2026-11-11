@@ -248,6 +248,7 @@ android {
             res.srcDirs += nxPlay || nxLive ? 'src/variant-play/res' : 'src/variant-test/res'
             java.srcDirs += 'src/ondevice/java'
         }
+        if (nxApp == 'peanuts') { release { res.srcDirs += 'src/peanuts/res' }; debug { res.srcDirs += 'src/peanuts/res' } }   // PEANUTS: peanut icon/background overlay (a build type's res overrides main's by name)
         // The service and its permissions, merged over the main manifest (a build type's manifest is an overlay)
         release { manifest.srcFile 'src/ondevice/AndroidManifest.xml' }
         debug { manifest.srcFile 'src/ondevice/AndroidManifest.xml' }

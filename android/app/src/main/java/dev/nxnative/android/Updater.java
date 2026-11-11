@@ -442,7 +442,7 @@ final class Updater {
         if (!a.getPackageManager().canRequestPackageInstalls()) {
             pending = apk;
             new AlertDialog.Builder(a).setTitle("Allow installs")
-                    .setMessage("To install the update, allow Banana Native to install apps (\"Install unknown apps\"), then come back.")
+                    .setMessage("To install the update, allow Peanuts Native to install apps (\"Install unknown apps\"), then come back.")   // PEANUTS: rebrand
                     .setPositiveButton("Open settings", (d, w) -> a.startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + a.getPackageName()))))
                     .setNegativeButton("Cancel", (d, w) -> { pending = null; apk.delete(); })
                     .setCancelable(false).show();
