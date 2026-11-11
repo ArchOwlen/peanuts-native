@@ -1021,7 +1021,12 @@ static void copy_t2t(const p_copy_t2t *c) {
         if (sa == VK_IMAGE_ASPECT_COLOR_BIT) vk.vkCmdResolveImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         else VRED_ONCE("depth resolve is not on Vulkan yet");
     } else if (c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT))
-               && s->samples == d->samples && s->f.bpb == d->f.bpb && s->f.bw == d->f.bw && s->f.bh == d->f.bh) {
+               && s->samples == d->samples && s->f.bpb == d->f.bpb && s->f.bw == d->f.bw && s->f.bh == d->f.bh
+               && (s->f.vk == d->f.vk || sa != VK_IMAGE_ASPECT_COLOR_BIT || (s->f.kind && s->f.kind < 3 && d->f.kind && d->f.kind < 3))) {
+        // A plain copy only between equal formats (or depth / stencil, or integer to integer, which a blit cannot convert): NVN's copy converts the texels when the formats differ,
+        // as nvn_mtl.m's copy_t2t draws it. The Legend of Zelda: Link's Awakening copies its B10G11R11 frame into the RGBA8 window every frame, the same size and 4 bytes a texel:
+        // copied bit for bit, the packed float bits showed as rainbow bands over the whole picture (Thor, 2026-11-11); the blit below converts them
+        static _Atomic int noted_; if (s->f.vk != d->f.vk && !atomic_exchange(&noted_, 1)) VLOG("texture copy between formats of one size, %#x → %#x (Vulkan %u → %u): copied as bits, not converted", c->src->d.format, c->dst->d.format, s->f.vk, d->f.vk);
         VkImageCopy r = {ss, {c->sr.xoffset, c->sr.yoffset, s3 ? c->sr.zoffset : 0}, ds, {c->dr.xoffset, c->dr.yoffset, d3 ? c->dr.zoffset : 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, s3 ? (uint32_t)nz : 1}};
         vk.vkCmdCopyImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else {   // a scaled, mirrored or format-changing copy: a blit (filtered with LINEAR_FILTER)
