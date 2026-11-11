@@ -45,24 +45,9 @@ final class Importer {
     }
 
     static int writeNup(File out, List<File> inputs, String baseTitleId, Progress cb) throws ReflectiveOperationException {
-        Class<?> k = Class.forName(CLASS);
-        Class<?> pi = Class.forName(CLASS + "$Progress");
-        Object proxy = Proxy.newProxyInstance(k.getClassLoader(), new Class<?>[] {pi}, (p, m, args) -> {
-            if (m.getName().equals("on") && args != null && args.length == 3) { cb.on(String.valueOf(args[0]), ((Number) args[1]).longValue(), ((Number) args[2]).longValue()); return null; }
-            if (m.getName().equals("toString")) return "Importer.Progress";
-            if (m.getName().equals("hashCode")) return System.identityHashCode(p);
-            if (m.getName().equals("equals")) return p == args[0];
-            return null;
-        });
+        // A direct call: the callback must be a real class implementing Native.Progress (ART's CheckJNI aborts a CallVoidMethod on a java.lang.reflect.Proxy)
         String[] in = new String[inputs.size()];
         for (int i = 0; i < in.length; i++) in[i] = inputs.get(i).getPath();
-        Method m = k.getMethod("writeNup", String.class, String[].class, String.class, pi);
-        try {
-            return (Integer) m.invoke(null, out.getPath(), in, baseTitleId, proxy);
-        } catch (InvocationTargetException e) {
-            Throwable c = e.getCause();
-            if (c instanceof RuntimeException) throw (RuntimeException) c;
-            throw e;
-        }
+        return dev.peanuts.importer.Native.writeNup(out.getPath(), in, baseTitleId, (step, done, total) -> cb.on(step, done, total));
     }
 }
