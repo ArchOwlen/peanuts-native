@@ -224,6 +224,9 @@ public:
     VirtualDir GetSubdirectory(std::string_view name) const override {
         return OpenHostDirectory(path / std::string{name});
     }
+    std::string GetFullPath() const override {
+        return path.string();
+    }
 
 private:
     std::filesystem::path path;

@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <format>
 #include <fstream>
 #include <mutex>
 #include <stop_token>
@@ -25,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "common/dsmod_dev_tools.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -32,6 +34,9 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/file_sys/vfs/vfs_vector.h"
+#include "core/mods/mod_yaz0.h"
+#include "core/mods/mod_bfres.h"
 #include "core/hle/service/ns/language.h"
 #include "core/hle/service/set/settings_types.h"
 #include "core/mods/mod_msbt.h"
@@ -65,10 +70,8 @@ bool EndsWithNoCase(std::string_view text, std::string_view suffix) {
     return true;
 }
 
-struct Roots {
-    FileSys::VirtualDir romfs;
-    FileSys::VirtualDir package;
-};
+/// Where a job's "<prefix>:" sources resolve: the runtime's source registry (mod_sources.h).
+using Roots = std::shared_ptr<AssetSources>;
 
 enum class JobKind : u8 { Image, Font, Msbt };
 
@@ -271,6 +274,16 @@ struct CompositeLive {
     std::vector<float> posted;
     u64 serial{};
     u32 pending_fade_ms{}; ///< flat: a layer appeared; cross-fade when its picture lands
+    /// Per layer, the show/hide binds pre-split into (key, negated), built once per `def`, so the
+    /// per-tick visibility pass looks the snapshot up without building a key string per layer.
+    struct Bind {
+        std::string key;
+        bool present{}; ///< the layer has this bind at all
+        bool negate{};
+    };
+    std::vector<Bind> show;
+    std::vector<Bind> hide;
+    std::vector<float> alpha; ///< per-tick scratch, kept so its storage is reused tick to tick
 };
 
 /// A layer's alpha resampled onto the composite, trimmed to where it is non-zero (flat mode keeps
@@ -410,11 +423,14 @@ Image MakePackedImage(const CompositeDef& def, std::span<const u8> premul) {
     return out;
 }
 
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
 struct PendingDump {
     std::string src;
     std::string out;
     NxClock::time_point requested{};
 };
+
+#endif
 
 struct Located {
     FileSys::VirtualFile file;
@@ -436,7 +452,7 @@ NX::ReadAt FileReader(const FileSys::VirtualFile& file, u64 base) {
 
 void EmitConsole(const std::string& line) {
     LOG_INFO(Core, "{}", line);
-    if (const char* const p = std::getenv("EDEN_DSMOD_CMD")) {
+    if (const char* const p = Common::DSMod::DevEnvironment("EDEN_DSMOD_CMD")) {
         std::ofstream f(std::string(p) + ".out", std::ios::app);
         if (f) {
             f << line << '\n';
@@ -444,9 +460,9 @@ void EmitConsole(const std::string& line) {
     }
 }
 
-bool BindNonZero(const StateSnapshot& snapshot, std::string_view bind) {
-    const bool negate = !bind.empty() && bind.front() == '!';
-    const std::string key{negate ? bind.substr(1) : bind};
+/// Is a layer bind non-zero, with its '!' (negation) already split off (CompositeLive::Bind).
+/// Looks the key up in ints first, then floats; a key in neither counts as zero.
+bool BindKeyNonZero(const StateSnapshot& snapshot, const std::string& key, bool negate) {
     bool value = false;
     if (const auto it = snapshot.ints.find(key); it != snapshot.ints.end()) {
         value = it->second != 0;
@@ -456,10 +472,22 @@ bool BindNonZero(const StateSnapshot& snapshot, std::string_view bind) {
     return negate ? !value : value;
 }
 
-bool LayerVisible(const CompositeLayer& layer, const StateSnapshot& snapshot) {
-    const bool show = layer.show_bind.empty() || BindNonZero(snapshot, layer.show_bind);
-    const bool hide = !layer.hide_bind.empty() && BindNonZero(snapshot, layer.hide_bind);
-    return show && !hide;
+CompositeLive::Bind SplitBind(const std::string& bind) {
+    CompositeLive::Bind out;
+    out.present = !bind.empty();
+    out.negate = out.present && bind.front() == '!';
+    out.key = out.negate ? bind.substr(1) : bind;
+    return out;
+}
+
+/// Whether layer `i` of a live composite is visible: its show bind (if any) is non-zero and its
+/// hide bind (if any) is not, read through the pre-split binds.
+bool LiveLayerVisible(const CompositeLive& live, size_t i, const StateSnapshot& snapshot) {
+    const auto& show = live.show[i];
+    const auto& hide = live.hide[i];
+    const bool shown = !show.present || BindKeyNonZero(snapshot, show.key, show.negate);
+    const bool hidden = hide.present && BindKeyNonZero(snapshot, hide.key, hide.negate);
+    return shown && !hidden;
 }
 
 } // namespace
@@ -479,6 +507,46 @@ struct NxAssetState {
     std::unordered_map<std::string, NX::SarcIndex> sarcs;
     std::unordered_map<std::string, std::shared_ptr<const NX::BntxIndex>> bntxs;
     std::unordered_map<std::string, std::shared_ptr<const FontBuild>> fonts;
+    /// Containers already unpacked in memory, by chain: a Yaz0-compressed archive (a game's
+    /// Common.sblarc) decoded once instead of on every job that reads a member of it (which was
+    /// the ~70 ms fixed cost of every small texture decode), and a BFRES's embedded BNTX. Bounded
+    /// by ExpandedCacheBytes, least recently used out first (io_mutex).
+    std::unordered_map<std::string, FileSys::VirtualFile> expanded;
+    std::deque<std::string> expanded_order;
+    size_t expanded_bytes{0};
+    static constexpr size_t ExpandedCacheBytes = 160ull * 1024 * 1024;
+    void RememberExpanded(const std::string& chain, const FileSys::VirtualFile& file) {
+        std::scoped_lock lock{io_mutex};
+        if (expanded.contains(chain)) {
+            return;
+        }
+        const size_t bytes = static_cast<size_t>(file->GetSize());
+        while (!expanded_order.empty() && expanded_bytes + bytes > ExpandedCacheBytes) {
+            const auto victim = expanded.find(expanded_order.front());
+            if (victim != expanded.end()) {
+                expanded_bytes -= static_cast<size_t>(victim->second->GetSize());
+                expanded.erase(victim);
+            }
+            expanded_order.pop_front();
+        }
+        expanded.emplace(chain, file);
+        expanded_order.push_back(chain);
+        expanded_bytes += bytes;
+    }
+    FileSys::VirtualFile FindExpanded(const std::string& chain) {
+        std::scoped_lock lock{io_mutex};
+        const auto it = expanded.find(chain);
+        if (it == expanded.end()) {
+            return nullptr;
+        }
+        // Least recently used goes first: a hit moves the chain to the back of the order.
+        if (const auto at = std::find(expanded_order.begin(), expanded_order.end(), chain);
+            at != expanded_order.end() && std::next(at) != expanded_order.end()) {
+            expanded_order.erase(at);
+            expanded_order.push_back(chain);
+        }
+        return it->second;
+    }
 
     // ---- worker only ----
     std::unordered_map<std::string, CompositeCache> caches;
@@ -511,15 +579,19 @@ struct NxAssetState {
     std::unordered_set<std::string> missing_composites;
     std::unordered_map<std::string, CompositeLive> live;
     std::unordered_map<std::string, CompositeFadeState> fades;
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     std::vector<PendingDump> dumps;
+#endif
     std::string font_key;
     MsbtState msbt;
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     // tick-side cost of PumpNxAssets, summarised like the runtime's other stage timers
     u64 pump_calls{};
     double pump_total_ms{};
     double pump_max_ms{};
     u64 posts{};
     NxClock::time_point pump_window{NxClock::now()};
+#endif
 
     ModRuntime*
         rt{}; ///< serves "module:" layer sources (asset-free packages); set once at creation
@@ -586,12 +658,12 @@ NxAssetState* MakeNxAssetState(ModRuntime* rt) {
 LocateStatus NxAssetState::Locate(const std::string& src, const Roots& roots, Located& out,
                                   std::string& error) {
     out = {};
-    const bool romfs = src.starts_with("romfs:");
-    const size_t scheme = romfs ? 6 : src.starts_with("file:") ? 5 : 0;
-    if (scheme == 0) {
+    const std::string_view prefix = AssetSources::PrefixOf(src);
+    if (!roots || prefix.empty() || !roots->IsDirectorySource(src)) {
         error = "unsupported scheme";
         return LocateStatus::Error;
     }
+    const size_t scheme = prefix.size() + 1;
     const size_t hash = src.find('#');
     std::string path =
         src.substr(scheme, hash == std::string::npos ? std::string::npos : hash - scheme);
@@ -605,7 +677,7 @@ LocateStatus NxAssetState::Locate(const std::string& src, const Roots& roots, Lo
         std::scoped_lock lock{io_mutex};
         auto& file = files[out.chain];
         if (!file) {
-            const auto& root = romfs ? roots.romfs : roots.package;
+            const auto root = roots->Root(prefix);
             file = root ? root->GetFileRelative(path) : nullptr;
         }
         out.file = file;
@@ -614,17 +686,63 @@ LocateStatus NxAssetState::Locate(const std::string& src, const Roots& roots, Lo
         }
     }
     if (!out.file) {
-        error = romfs ? (roots.romfs ? "no such romfs file" : "game romfs unavailable")
-                      : "no such package file";
+        error = prefix == "file" ? std::string{"no such package file"}
+                : roots->Root(prefix) ? std::format("no such {} file", prefix)
+                                      : std::format("game {} unavailable", prefix);
         return LocateStatus::NotFound;
     }
     out.size = out.file->GetSize();
     for (u32 depth = 0; depth < 8; ++depth) {
+        // This container was unpacked by an earlier job: use that copy (its embedded BNTX when
+        // it is a BFRES; the decoded bytes when it was Yaz0).
+        if (const auto embedded = FindExpanded(out.chain + "#embedded-bntx")) {
+            out.file = embedded;
+            out.base = 0;
+            out.size = embedded->GetSize();
+            out.chain += "#embedded-bntx";
+        } else if (const auto unpacked = FindExpanded(out.chain)) {
+            out.file = unpacked;
+            out.base = 0;
+            out.size = unpacked->GetSize();
+        }
         out.magic = {};
         if (out.size < 4 ||
             out.file->Read(out.magic.data(), 4, static_cast<size_t>(out.base)) != 4) {
             error = "file too short";
             return LocateStatus::Error;
+        }
+        if (std::memcmp(out.magic.data(), "Yaz0", 4) == 0) {
+            std::vector<u8> packed, decoded;
+            if (!ReadAll(out, packed, error) || !DecodeYaz0(packed, decoded, MaxWholeRead)) {
+                error = "invalid or oversized Yaz0 asset";
+                return LocateStatus::Error;
+            }
+            out.file = std::make_shared<FileSys::VectorVfsFile>(std::move(decoded));
+            out.base = 0;
+            out.size = out.file->GetSize();
+            if (out.file->Read(out.magic.data(), 4, 0) != 4) {
+                error = "decoded Yaz0 asset too short";
+                return LocateStatus::Error;
+            }
+            RememberExpanded(out.chain, out.file);
+        }
+        if (std::memcmp(out.magic.data(), "FRES", 4) == 0) {
+            std::vector<u8> container;
+            if (!ReadAll(out, container, error)) {
+                return LocateStatus::Error;
+            }
+            const auto member = BfresBntx(container);
+            if (member.empty()) {
+                error = "unsupported BFRES or invalid embedded BNTX";
+                return LocateStatus::Error;
+            }
+            out.file = std::make_shared<FileSys::VectorVfsFile>(
+                std::vector<u8>(member.begin(), member.end()));
+            out.base = 0;
+            out.size = member.size();
+            out.chain += "#embedded-bntx";
+            std::memcpy(out.magic.data(), "BNTX", 4);
+            RememberExpanded(out.chain, out.file);
         }
         if (!out.has_rest || std::memcmp(out.magic.data(), "SARC", 4) != 0) {
             return LocateStatus::Ok;
@@ -1560,8 +1678,8 @@ void NxAssetState::RunCompositeStep(const std::string& name) {
 // ---------------------------------------------------------------------------------------------
 // ModRuntime side (tick thread)
 
-bool ModRuntime::IsNxAssetSource(const std::string& src) {
-    if (!src.starts_with("romfs:") && !src.starts_with("file:")) {
+bool ModRuntime::IsNxAssetSource(const std::string& src) const {
+    if (!asset_sources->IsDirectorySource(src)) {
         return false;
     }
     const size_t hash = src.find('#');
@@ -1573,7 +1691,9 @@ bool ModRuntime::IsNxAssetSource(const std::string& src) {
         return true;
     }
     return EndsWithNoCase(file, ".bntx") || EndsWithNoCase(file, ".bffnt") ||
-           EndsWithNoCase(file, ".arc") || EndsWithNoCase(file, ".sarc");
+           EndsWithNoCase(file, ".arc") || EndsWithNoCase(file, ".sarc") ||
+           EndsWithNoCase(file, ".bfres") || EndsWithNoCase(file, ".sbfres") ||
+           EndsWithNoCase(file, ".bmaptex") || EndsWithNoCase(file, ".sbmaptex");
 }
 
 bool ModRuntime::NxFallback(const std::string& src) const {
@@ -1590,14 +1710,11 @@ std::shared_ptr<const Image> ModRuntime::GetNxImage(const std::string& src) {
     if (s.pending.contains(src) || s.failed.contains(src) || s.fallback.contains(src)) {
         return nullptr;
     }
-    if (src.starts_with("romfs:") && !romfs_tried) {
-        ReadAssetBytesRaw("romfs:"); // opens the session romfs on this (the owner) thread
-    }
     s.pending.insert(src);
     {
         std::scoped_lock lock{s.queue_mutex};
         s.jobs.push_back(
-            {JobKind::Image, src, {romfs_root, manifest.asset_dir}, s.generation, NxClock::now()});
+            {JobKind::Image, src, asset_sources, s.generation, NxClock::now()});
     }
     s.EnsureWorker();
     s.cv.notify_one();
@@ -1632,11 +1749,8 @@ std::shared_ptr<const Image> ModRuntime::GetCompositeImage(const std::string& na
 }
 
 bool ModRuntime::ReadNxMember(const std::string& src, std::vector<u8>& out) {
-    if (!src.starts_with("romfs:") && !src.starts_with("file:")) {
+    if (!asset_sources->IsDirectorySource(src)) {
         return false;
-    }
-    if (src.starts_with("romfs:") && !romfs_tried) {
-        ReadAssetBytesRaw("romfs:");
     }
     auto& s = *nx_assets;
     // Only an archive at the top decides this path; anything else keeps the older handling.
@@ -1644,12 +1758,12 @@ bool ModRuntime::ReadNxMember(const std::string& src, std::vector<u8>& out) {
     Located at;
     std::string error;
     const LocateStatus status =
-        s.Locate(src.substr(0, hash), {romfs_root, manifest.asset_dir}, at, error);
+        s.Locate(src.substr(0, hash), asset_sources, at, error);
     if (status != LocateStatus::Ok || std::memcmp(at.magic.data(), "SARC", 4) != 0) {
         return false;
     }
     out.clear();
-    if (s.Locate(src, {romfs_root, manifest.asset_dir}, at, error) != LocateStatus::Ok) {
+    if (s.Locate(src, asset_sources, at, error) != LocateStatus::Ok) {
         LOG_WARNING(Core, "DSMod: '{}': {}", src, error);
         return true;
     }
@@ -1668,15 +1782,12 @@ bool ModRuntime::RequestNxFont() {
                         ".bffnt")) {
         return false;
     }
-    if (manifest.font_metrics_src.starts_with("romfs:") && !romfs_tried) {
-        ReadAssetBytesRaw("romfs:");
-    }
     s.font_key = manifest.font_metrics_src;
     {
         std::scoped_lock lock{s.queue_mutex};
         s.jobs.push_front({JobKind::Font,
                            s.font_key,
-                           {romfs_root, manifest.asset_dir},
+                           asset_sources,
                            s.generation,
                            NxClock::now()});
     }
@@ -1689,6 +1800,7 @@ bool ModRuntime::RequestNxFont() {
 void ModRuntime::ResetNxAssets() {
     auto& s = *nx_assets;
     std::scoped_lock state_lock{s.state_mutex}; // clears the whole bucket below
+    nx_preload_done = false;                     // a reloaded manifest's "preload" is queued again
     {
         std::scoped_lock lock{s.queue_mutex};
         ++s.generation;
@@ -1703,7 +1815,9 @@ void ModRuntime::ResetNxAssets() {
     s.live.clear();
     s.fades.clear();
     s.font_key.clear();
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     s.dumps.clear();
+#endif
     s.msbt = {};
     std::scoped_lock lock{s.io_mutex};
     s.files.clear();
@@ -1718,6 +1832,22 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
     // this lock does -- locals destruct in reverse declaration order), covering every touch of
     // the state_mutex bucket this function makes.
     std::scoped_lock state_lock{s.state_mutex};
+    // Manifest "preload" (runtime 22): the package's fixed pictures are
+    // queued once, here, behind whatever the first page asked for, so a later page finds them
+    // decoded instead of popping them in one by one on its first visit.
+    // Queued on the second pump, not the first: the first page's own pictures are requested by
+    // the first render, which runs after the first pump, and they must stay ahead of the preload
+    // burst on the single worker.
+    if (!nx_preload_done && asset_sources && tick_count >= 2) {
+        nx_preload_done = true;
+        for (const auto& src : manifest.preload) {
+            GetImage(src);
+        }
+        if (!manifest.preload.empty()) {
+            LOG_INFO(Core, "DSMod nx: {} preload picture(s) queued", manifest.preload.size());
+        }
+    }
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     const auto pump_started = NxClock::now();
     struct PumpTimer {
         NxAssetState& s;
@@ -1744,6 +1874,7 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
             }
         }
     } pump_timer{s, pump_started};
+#endif
     std::deque<Result> results;
     {
         std::scoped_lock lock{s.queue_mutex};
@@ -1854,7 +1985,7 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
             for (size_t i = 0; i < text->size();) {
                 const char32_t c = Msbt::NextUtf8(*text, i);
                 if (c >= TextIconBase && c <= TextIconLast) {
-                    shown += fmt::format("{{U+{:04X}}}", static_cast<u32>(c - TextIconBase));
+                    shown += std::format("{{U+{:04X}}}", static_cast<u32>(c - TextIconBase));
                 } else if (c == '\n') {
                     shown += "\\n";
                 } else {
@@ -1862,9 +1993,9 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
                 }
             }
         }
-        EmitConsole(text != nullptr ? fmt::format("DSMod msbt {} [{}/{}] = {}", it->ref,
+        EmitConsole(text != nullptr ? std::format("DSMod msbt {} [{}/{}] = {}", it->ref,
                                                   s.msbt.chosen.first, s.msbt.chosen.second, shown)
-                                    : fmt::format("DSMod msbt {} FAILED ({})", it->ref,
+                                    : std::format("DSMod msbt {} FAILED ({})", it->ref,
                                                   timeout ? "timeout" : "no such text"));
         it = s.msbt.console.erase(it);
     }
@@ -1882,17 +2013,24 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
         }
         const auto& def = found->second;
         const size_t n = def->layers.size();
-        if (live.def != def) {
+        if (live.def != def || live.show.size() != n) {
             live = {};
             live.wanted = true;
             live.def = def;
             live.shown.assign(n, 0);
             live.shown_at.assign(n, now);
+            live.show.reserve(n);
+            live.hide.reserve(n);
+            for (const auto& layer : def->layers) {
+                live.show.push_back(SplitBind(layer.show_bind));
+                live.hide.push_back(SplitBind(layer.hide_bind));
+            }
         }
-        std::vector<float> alpha(n, 0.0f);
+        auto& alpha = live.alpha;
+        alpha.assign(n, 0.0f);
         for (size_t i = 0; i < n; ++i) {
             const auto& layer = def->layers[i];
-            const bool visible = LayerVisible(layer, snapshot);
+            const bool visible = LiveLayerVisible(live, i, snapshot);
             if (!live.initialized) {
                 live.shown[i] = visible; // what is visible at first sight does not fade in
                 live.shown_at[i] = now - std::chrono::hours{1};
@@ -1929,26 +2067,24 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
         }
         live.posted = alpha;
         ++live.serial;
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
         ++s.posts;
+#endif
         {
             std::scoped_lock lock{s.queue_mutex};
             auto& request = s.requests[name];
             request.def = def;
-            request.alpha = std::move(alpha);
+            request.alpha = alpha;
             request.serial = live.serial;
-            request.roots = {romfs_root, manifest.asset_dir};
+            request.roots = asset_sources;
             request.generation = s.generation;
             request.dirty = true;
-        }
-        if (!romfs_tried) {
-            ReadAssetBytesRaw("romfs:");
-            std::scoped_lock lock{s.queue_mutex};
-            s.requests[name].roots = {romfs_root, manifest.asset_dir};
         }
         s.EnsureWorker();
         s.cv.notify_one();
     }
 
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     // Console image dumps waiting for their picture.
     for (auto it = s.dumps.begin(); it != s.dumps.end();) {
         const auto cached = CacheFindImage(it->src);
@@ -1966,16 +2102,17 @@ void ModRuntime::PumpNxAssets(const StateSnapshot& snapshot) {
             const bool ok = stbi_write_png(it->out.c_str(), static_cast<int>(cached->w),
                                            static_cast<int>(cached->h), 4, rgba.data(),
                                            static_cast<int>(cached->w) * 4) != 0;
-            EmitConsole(fmt::format(
+            EmitConsole(std::format(
                 "DSMod imgdump {} '{}' {}x{} -> {} ({:.0f} ms)", ok ? "ok" : "write-failed",
                 it->src, cached->w, cached->h, it->out,
                 std::chrono::duration<double, std::milli>(now - it->requested).count()));
         } else {
-            EmitConsole(fmt::format("DSMod imgdump FAILED '{}' ({})", it->src,
+            EmitConsole(std::format("DSMod imgdump FAILED '{}' ({})", it->src,
                                     timeout ? "timeout" : "not decodable"));
         }
         it = s.dumps.erase(it);
     }
+#endif
 }
 
 float ModRuntime::CompositeFade(const std::string& name) {
@@ -2051,12 +2188,12 @@ void ModRuntime::NxImageDump(const std::string& args) {
         const bool ok =
             stbi_write_png(out.c_str(), static_cast<int>(image->w), static_cast<int>(image->h), 4,
                            rgba.data(), static_cast<int>(image->w) * 4) != 0;
-        EmitConsole(fmt::format("DSMod imgdump {} '{}' {}x{} -> {} (0 ms)",
+        EmitConsole(std::format("DSMod imgdump {} '{}' {}x{} -> {} (0 ms)",
                                 ok ? "ok" : "write-failed", src, image->w, image->h, out));
         return;
     }
     nx_assets->dumps.push_back({src, out, NxClock::now()});
-    EmitConsole(fmt::format("DSMod imgdump queued '{}'", src));
+    EmitConsole(std::format("DSMod imgdump queued '{}'", src));
 }
 #endif // EDEN_DSMOD_BUILD_DEV_TOOLS
 
@@ -2218,15 +2355,12 @@ void ModRuntime::RequestMsbt(const std::string& alias) {
     if (IsNxAssetSource(manifest.font_metrics_src) || EndsWithNoCase(font_file, ".bffnt")) {
         job->font_src = manifest.font_metrics_src;
     }
-    if ((path.starts_with("romfs:") || job->font_src.starts_with("romfs:")) && !romfs_tried) {
-        ReadAssetBytesRaw("romfs:");
-    }
     m.queued.insert(alias);
     const size_t used_labels = job->labels.size();
     {
         std::scoped_lock lock{s.queue_mutex};
         Job queued{
-            JobKind::Msbt, path, {romfs_root, manifest.asset_dir}, s.generation, NxClock::now()};
+            JobKind::Msbt, path, asset_sources, s.generation, NxClock::now()};
         queued.msbt = std::move(job);
         s.jobs.push_back(std::move(queued));
         if (!manifest.msbt.icon_font.empty() && !m.icon_requested) {
@@ -2234,7 +2368,7 @@ void ModRuntime::RequestMsbt(const std::string& alias) {
             m.icon_key = manifest.msbt.icon_font;
             Job icon{JobKind::Font,
                      m.icon_key,
-                     {romfs_root, manifest.asset_dir},
+                     asset_sources,
                      s.generation,
                      NxClock::now()};
             icon.icon_font = true;
@@ -2255,14 +2389,14 @@ bool ModRuntime::AcceptMsbt(const MsbtResult& r) {
     // Unknown tags and unmapped icons: stripped, each reported once per session (one line).
     std::string tags, icons;
     for (const u32 tag : r.stripped) {
-        if (m.logged.insert(fmt::format("tag {}", tag)).second) {
-            tags += fmt::format(" {}{}.{}", (tag >> 31) != 0 ? "/" : "", (tag >> 16) & 0x7FFF,
+        if (m.logged.insert(std::format("tag {}", tag)).second) {
+            tags += std::format(" {}{}.{}", (tag >> 31) != 0 ? "/" : "", (tag >> 16) & 0x7FFF,
                                 tag & 0xFFFF);
         }
     }
     for (const u32 index : r.unmapped_icons) {
-        if (m.logged.insert(fmt::format("icon {}", index)).second) {
-            icons += fmt::format(" {}", index);
+        if (m.logged.insert(std::format("icon {}", index)).second) {
+            icons += std::format(" {}", index);
         }
     }
     if (!tags.empty() || !icons.empty()) {
@@ -2276,13 +2410,13 @@ bool ModRuntime::AcceptMsbt(const MsbtResult& r) {
     if (!usable && !m.on_fallback && manifest.msbt.has_fallback && m.chosen != fallback) {
         std::string why;
         if (!r.ok) {
-            why = fmt::format("'{}' could not be read ({})", r.path, r.error);
+            why = std::format("'{}' could not be read ({})", r.path, r.error);
         } else {
             std::string sample;
             for (const char32_t c : r.uncovered_sample) {
-                sample += fmt::format(" U+{:04X}", static_cast<u32>(c));
+                sample += std::format(" U+{:04X}", static_cast<u32>(c));
             }
-            why = fmt::format("{} character(s) of the used labels are not in {} (e.g.{})",
+            why = std::format("{} character(s) of the used labels are not in {} (e.g.{})",
                               r.uncovered, r.font_used, sample);
         }
         LOG_WARNING(Core, "DSMod msbt: {}/{} not usable: {} -> fallback {}/{}", m.chosen.first,
@@ -2400,7 +2534,7 @@ void ModRuntime::MsbtConsole(const std::string& args) {
         ResolveMsbtLanguage();
     }
     if (ref.empty()) {
-        EmitConsole(fmt::format("DSMod msbt lang: settings {} ({}), game given '{}', NACP {:08X}, "
+        EmitConsole(std::format("DSMod msbt lang: settings {} ({}), game given '{}', NACP {:08X}, "
                                 "key '{}' -> {}/{}{}{}",
                                 m.settings_index, m.settings_name, m.desired, m.nacp_languages,
                                 m.matched_key, m.chosen.first, m.chosen.second,
@@ -2499,9 +2633,13 @@ void ParseManifestExtras(const nlohmann::json& json, Manifest& manifest) {
     if (manifest.font_atlas_src.empty()) {
         manifest.font_atlas_src = json.value("font_atlas_src", std::string{});
     }
+    // A BFFNT carries its own sheets, whether it is the file itself ("x.bffnt", "x.bffnt#...") or
+    // a member of an archive ("FontData.szs#TitleFont60.bffnt").
     if (manifest.font_atlas_src.empty() &&
-        EndsWithNoCase(manifest.font_metrics_src.substr(0, manifest.font_metrics_src.find('#')),
-                       ".bffnt")) {
+        (EndsWithNoCase(manifest.font_metrics_src.substr(0, manifest.font_metrics_src.find('#')),
+                        ".bffnt") ||
+         EndsWithNoCase(manifest.font_metrics_src.substr(manifest.font_metrics_src.rfind('#') + 1),
+                        ".bffnt"))) {
         manifest.font_atlas_src = manifest.font_metrics_src; // a BFFNT carries its own sheets
     }
 

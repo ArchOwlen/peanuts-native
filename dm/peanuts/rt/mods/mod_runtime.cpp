@@ -26,16 +26,29 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <format>
 
 #include <cstdlib>
 #include <fstream>
+#include "common/fs/fs_util.h"
+#include "common/dsmod_dev_tools.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "core/arm/debug.h"
+#include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/memory.h"
+#include "core/mods/mod_hooks.h"
 #include "core/mods/mod_runtime.h"
 #include "core/mods/mod_runtime_shared.h"
+#include "core/mods/mod_view_default.h"
+#include "core/perf_stats.h"
+#include "hid_core/resources/npad/dsmod_pad_gate.h"
 #include "input_common/drivers/virtual_gamepad.h"
+#include "input_common/main.h"
 #include "video_core/dsmod/aux_routing.h"
 #include "video_core/gpu.h"
 
@@ -46,7 +59,137 @@ constexpr auto ModTickNs = std::chrono::nanoseconds{1000000000 / ModTickHz};
 } // namespace
 
 ModRuntime::ModRuntime(System& system_, Manifest manifest_)
-    : system{system_}, core_timing{system_.CoreTiming()}, manifest{std::move(manifest_)} {}
+    : system{system_}, core_timing{system_.CoreTiming()},
+      owner_process{system_.Kernel().RetainApplicationProcess(&owner_epoch)},
+      owner_pointer{owner_process.GetPointerUnsafe()}, borrowed_thread{system_.Kernel()},
+      manifest{std::move(manifest_)} {
+    // Before anything can read an asset: the registry is read without a lock from here on.
+    RegisterAssetSources();
+    // Runtime 16 @game.seconds: emulated-system time since boot (the wall clock is the default).
+    clock_points.SetSource(ClockSource{.game_seconds = [this] {
+        return static_cast<s64>(core_timing.GetGlobalTimeNs().count() / 1000000000);
+    }});
+    // Runtime 21 @perf.*: the non-resetting PerfStats totals (GetAndResetStats belongs to the
+    // frontends' overlays). PerfStats is created after this runtime (System::Load) and exists once
+    // the game runs, which the first tick proves; a module's create() can ask earlier.
+    host_values.SetSource(HostValueSource{.perf = [this]() -> std::optional<PerfSample> {
+        if (tick_count == 0 || !system.IsPoweredOn()) {
+            return std::nullopt;
+        }
+        const auto totals = system.GetPerfStats().GetTotals();
+        return PerfSample{
+            .game_frames = totals.game_frames,
+            .system_frames = totals.system_frames,
+            .frametime_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(totals.frametime).count(),
+            .emulated_us = core_timing.GetGlobalTimeUs().count(),
+        };
+    }});
+}
+
+Kernel::KProcess* ModRuntime::OwnerProcess() const {
+    return owner_pointer.load(std::memory_order_acquire);
+}
+
+Core::Memory::Memory& ModRuntime::OwnerMemory() const {
+    return OwnerProcess()->GetMemory();
+}
+
+bool ModRuntime::IsOwnerContext() const {
+    const auto* const process = OwnerProcess();
+    return owner_guard.Allow(process != nullptr &&
+                             system.Kernel().IsApplicationProcess(process, owner_epoch));
+}
+
+void ModRuntime::RefuseChangedProcess() {
+    if (process_notice_published) {
+        // Later application switches can still encounter this retired runtime. Its sources are
+        // already neutral and permanently refused; never leave a subsequent app's pad blocked.
+        Core::HID::DSModPadGate::BlockForContextChange(false);
+        return;
+    }
+    auto& aux = system.GPU().DSModAux();
+    aux.companion_context_active.store(false, std::memory_order_release);
+    aux.bound_layer.store(VideoCore::DSMod::AuxRouting::NoLayer);
+    aux.mirror_enabled.store(false);
+    aux.rt_capture.store(false);
+    if (!process_workers_stopped) {
+        // No decoder or module callback may retain a guest pointer when the owner is released.
+        StopRedrawWorker();
+        DropFontPages();
+        nx_assets.reset(); // stops and joins its decode worker
+        ShutdownGameModule(); // joins module image/map-area workers before destroying the instance
+        process_workers_stopped = true;
+    }
+    ReleaseHeldInputs();
+    // Dev scripts/autostart can hold untracked tokens. Neutralize the virtual source while the
+    // independent kernel context-change gate still protects the new application's HID samples.
+    if (auto* const input = system.GetInputSubsystem()) {
+        input->GetVirtualGamepad()->ResetControllers();
+    }
+    NavOff("application process changed");
+    Core::HID::DSModPadGate::Reset();
+    Core::HID::DSModPadGate::BlockForContextChange(false);
+    {
+        std::scoped_lock lock{tap_mutex};
+        pending_taps.clear();
+    }
+    live_fingers.clear();
+    wheel_target.clear();
+    wheel_dx = wheel_dy = 0.0f;
+    aux.ClearWheel();
+    aux.ClearPinch();
+    callback_target = {};
+    native_pinch_target = {};
+    ignored_fingers.clear();
+    tap_was_down = false;
+    hold_tracker = {};
+    swipe_tracker = {};
+    gesture_target.clear();
+    // Retire hooks and restore the borrowed thread only while guest execution is stopped.
+    // A busy pause/resume defers cleanup until the next tick; the old process stays retained.
+    const bool retired = RunWithGuestStopped([this] {
+        std::scoped_lock lock{guest_bridge_mutex};
+        if (auto* const thread = borrowed_thread.GetPointerUnsafe()) {
+            thread->GetContext() = saved_context;
+            borrowed_thread.SetObject(nullptr);
+        }
+        if (OwnerProcess() != nullptr) {
+            auto& memory = OwnerMemory();
+            for (const auto& [address, instruction] : patched_original) {
+                if (memory.IsValidVirtualAddressRange(address, sizeof(u32))) {
+                    memory.Write32(address, instruction);
+                    Core::InvalidateInstructionCacheRange(OwnerProcess(), address, sizeof(u32));
+                }
+            }
+        }
+        patched_original.clear();
+        spy_armed.clear();
+        call_seq = nullptr;
+        call_state = CallState::Idle;
+        g_guest_hooks_enabled.store(false, std::memory_order_relaxed);
+        // Atomic pointer clear plus the bridge lock prevent a late breakpoint callback from
+        // observing an owner after its final reference is dropped. All workers are joined above.
+        owner_pointer.store(nullptr, std::memory_order_release);
+        owner_process.SetObject(nullptr);
+    });
+    if (!retired) {
+        return;
+    }
+    aux.SetTouch({});
+    aux.ClearComposite();
+    aux.ClearUi();
+    // Use the built-in font, independently of package/module assets and cached game state.
+    Canvas notice;
+    notice.Resize(1240, 1080);
+    notice.Clear(0xFF101010u);
+    notice.DrawTextAligned(620, 440, "Companion paused", 6, 0xFFFFFFFFu, 1);
+    notice.DrawTextAligned(620, 540, "The running application changed.", 4, 0xFFFFFFFFu, 1);
+    notice.DrawTextAligned(620, 620, "Restart the game to use its companion.", 4, 0xFFFFFFFFu, 1);
+    aux.PublishUi(notice.Width(), notice.Height(), notice.Pixels());
+    process_notice_published = true;
+    LOG_WARNING(Core, "DSMod: companion stopped because its application process changed");
+}
 
 ModRuntime::~ModRuntime() {
     // Stop and join the redraw worker FIRST, before anything below tears down
@@ -56,12 +199,20 @@ ModRuntime::~ModRuntime() {
     // are destroyed) -- but that happens only AFTER this function's own body finishes, which is too
     // late relative to ShutdownGameModule() below. Mirrors NxAssetState::Stop()'s same reasoning.
     StopRedrawWorker();
+    DropFontPages(); // its loader reads through this runtime
     if (event) {
         core_timing.UnscheduleEvent(event);
     }
     ShutdownGameModule();
     ReleaseHeldInputs();
+    Core::HID::DSModPadGate::Reset(); // runtime 17: never leave the game's pad gated
+    Core::HID::DSModPadGate::BlockForContextChange(false);
     system.GPU().DSModAux().ClearUi();
+    // The brk gate stays open for the whole session (see OnGuestBreakpoint), but it belongs to
+    // this game: the runtime is destroyed only after the cores are shut down, and the next title
+    // in the same process gets fresh JITs. Leaving it set made every later game treat any JIT
+    // exception as a debug breakpoint (suspend) instead of upstream's log-and-continue.
+    g_guest_hooks_enabled.store(false, std::memory_order_relaxed);
 }
 
 void ModRuntime::SetMainMemoryParameters(VAddr main_region_begin_, u64 main_region_size_) {
@@ -73,11 +224,14 @@ void ModRuntime::Initialize() {
     if (event) {
         return;
     }
-    log_guest_threads = std::getenv("EDEN_DSMOD_THREADS") != nullptr;
+    system.GPU().DSModAux().companion_context_active.store(true, std::memory_order_release);
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+    dev.log_guest_threads = Common::DSMod::DevEnvironment("EDEN_DSMOD_THREADS") != nullptr;
+#endif
     // EDEN_DSMOD_NO_GUEST_BRIDGE=1 reproduces the handheld's NCE conditions on a Dynarmic desktop:
     // no frame hook, sequences or spies, so only memory reads and the title module feed the page.
     guest_bridge_supported =
-        !Settings::IsNceEnabled() && std::getenv("EDEN_DSMOD_NO_GUEST_BRIDGE") == nullptr;
+        !Settings::IsNceEnabled() && Common::DSMod::DevEnvironment("EDEN_DSMOD_NO_GUEST_BRIDGE") == nullptr;
     if (!guest_bridge_supported &&
         (manifest.frame_hook != 0 || !manifest.frame_hook_symbol.empty() ||
          !manifest.spies.empty() || !manifest.sequences.empty())) {
@@ -87,13 +241,17 @@ void ModRuntime::Initialize() {
     }
     InitializeGameModule();
 
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     // EDEN_DSMOD_DUMP_ROMFS="<path in romfs>:<file to write>" saves one file out of the running
     // game's *patched* filesystem. An update ships only the files it changes, so this is the only
     // way to get the metadata for a base+update pairing without owning a merged dump.
-    if (const char* const spec = std::getenv("EDEN_DSMOD_DUMP_ROMFS"); spec != nullptr) {
+    if (const char* const spec = Common::DSMod::DevEnvironment("EDEN_DSMOD_DUMP_ROMFS"); spec != nullptr) {
         const std::string text{spec};
         if (const auto split = text.rfind(':'); split != std::string::npos) {
-            const auto bytes = ReadAssetBytes("romfs:" + text.substr(0, split));
+            // Any registered source may be named ("aoc:x:/tmp/x"); a bare path is a romfs path.
+            const std::string what = text.substr(0, split);
+            const auto bytes =
+                ReadAssetBytes(AssetSources::PrefixOf(what).empty() ? "romfs:" + what : what);
             const auto out = text.substr(split + 1);
             if (bytes.empty()) {
                 LOG_ERROR(Core, "DSMod: '{}' not found in the game's romfs", text.substr(0, split));
@@ -105,10 +263,20 @@ void ModRuntime::Initialize() {
             }
         }
     }
+#endif
     flags = manifest.flag_defaults;
+    if (!manifest.persist_flags.empty()) {
+        const std::string package = manifest.name.empty() ? manifest.mod_dir_name : manifest.name;
+        flag_persistence = FlagPersistence{
+            PersistFlagsPath(PersistFlagsRoot(), manifest.title_id, package), manifest.persist_flags};
+        const size_t restored = flag_persistence.Restore(flags);
+        LOG_INFO(Core, "DSMod: {} persisted flag(s), {} restored from {}",
+                 manifest.persist_flags.size(), restored,
+                 Common::FS::PathToUTF8String(flag_persistence.File()));
+    }
     if (manifest.poll_hz != ModTickHz) {
-        LOG_WARNING(Core,
-                    "DSMod: manifest poll_hz={} is legacy metadata; runtime scheduling is fixed "
+        LOG_DEBUG(Core,
+                  "DSMod: manifest poll_hz={} is legacy metadata; runtime scheduling is fixed "
                     "at {} Hz and millisecond intervals use elapsed tick time",
                     manifest.poll_hz, ModTickHz);
     }
@@ -119,89 +287,92 @@ void ModRuntime::Initialize() {
             return std::nullopt;
         });
     core_timing.ScheduleLoopingEvent(ModTickNs, ModTickNs, event);
-    if (const char* const heap = std::getenv("EDEN_DSMOD_HEAPDUMP"); heap != nullptr) {
-        heapdump_path = heap;
-        LOG_INFO(Core, "DSMod: will snapshot the heap to '{}'", heapdump_path);
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+    // Search tools and headless input drivers (dev-tools builds only).
+    if (const char* const heap = Common::DSMod::DevEnvironment("EDEN_DSMOD_HEAPDUMP"); heap != nullptr) {
+        dev.heapdump_path = heap;
+        LOG_INFO(Core, "DSMod: will snapshot the heap to '{}'", dev.heapdump_path);
     }
     // The manifest can carry these too. An Android app inherits no environment, so a search that
     // can only be configured by an environment variable can only ever run on a desktop -- and the
     // device is where the interesting differences live.
     if (!manifest.find_spec.empty()) {
-        find_spec = manifest.find_spec;
+        dev.find_spec = manifest.find_spec;
     }
-    trace_target = manifest.trace_target;
-    if (!trace_target.empty()) {
-        LOG_INFO(Core, "DSMod: will trace a static route to '{}'", trace_target);
+    dev.trace_target = manifest.trace_target;
+    if (!dev.trace_target.empty()) {
+        LOG_INFO(Core, "DSMod: will trace a static route to '{}'", dev.trace_target);
     }
-    if (const char* const find = std::getenv("EDEN_DSMOD_FIND"); find != nullptr) {
-        find_spec = find;
+    if (const char* const find = Common::DSMod::DevEnvironment("EDEN_DSMOD_FIND"); find != nullptr) {
+        dev.find_spec = find;
     }
     // Dread stores its inventory in floats. Matching integers as well multiplies the
     // coincidences without adding one real candidate: 99 is among the commonest words in any
     // heap, and 99.0f is not.
-    if (const char* const only = std::getenv("EDEN_DSMOD_FINDFLOAT");
+    if (const char* const only = Common::DSMod::DevEnvironment("EDEN_DSMOD_FINDFLOAT");
         only != nullptr && only[0] == '1') {
-        find_float_only = true;
+        dev.find_float_only = true;
         LOG_INFO(Core, "DSMod: the value search will match float encodings only");
     }
-    if (!find_spec.empty()) {
-        LOG_INFO(Core, "DSMod: looking for the value cluster '{}'", find_spec);
+    if (!dev.find_spec.empty()) {
+        LOG_INFO(Core, "DSMod: looking for the value cluster '{}'", dev.find_spec);
     }
-    auto_start = std::getenv("EDEN_DSMOD_AUTOSTART") != nullptr;
-    if (const char* const path = std::getenv("EDEN_DSMOD_INPUT"); path != nullptr) {
+    dev.auto_start = Common::DSMod::DevEnvironment("EDEN_DSMOD_AUTOSTART") != nullptr;
+    if (const char* const path = Common::DSMod::DevEnvironment("EDEN_DSMOD_INPUT"); path != nullptr) {
         std::ifstream f(path);
         std::string token;
         while (f >> token) {
-            input_script.push_back(token);
+            dev.input_script.push_back(token);
         }
-        input_script_loaded = !input_script.empty();
-        LOG_INFO(Core, "DSMod: loaded {} input step(s) from {}", input_script.size(), path);
+        dev.input_script_loaded = !dev.input_script.empty();
+        LOG_INFO(Core, "DSMod: loaded {} input step(s) from {}", dev.input_script.size(), path);
     }
-    if (const char* const ms = std::getenv("EDEN_DSMOD_MOTION"); ms != nullptr) {
-        motion_spec = ms;
+    if (const char* const ms = Common::DSMod::DevEnvironment("EDEN_DSMOD_MOTION"); ms != nullptr) {
+        dev.motion_spec = ms;
         LOG_INFO(Core, "DSMod: walking to find a coordinate");
     }
-    if (const char* const ad = std::getenv("EDEN_DSMOD_ARRAY"); ad != nullptr) {
-        arraydump_spec = ad;
-        LOG_INFO(Core, "DSMod: will map value arrays of class '{}'", arraydump_spec);
+    if (const char* const ad = Common::DSMod::DevEnvironment("EDEN_DSMOD_ARRAY"); ad != nullptr) {
+        dev.arraydump_spec = ad;
+        LOG_INFO(Core, "DSMod: will map value arrays of class '{}'", dev.arraydump_spec);
     }
-    if (const char* const cd = std::getenv("EDEN_DSMOD_CLASSDUMP"); cd != nullptr) {
-        classdump_spec = cd;
-        LOG_INFO(Core, "DSMod: will dump objects of class '{}'", classdump_spec);
+    if (const char* const cd = Common::DSMod::DevEnvironment("EDEN_DSMOD_CLASSDUMP"); cd != nullptr) {
+        dev.classdump_spec = cd;
+        LOG_INFO(Core, "DSMod: will dump objects of class '{}'", dev.classdump_spec);
     }
-    if (const char* const pm = std::getenv("EDEN_DSMOD_PAIRMAX"); pm != nullptr) {
-        range_pair_max = std::strtof(pm, nullptr);
-        LOG_INFO(Core, "DSMod: a watched counter must be followed by {:g}", range_pair_max);
+    if (const char* const pm = Common::DSMod::DevEnvironment("EDEN_DSMOD_PAIRMAX"); pm != nullptr) {
+        dev.range_pair_max = std::strtof(pm, nullptr);
+        LOG_INFO(Core, "DSMod: a watched counter must be followed by {:g}", dev.range_pair_max);
     }
-    if (const char* const rw = std::getenv("EDEN_DSMOD_RANGE"); rw != nullptr) {
-        range_spec = rw;
-        LOG_INFO(Core, "DSMod: watching whole-numbered floats in '{}'", range_spec);
+    if (const char* const rw = Common::DSMod::DevEnvironment("EDEN_DSMOD_RANGE"); rw != nullptr) {
+        dev.range_spec = rw;
+        LOG_INFO(Core, "DSMod: watching whole-numbered floats in '{}'", dev.range_spec);
     }
-    if (const char* const fp = std::getenv("EDEN_DSMOD_FIELD"); fp != nullptr) {
-        field_spec = fp;
-        LOG_INFO(Core, "DSMod: field probe '{}'", field_spec);
+    if (const char* const fp = Common::DSMod::DevEnvironment("EDEN_DSMOD_FIELD"); fp != nullptr) {
+        dev.field_spec = fp;
+        LOG_INFO(Core, "DSMod: field probe '{}'", dev.field_spec);
     }
-    if (const char* const hf = std::getenv("EDEN_DSMOD_HEAPFIND"); hf != nullptr) {
-        heapfind_spec = hf;
-        LOG_INFO(Core, "DSMod: heap search for '{}'", heapfind_spec);
+    if (const char* const hf = Common::DSMod::DevEnvironment("EDEN_DSMOD_HEAPFIND"); hf != nullptr) {
+        dev.heapfind_spec = hf;
+        LOG_INFO(Core, "DSMod: heap search for '{}'", dev.heapfind_spec);
     }
-    if (const char* const diff = std::getenv("EDEN_DSMOD_DIFF"); diff != nullptr) {
-        diff_spec = diff;
-        LOG_INFO(Core, "DSMod: fire/rest differential search around '{}'", diff_spec);
+    if (const char* const diff = Common::DSMod::DevEnvironment("EDEN_DSMOD_DIFF"); diff != nullptr) {
+        dev.diff_spec = diff;
+        LOG_INFO(Core, "DSMod: fire/rest differential search around '{}'", dev.diff_spec);
     }
-    if (const char* const scan = std::getenv("EDEN_DSMOD_SCAN"); scan != nullptr) {
-        scan_spec = scan;
-        LOG_INFO(Core, "DSMod: scanning for moving floats '{}'", scan_spec);
+    if (const char* const scan = Common::DSMod::DevEnvironment("EDEN_DSMOD_SCAN"); scan != nullptr) {
+        dev.scan_spec = scan;
+        LOG_INFO(Core, "DSMod: scanning for moving floats '{}'", dev.scan_spec);
     }
-    if (const char* const spec = std::getenv("EDEN_DSMOD_DUMP"); spec != nullptr) {
-        dump_spec = spec;
-        LOG_INFO(Core, "DSMod: watching memory '{}'", dump_spec);
+    if (const char* const spec = Common::DSMod::DevEnvironment("EDEN_DSMOD_DUMP"); spec != nullptr) {
+        dev.dump_spec = spec;
+        LOG_INFO(Core, "DSMod: watching memory '{}'", dev.dump_spec);
     }
+#endif
     {
         // Enable the GPU composite path via the env var (desktop testing) OR a manifest "flags"
         // entry "gpu_composite": true (the reliable switch on Android, where the app gets no shell
-        // env -- push a manifest with the flag on to turn it on for the Thor).
-        const char* const gc = std::getenv("EDEN_DSMOD_GPU_COMPOSITE");
+        // env -- push a manifest with the flag on to turn it on for a device).
+        const char* const gc = Common::DSMod::DevEnvironment("EDEN_DSMOD_GPU_COMPOSITE");
         const bool env_gc = gc != nullptr && gc[0] == '1';
         const bool env_off = gc != nullptr && gc[0] == '0'; // explicit "0" overrides the manifest
         const auto gcf = manifest.flag_defaults.find("gpu_composite");
@@ -222,9 +393,9 @@ void ModRuntime::DumpWatchedMemory() {
 #endif
 }
 
-void ModRuntime::DumpOneWatch([[maybe_unused]] const std::string& dump_spec) {
+void ModRuntime::DumpOneWatch([[maybe_unused]] const std::string& spec) {
 #if EDEN_DSMOD_BUILD_DEV_TOOLS
-    DumpOneWatchImpl(dump_spec);
+    DumpOneWatchImpl(spec);
 #endif
 }
 
@@ -351,6 +522,10 @@ void ModRuntime::DriveCmd() {
 }
 
 void ModRuntime::Tick() {
+    if (!IsOwnerContext()) {
+        RefuseChangedProcess();
+        return;
+    }
     static thread_local RuntimeStageStats stats;
     const RuntimeStageTimer timer{stats, "tick"};
     ++tick_count;
@@ -370,6 +545,7 @@ void ModRuntime::Tick() {
     // reveals more than the game's own minimap). The self-tracked MarkVisitedAt fallback still runs
     // in-session when the grid can't be read; it just no longer survives a restart.
 
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     // Headless entry into gameplay: pulse the buttons that get a save loaded and a cutscene
     // skipped, until the game reports a player. Only for unattended runs -- it stops the moment
     // gameplay starts, so it cannot fight a person at the controls.
@@ -377,10 +553,10 @@ void ModRuntime::Tick() {
     // search tools for a game with no points yet) InGameplay() is always true, and the very
     // override that enables exploration silently disabled the presses that make it possible.
     static const u64 autostart_ticks = [] {
-        const char* const v = std::getenv("EDEN_DSMOD_AUTOSTART_TICKS");
+        const char* const v = Common::DSMod::DevEnvironment("EDEN_DSMOD_AUTOSTART_TICKS");
         return v != nullptr ? std::strtoull(v, nullptr, 0) : u64{60 * 60 * 30};
     }();
-    if (auto_start && !InGameplayHonest() && tick_count < autostart_ticks) {
+    if (dev.auto_start && !InGameplayHonest() && tick_count < autostart_ticks) {
         if (auto* const pad = system.GetInputSubsystem() != nullptr
                                   ? system.GetInputSubsystem()->GetVirtualGamepad()
                                   : nullptr) {
@@ -389,7 +565,7 @@ void ModRuntime::Tick() {
             // differ in what their menus need, and B in the wrong place backs out of them.
             static const std::vector<std::string> keys = [] {
                 std::vector<std::string> parsed;
-                const char* const spec = std::getenv("EDEN_DSMOD_AUTOSTART");
+                const char* const spec = Common::DSMod::DevEnvironment("EDEN_DSMOD_AUTOSTART");
                 if (spec != nullptr && std::strchr(spec, ',') != nullptr) {
                     std::string token;
                     for (const char* c = spec;; ++c) {
@@ -423,10 +599,11 @@ void ModRuntime::Tick() {
     // each "BUTTON" or "BUTTON:ticks" (default 6 held / then Gap released). Unlike AUTOSTART's
     // loop this plays once, so it can complete a form -- pick a field, choose a value, confirm --
     // which a repeating pattern never can. Stick directions: LX+/LX-/LY+/LY- (held as a deflect).
-    if (input_script_loaded) {
+    if (dev.input_script_loaded) {
         DriveInputScript();
     }
     DriveLiveInput();
+#endif
     DriveCmd();
     DriveAutoChain();
     // Input ownership must age independently of the aux surface. A display can disappear while a
@@ -437,17 +614,18 @@ void ModRuntime::Tick() {
     TickAutoMgrFindImpl();
 #endif
 
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
     // Diagnostic: where are the guest threads? Useful when a title hangs before it ever presents.
-    if (log_guest_threads && (tick_count % 180) == 0) {
-        if (auto* const process = system.ApplicationProcess(); process != nullptr) {
+    if (dev.log_guest_threads && (tick_count % 180) == 0) {
+        if (auto* const process = OwnerProcess(); process != nullptr) {
             std::string summary;
             int listed = 0;
             for (const auto& thread : process->GetThreadList()) {
                 const u64 pc = thread.GetContext().pc;
                 const s64 rel = static_cast<s64>(pc) - static_cast<s64>(main_region_begin);
-                summary += fmt::format(" [{}:{:X}{}]", thread.GetThreadId(), pc,
+                summary += std::format(" [{}:{:X}{}]", thread.GetThreadId(), pc,
                                        (rel >= 0 && rel < static_cast<s64>(main_region_size))
-                                           ? fmt::format(" main+{:X}", rel)
+                                           ? std::format(" main+{:X}", rel)
                                            : std::string{});
                 if (++listed >= 12) {
                     break;
@@ -456,21 +634,35 @@ void ModRuntime::Tick() {
             LOG_INFO(Core, "DSMod guest threads:{}", summary);
         }
     }
+#endif
 
     auto& aux = system.GPU().DSModAux();
     if (!aux.present.load()) {
         // Action-capable modules may have an asynchronous guest mailbox to retire even while the
         // auxiliary surface is hidden. Keep that cheap extension tick alive without running the
         // declarative sampler or legacy modules such as Dread, whose tick performs full scans.
-        if (game_module_instance && game_module && game_module->Extensions() &&
-            game_module->Extensions()->on_action) {
+        if (ModuleTicksWhileHidden()) {
             StateSnapshot& snapshot = tick_snapshot;
             snapshot.ints.clear();
             snapshot.texts.clear();
             snapshot.floats.clear();
             snapshot.addresses.clear();
+            UpdateHostValues(); // runtime 21: what the module's get_i64 answers
             RunGameModule(snapshot, true);
         }
+        // What the package does to the game itself must not depend on whether a second display
+        // exists (lid closed at boot, one-display setups): code patches, spies, and the watchdog
+        // for a call that went in just before the surface vanished. With the surface shown these
+        // run from ApplyEnforceRules / after the page binds, exactly as before.
+        MaintainGuestBridge();
+        ArmSpies();
+        NavOff("second screen hidden"); // runtime 17: the game gets its controller back
+        aux.ClearWheel();
+        aux.ClearPinch();
+        callback_target = {};
+        native_pinch_target = {};
+        wheel_target.clear();
+        wheel_dx = wheel_dy = 0.0f;
         return;
     }
 
@@ -488,28 +680,72 @@ void ModRuntime::Tick() {
     const u32 panel_h = std::max(1u, aux.height.load());
     const u32 cw = canvas.Width() != 0 ? canvas.Width() : panel_w;
     const u32 ch = canvas.Height() != 0 ? canvas.Height() : panel_h;
+    aux.SetCanvasRect(TouchRect(panel_w, panel_h, cw, ch)); // for frontends' scripted touches
     DriveCmdDrag(panel_w, panel_h, cw, ch); // console "drag": feeds the touch read just below
     const size_t count = aux.GetTouch(points);
 
+    UpdateHostValues(); // runtime 21: before the module, which may read them through get_i64
     RunGameModule(snapshot, true);
-    for (const auto& [name, value] : flags) {
-        snapshot.ints["@flag:" + name] = value; // runtime flags are sources for derived values too
+    WatchFontEpoch(snapshot);  // runtime 18: the module may ask for its font again
+    PublishFlags(snapshot);    // runtime flags are sources for derived values too
+    if (manifest.uses_clock_keys) {
+        // Runtime 16 @clock.* / @game.seconds, also derived sources. Only for a package that
+        // names them: they change every second and would otherwise churn UiSignature.
+        clock_points.Publish(snapshot);
+    }
+    if (manifest.uses_host_keys) {
+        // Runtime 21 @device.* / @perf.*: change at most twice a second.
+        host_values.Publish(snapshot);
     }
     EvaluateDerived(snapshot); // after every source (points, sequences, module) is published
-    // View gestures are a shared host feature, available to every package.
+    // View gestures are a shared host feature, available to every package. Bound default views
+    // first (runtime 15): "custom" is measured against each view's home
+    // (zoom 1 / no pan without one).
+    // Runtime 17 auto_w: from here on (hit tests, the dirty scan, the synchronous draw) text-sized
+    // boxes are measured on the tick canvas, with its fonts, as the page draws them.
+    const TextProvider measure_texts = [this](const std::string& ref) { return GetMsbtText(ref); };
+    const TextMeasureScope text_measure{canvas, &measure_texts};
+    ApplyViewDefaults(snapshot);
     {
         std::scoped_lock lock{view_mutex};
         for (const auto& [key, view] : view_state) {
-            const bool custom = view.gliding || std::fabs(view.zoom - 1.0f) > 0.001f ||
-                                std::fabs(view.pan_x) > 0.5f || std::fabs(view.pan_y) > 0.5f;
-            snapshot.ints["view_custom:" + key] = custom ? 1 : 0;
+            // As drawn: an Image's pan_bounds clamp the pan compared (mod_view_default.h).
+            const Widget* const widget = FindWidgetByKey(key);
+            snapshot.ints[view_custom_keys(key)] =
+                (widget ? ViewAwayFromHome(view, *widget) : ViewAwayFromHome(view)) ? 1 : 0;
+            // The view itself, for pages and (through PanZoomViewHostValue) modules.
+            snapshot.floats["@view_zoom:" + key] = view.zoom;
+            snapshot.floats["@view_pan_x:" + key] = view.pan_x;
+            snapshot.floats["@view_pan_y:" + key] = view.pan_y;
         }
     }
 
-    PublishMapState(snapshot);     // @flag:* etc. before hit-testing (panels gated on a flag)
+    // Map selections etc. before hit-testing. The flags were published above and nothing since
+    // has changed them, so this pass skips republishing them.
+    PublishMapState(snapshot, false);
     PublishScroll(snapshot, true); // list offsets as drawn: taps hit-test the rows on screen
     UpdateGestures(snapshot, points, count, panel_w, panel_h, cw, ch);
+    std::array<VideoCore::DSMod::AuxPinchEvent,
+               VideoCore::DSMod::AuxRouting::MaxPinchEvents> pinch_events{};
+    const size_t pinch_count = aux.TakePinch(pinch_events);
+    UpdateNativePinch(snapshot, std::span{pinch_events}.first(pinch_count), panel_w, panel_h, cw, ch,
+                      count != 0 || !live_fingers.empty());
+    std::array<VideoCore::DSMod::AuxWheelEvent,
+               VideoCore::DSMod::AuxRouting::MaxWheelEvents> wheel_events{};
+    const size_t wheel_count = aux.TakeWheel(wheel_events);
+    UpdateWheel(snapshot, std::span{wheel_events}.first(wheel_count), panel_w, panel_h, cw, ch,
+                count != 0 || !live_fingers.empty());
     ReturnIdleViews();
+    UpdateNav(snapshot); // runtime 17: controller focus mode; its A press is a tap drained below
+    if (HasPendingInput()) {
+        // Runtime 16: the taps' gates (enabled_bind and the derived values they read) see this
+        // tick's "@sel:" / "@drag*", the drag being dropped included.
+        PublishInteraction(snapshot, true);
+        if (!manifest.derived.empty() && derived_order_list == manifest.derived.data() &&
+            derived_order_size == manifest.derived.size() && derived_reads_interaction) {
+            EvaluateDerived(snapshot, true);
+        }
+    }
     DrainTaps(snapshot);
     FlushHaptic();                // at most one per tick, handed to the frontend's notifier thread
     PublishInteraction(snapshot); // selection / drag state as of this tick, for the page
@@ -553,14 +789,14 @@ void ModRuntime::Tick() {
             // marker's player_x/y come from the minimap-grid tracker), so report the value
             // whenever one exists and say "unresolved" only when there is neither.
             if (const auto number = snapshot.floats.find(name); number != snapshot.floats.end()) {
-                summary += fmt::format("{}={:g} ", name, number->second);
+                summary += std::format("{}={:g} ", name, number->second);
             } else if (const auto whole = snapshot.ints.find(name); whole != snapshot.ints.end()) {
-                summary += fmt::format("{}={} ", name, whole->second);
+                summary += std::format("{}={} ", name, whole->second);
             } else if (const auto address = snapshot.addresses.find(name);
                        address == snapshot.addresses.end() || address->second == 0) {
-                summary += fmt::format("{}=unresolved ", name);
+                summary += std::format("{}=unresolved ", name);
             } else {
-                summary += fmt::format("{}=? ", name);
+                summary += std::format("{}=? ", name);
             }
         }
         LOG_INFO(Core, "DSMod snapshot: {}", summary);
@@ -569,6 +805,12 @@ void ModRuntime::Tick() {
     // Redraw every tick (~60 Hz) so the marker tracks smoothly. This is affordable now that the
     // aux screen presents on its own thread (force_present_thread) instead of blocking the game's
     // render thread once per frame -- that per-frame present, not this redraw, was the fps cost.
+    // Runtime 17: Chart widgets sample their bound values (after every source and derived value).
+    chart_sampler.Update(manifest,
+                         static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count()),
+                         snapshot);
     PublishNxFades(snapshot);
     PublishUi(snapshot);
 }

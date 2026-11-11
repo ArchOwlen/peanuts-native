@@ -26,8 +26,10 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <format>
 #include <limits>
 #include <sstream>
+#include <tuple>
 
 #include <nlohmann/json.hpp>
 
@@ -38,9 +40,12 @@
 #include "core/core.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/mods/mod_input_tokens.h"
 #include "core/mods/mod_nx_assets.h"
+#include "core/mods/mod_package_io.h"
 #include "core/mods/mod_runtime.h"
 #include "core/mods/mod_runtime_shared.h"
+#include "core/mods/mod_settings.h"
 
 namespace Core::Mods {
 
@@ -103,6 +108,15 @@ std::shared_ptr<const std::unordered_map<s64, u32>> ParseColorMap(const nlohmann
     return map;
 }
 
+/// j[key] when it is a string, else `fallback` (json::value throws on a wrong type; the runtime
+/// 16/17 parsers use this instead so a mistyped key is ignored, not a failed package).
+std::string StringOr(const nlohmann::json& j, const char* key, std::string fallback = {}) {
+    if (const auto it = j.find(key); it != j.end() && it->is_string()) {
+        return it->get<std::string>();
+    }
+    return fallback;
+}
+
 s64 ParseNumber(const nlohmann::json& value, s64 fallback = 0) {
     if (value.is_number_integer()) {
         return value.get<s64>();
@@ -122,6 +136,20 @@ s64 ParseNumber(const nlohmann::json& value, s64 fallback = 0) {
         }
     }
     return fallback;
+}
+
+// Coordinates accept decimal JSON numbers; game addresses keep integer parsing.
+s32 ParseCoordinate(const nlohmann::json& value) {
+    if (value.is_number_float()) {
+        const double n = value.get<double>();
+        if (!std::isfinite(n))
+            return 0;
+        return static_cast<s32>(
+            std::round(std::clamp(n, static_cast<double>(std::numeric_limits<s32>::min()),
+                                  static_cast<double>(std::numeric_limits<s32>::max()))));
+    }
+    return static_cast<s32>(std::clamp<s64>(ParseNumber(value), std::numeric_limits<s32>::min(),
+                                            std::numeric_limits<s32>::max()));
 }
 
 ValueType ParseValueType(const std::string& text) {
@@ -167,6 +195,8 @@ WidgetType ParseWidgetType(const std::string& text) {
         return WidgetType::Image;
     if (text == "map")
         return WidgetType::Map;
+    if (text == "chart")
+        return WidgetType::Chart; // runtime 17
     return WidgetType::Label;
 }
 
@@ -468,6 +498,31 @@ void ParseDerived(const nlohmann::json& list, std::vector<DerivedPoint>& out) {
                 }
             }
         }
+        // Runtime 16: "countdown": <target name or constant>, "now": <name> (default
+        // "@clock.epoch") -> max(0, target - now).
+        if (d.contains("countdown")) {
+            const auto& t = d.at("countdown");
+            if (t.is_number()) {
+                entry.countdown_target.is_const = true;
+                entry.countdown_target.const_value = t.get<f64>();
+            } else if (t.is_string()) {
+                entry.countdown_target.name = t.get<std::string>();
+            }
+            if (t.is_number() || t.is_string()) {
+                const auto now = StringOr(d, "now");
+                entry.countdown_now = now.empty() ? std::string{"@clock.epoch"} : now;
+            }
+        }
+        // Runtime 17: "expr": "<expression>" (mod_expr.h), compiled once here. A compile error is
+        // logged and the value publishes 0.
+        if (d.contains("expr") && d.at("expr").is_string()) {
+            entry.expr = d.at("expr").get<std::string>();
+            entry.expr_program = CompileExpr(entry.expr);
+            if (!entry.expr_program->Ok()) {
+                LOG_WARNING(Core, "DSMod: derived '{}': expr \"{}\": {} (publishes 0)", entry.name,
+                            entry.expr, entry.expr_program->error);
+            }
+        }
         const auto same = std::ranges::find(out, entry.name, &DerivedPoint::name);
         if (same != out.end()) {
             *same = std::move(entry);
@@ -510,12 +565,33 @@ std::optional<ScrollRegion> ParseScrollRegion(const nlohmann::json& j) {
     r.pad = static_cast<s32>(j.contains("pad") ? ParseNumber(j.at("pad")) : 0);
     r.show = ParseGate(j, "show_bind");
     r.reset_bind = j.value("reset_bind", std::string{});
+    r.follow_bind = j.value("follow_bind", std::string{});
+    r.follow_open = j.value("follow_open", false);
     r.fling = j.value("fling", true);
     r.friction = std::clamp(static_cast<float>(j.value("friction", 0.135)), 0.0001f, 0.99f);
+    r.bar_src = StringOr(j, "bar_src");
+    r.bar_track_src = StringOr(j, "bar_track_src");
     r.bar_color = ParseColor(j, "bar", 0);
     r.bar_track = ParseColor(j, "bar_track", 0);
     r.bar_w =
         std::max<s32>(1, static_cast<s32>(j.contains("bar_w") ? ParseNumber(j.at("bar_w")) : 6));
+    // Two-axis scrolling (runtime 22); every key optional.
+    if (j.contains("axes")) {
+        const std::string axes = j.at("axes").is_string() ? j.at("axes").get<std::string>() : "";
+        if (axes == "x") {
+            r.axes = ScrollRegion::AxisX;
+        } else if (axes == "xy" || axes == "yx") {
+            r.axes = ScrollRegion::AxisX | ScrollRegion::AxisY;
+        } else if (axes != "y") {
+            LOG_WARNING(Core, "DSMod: scroll region '{}': \"axes\" must be \"x\", \"y\" or \"xy\"; using y",
+                        r.id);
+        }
+    }
+    r.lock_axis = j.value("lock_axis", false);
+    r.content_w = static_cast<s32>(j.contains("content_w") ? ParseNumber(j.at("content_w")) : 0);
+    r.content_h = static_cast<s32>(j.contains("content_h") ? ParseNumber(j.at("content_h")) : 0);
+    r.content_w_bind = j.value("content_w_bind", std::string{});
+    r.content_h_bind = j.value("content_h_bind", std::string{});
     if (r.rect[2] <= 0 || r.rect[3] <= 0) {
         LOG_WARNING(Core, "DSMod: scroll region '{}' has an empty rect", r.id);
     }
@@ -628,6 +704,146 @@ void ParseHaptics(const nlohmann::json& j, HapticsConfig& out) {
                         j.at(HapticKindNames[k]).dump());
         }
     }
+}
+
+/// Manifest "nav" (runtime 17) and "haptics": {"nav": ...}. Absent = on for a package written for
+/// runtime 17 or later (min_runtime >= 17), off for an older one so a published package keeps its
+/// behaviour; "nav": true or an object (without "enabled": false) turns it on for any package.
+/// (A min_runtime >= 17 given only in package.json is applied by the loader: NavDefaultOn.)
+void ParseNav(const nlohmann::json& json, NavConfig& out) {
+    out = NavConfig{};
+    out.enabled = NavDefaultOn(&json, nullptr);
+    if (json.contains("haptics") && json.at("haptics").is_object() &&
+        json.at("haptics").contains("nav")) {
+        if (const auto strength = ParseHapticStrength(json.at("haptics").at("nav"))) {
+            out.haptic = static_cast<s8>(*strength);
+        }
+    }
+    if (!json.contains("nav")) {
+        return;
+    }
+    const auto& j = json.at("nav");
+    if (j.is_boolean()) {
+        out.enabled = j.get<bool>();
+        return;
+    }
+    if (!j.is_object()) {
+        LOG_WARNING(Core, "DSMod: \"nav\" must be an object or a boolean");
+        return;
+    }
+    out.enabled = true; // an explicit "nav" object opts in, whatever the package's min_runtime
+    if (j.contains("enabled") && j.at("enabled").is_boolean()) {
+        out.enabled = j.at("enabled").get<bool>();
+    }
+    if (j.contains("toggle") && j.at("toggle").is_string()) {
+        const auto text = j.at("toggle").get<std::string>();
+        if (const auto mask = Nav::ParseChord(text)) {
+            out.toggle = text;
+            out.toggle_mask = *mask;
+        } else {
+            LOG_WARNING(Core,
+                        "DSMod: nav.toggle '{}' is not a chord of two or more buttons; using {}",
+                        text, Nav::DefaultToggle);
+        }
+    }
+    out.color = ParseColor(j, "color", out.color);
+    if (j.contains("frame") && j.at("frame").is_number()) {
+        out.frame = static_cast<s32>(std::clamp(j.at("frame").get<f64>(), -1.0, 64.0));
+    }
+    if (j.contains("src") && j.at("src").is_string()) {
+        out.src = j.at("src").get<std::string>();
+    }
+    if (j.contains("haptic")) {
+        if (const auto strength = ParseHapticStrength(j.at("haptic"))) {
+            out.haptic = static_cast<s8>(*strength);
+        }
+    }
+}
+
+/// Runtime 16: image transforms and fills ("rotate", "rotate_bind", "pivot", "scale_bind",
+/// "tint", "tint_bind", "tint_colors", "fill", "slice", "fill_dir", Bar "image"). Every key is
+/// optional and its absence leaves the widget exactly as before runtime 16.
+void ParseImageStyleKeys(const nlohmann::json& w, Widget& widget) {
+    const auto number = [](const nlohmann::json& v) {
+        return v.is_number() ? v.get<f64>() : static_cast<f64>(ParseNumber(v));
+    };
+    if (w.contains("rotate") && w.at("rotate").is_number()) {
+        const f64 deg = w.at("rotate").get<f64>();
+        widget.rotate = std::isfinite(deg) ? static_cast<float>(std::fmod(deg, 360.0)) : 0.0f;
+    }
+    widget.rotate_bind = StringOr(w, "rotate_bind");
+    widget.scale_bind = StringOr(w, "scale_bind");
+    if (w.contains("pivot") && w.at("pivot").is_array() && w.at("pivot").size() == 2) {
+        const f64 px = number(w.at("pivot")[0]), py = number(w.at("pivot")[1]);
+        if (std::isfinite(px) && std::isfinite(py)) {
+            widget.pivot = {static_cast<float>(px), static_cast<float>(py)};
+            widget.has_pivot = true;
+        }
+    }
+    if (w.contains("tint")) {
+        widget.tint = ParseColor(w, "tint", 0xFFFFFFFFu);
+        widget.has_tint = true;
+    }
+    widget.tint_bind = StringOr(w, "tint_bind");
+    if (w.contains("tint_colors") && w.at("tint_colors").is_array()) {
+        for (const auto& c : w.at("tint_colors")) {
+            nlohmann::json wrap = nlohmann::json::object();
+            wrap["c"] = c;
+            widget.tint_colors.push_back(ParseColor(wrap, "c", 0xFFFFFFFFu));
+        }
+    }
+    if (w.contains("fill") && w.at("fill").is_string()) {
+        const std::string fill = w.at("fill").get<std::string>();
+        if (fill == "tile") {
+            widget.fill = ImageFill::Tile;
+        } else if (fill == "slice") {
+            widget.fill = ImageFill::Slice;
+        } else if (fill != "stretch") {
+            LOG_WARNING(Core, "DSMod: widget '{}': fill '{}' not understood; stretch", widget.id,
+                        fill);
+        }
+    }
+    if (w.contains("slice") && w.at("slice").is_array() && w.at("slice").size() == 4) {
+        for (size_t i = 0; i < 4; ++i) {
+            widget.slice[i] = static_cast<s32>(std::clamp<s64>(ParseNumber(w.at("slice")[i]), 0,
+                                                               1 << 16));
+        }
+    }
+    if (w.contains("fill_dir") && w.at("fill_dir").is_string()) {
+        const std::string dir = w.at("fill_dir").get<std::string>();
+        widget.fill_dir = dir == "left"   ? BarFillDir::Left
+                          : dir == "up"   ? BarFillDir::Up
+                          : dir == "down" ? BarFillDir::Down
+                                          : BarFillDir::Right;
+    }
+    if (widget.type == WidgetType::Bar && w.contains("image") && w.at("image").is_string()) {
+        widget.fill_image = w.at("image").get<std::string>();
+    }
+}
+
+/// Runtime 17: a Chart widget's "samples", "interval_ms", "style", "min" and "max". `index` is the
+/// widget's position on its page, naming the ring buffer when the widget has no id.
+std::shared_ptr<const ChartSpec> ParseChartSpec(const nlohmann::json& w, const Widget& widget,
+                                                const std::string& page_id, size_t index) {
+    auto spec = std::make_shared<ChartSpec>();
+    spec->key = widget.id.empty() ? page_id + "#" + std::to_string(index) : widget.id;
+    if (w.contains("samples")) {
+        spec->samples = static_cast<u32>(std::clamp<s64>(ParseNumber(w.at("samples"), 60), 2, 1024));
+    }
+    if (w.contains("interval_ms")) {
+        spec->interval_ms =
+            static_cast<u32>(std::clamp<s64>(ParseNumber(w.at("interval_ms"), 1000), 16, 3600000));
+    }
+    spec->style =
+        StringOr(w, "style", "line") == "bar" ? ChartSpec::Style::Bar : ChartSpec::Style::Line;
+    for (const auto& [key, has, out] :
+         {std::tuple{"min", &spec->has_min, &spec->min}, std::tuple{"max", &spec->has_max, &spec->max}}) {
+        if (w.contains(key) && w.at(key).is_number() && std::isfinite(w.at(key).get<f64>())) {
+            *has = true;
+            *out = w.at(key).get<f64>();
+        }
+    }
+    return spec;
 }
 
 /// A widget's "anim" (null when absent or unusable).
@@ -747,9 +963,24 @@ void ParseFloatPair(const nlohmann::json& j, const char* key, float& a, float& b
 
 /// Map widget "groups", "label_style" and tap keys; null when none is present.
 std::shared_ptr<const MapWidgetExtras> ParseMapWidgetExtras(const nlohmann::json& w) {
-    static constexpr std::array keys{
-        "groups",           "label_style",   "on_map_tap",        "on_marker_tap",
-        "tap_enabled_bind", "marker_hit_px", "marker_tap_groups", "empty_tap_deselects"};
+    static constexpr std::array keys{"groups",
+                                     "label_style",
+                                     "on_map_tap",
+                                     "on_marker_tap",
+                                     "tap_enabled_bind",
+                                     "marker_hit_px",
+                                     "marker_tap_groups",
+                                     "empty_tap_deselects",
+                                     "view_rect_x0_bind",
+                                     "view_rect_y0_bind",
+                                     "view_rect_x1_bind",
+                                     "view_rect_y1_bind",
+                                     "view_rect_pad",
+                                     "image_bind",
+                                     "marker_rotate_bind",
+                                     "view_rotate_bind",
+                                     "marker_tint",
+                                     "overlays"};
     if (std::ranges::none_of(keys, [&](const char* k) { return w.contains(k); })) {
         return nullptr;
     }
@@ -781,12 +1012,67 @@ std::shared_ptr<const MapWidgetExtras> ParseMapWidgetExtras(const nlohmann::json
         st.outline_color = ParseColor(ls, "outline_color", st.outline_color);
         st.outline = static_cast<s32>(ls.value("outline", st.outline));
         st.opacity = std::clamp(JsonFloat(ls, "opacity", st.opacity), 0.0f, 1.0f);
+        st.avoid_overlap = ls.value("avoid_overlap", st.avoid_overlap);
     }
     extras->on_map_tap = w.value("on_map_tap", std::string{});
     extras->on_marker_tap = w.value("on_marker_tap", std::string{});
     extras->empty_tap_deselects = w.value("empty_tap_deselects", true);
     extras->tap_enabled = ParseGate(w, "tap_enabled_bind");
     extras->marker_hit_px = std::max<s32>(32, static_cast<s32>(w.value("marker_hit_px", 32)));
+    // Runtime 14: the bound default view rect (all four binds, or none takes effect).
+    static constexpr std::array rect_keys{"view_rect_x0_bind", "view_rect_y0_bind",
+                                          "view_rect_x1_bind", "view_rect_y1_bind"};
+    for (size_t i = 0; i < rect_keys.size(); ++i) {
+        extras->view_rect_binds[i] = w.value(rect_keys[i], std::string{});
+    }
+    extras->view_rect_pad = std::max(0.0f, JsonFloat(w, "view_rect_pad", 0.0f));
+    // Runtime 14: a bound base picture and world-space overlays.
+    // A bind key must name a published value; a wrong type is skipped with a warning rather
+    // than failing the whole manifest.
+    const auto bind_name = [&w](const char* key) -> std::string {
+        if (!w.contains(key)) {
+            return {};
+        }
+        if (!w.at(key).is_string()) {
+            LOG_WARNING(Core, "DSMod: map widget {} must be a name; ignored", key);
+            return {};
+        }
+        return w.at(key).get<std::string>();
+    };
+    extras->image_bind = bind_name("image_bind");
+    extras->marker_rotate_bind = bind_name("marker_rotate_bind");
+    extras->view_rotate_bind = bind_name("view_rotate_bind"); // runtime 22
+    extras->marker_tint = ParseColor(w, "marker_tint", 0xFFFFFFFFu);
+    if (w.contains("overlays") && w.at("overlays").is_array()) {
+        for (const auto& o : w.at("overlays")) {
+            if (!o.is_object()) {
+                continue;
+            }
+            MapWidgetExtras::Overlay ov;
+            ov.src = o.value("src", std::string{});
+            ov.src_bind = o.value("src_bind", std::string{});
+            ov.src_detail_bind = o.value("src_detail_bind", std::string{});
+            ov.mask_bind = o.value("mask_bind", std::string{}); // runtime 24
+            ov.detail_threshold = std::max(1.0f, JsonFloat(o, "detail_threshold", 210.0f));
+            ov.x0 = JsonFloat(o, "x0", 0.0f);
+            ov.y0 = JsonFloat(o, "y0", 0.0f);
+            ov.x1 = JsonFloat(o, "x1", 0.0f);
+            ov.y1 = JsonFloat(o, "y1", 0.0f);
+            ov.show = ParseGate(o, "show_bind");
+            ov.opacity = std::clamp(JsonFloat(o, "opacity", 1.0f), 0.0f, 1.0f);
+            if ((ov.src.empty() && ov.src_bind.empty()) || ov.x0 == ov.x1 || ov.y0 == ov.y1) {
+                LOG_WARNING(Core,
+                            "DSMod: map overlay without src/src_bind or an empty box ignored");
+                continue;
+            }
+            extras->overlays.push_back(std::move(ov));
+        }
+    }
+    if (!extras->HasViewRect() &&
+        std::ranges::any_of(extras->view_rect_binds, [](const auto& b) { return !b.empty(); })) {
+        LOG_WARNING(Core, "DSMod: map widget has only some view_rect_*_bind keys; the view rect "
+                          "needs all four and is ignored");
+    }
     if (w.contains("marker_tap_groups") && w.at("marker_tap_groups").is_array()) {
         for (const auto& g : w.at("marker_tap_groups")) {
             if (g.is_string()) {
@@ -927,6 +1213,45 @@ void ParseMapAreasInto(const nlohmann::json& areas,
                 dm.opacity = std::clamp(JsonFloat(d, "opacity", 1.0f), 0.0f, 1.0f);
                 dm.show = ParseGate(d, "show_bind");
                 dm.hide = ParseGate(d, "hide_bind");
+                // Runtime 14: per-slot pictures, world size, bar, dim and frame / tint.
+                dm.icon_src_bind = d.value("icon_src_bind", std::string{});
+                dm.size_world = std::max(0.0f, JsonFloat(d, "size_world", 0.0f));
+                dm.size_max = std::max(0.0f, JsonFloat(d, "size_max", 0.0f));
+                dm.bar_bind = d.value("bar_bind", std::string{});
+                dm.bar_max_bind = d.value("bar_max_bind", std::string{});
+                dm.bar_max = d.contains("bar_max") ? ParseNumber(d.at("bar_max")) : 100;
+                dm.bar_color = ParseColor(d, "bar_color", dm.bar_color);
+                dm.bar_bg = ParseColor(d, "bar_bg", dm.bar_bg);
+                dm.bar_h = static_cast<s32>(d.value("bar_h", 0));
+                dm.dim_bind = d.value("dim_bind", std::string{});
+                dm.frame_color_bind = d.value("frame_color_bind", std::string{});
+                dm.frame_px = static_cast<s32>(d.value("frame_px", 0));
+                dm.tint_bind = d.value("tint_bind", std::string{});
+                // Time-animated markers (runtime 22).
+                if (d.contains("frames") && d.at("frames").is_array()) {
+                    for (const auto& f : d.at("frames")) {
+                        if (f.is_string() && !f.get<std::string>().empty() &&
+                            dm.frames.size() < 256) {
+                            dm.frames.push_back(f.get<std::string>());
+                        }
+                    }
+                }
+                dm.frame_ms = std::clamp(static_cast<s32>(d.value("frame_ms", 100)), 1, 60000);
+                if (d.contains("pulse") && d.at("pulse").is_object()) {
+                    const auto& p = d.at("pulse");
+                    dm.pulse.period_ms =
+                        std::clamp(static_cast<s32>(p.value("period_ms", 1000)), 1, 60000);
+                    const auto range = [&p](const char* key, float& lo, float& hi) {
+                        if (p.contains(key) && p.at(key).is_array() && p.at(key).size() == 2 &&
+                            p.at(key)[0].is_number() && p.at(key)[1].is_number()) {
+                            lo = std::clamp(p.at(key)[0].get<float>(), 0.0f, 8.0f);
+                            hi = std::clamp(p.at(key)[1].get<float>(), 0.0f, 8.0f);
+                        }
+                    };
+                    range("alpha", dm.pulse.alpha_lo, dm.pulse.alpha_hi);
+                    range("scale", dm.pulse.scale_lo, dm.pulse.scale_hi);
+                    dm.pulse.grow = p.value("mode", std::string{"breathe"}) == "grow";
+                }
                 if (dm.count > 0 && !dm.x.empty() && !dm.y.empty()) {
                     entry.dynamic_markers.push_back(std::move(dm));
                 } else {
@@ -1135,9 +1460,13 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
     manifest.poll_hz = json.value("poll_hz", 60u);
     manifest.canvas_w = json.value("canvas_w", 0u);
     manifest.canvas_h = json.value("canvas_h", 0u);
-    manifest.debug_page = json.value("debug_page", false);
+    manifest.debug_page = Common::DSMod::DevToolsEnabled && json.value("debug_page", false);
     manifest.font_metrics_src = json.value("font", std::string{});
     manifest.font_atlas_src = json.value("font_atlas", std::string{});
+    if (json.contains("font_page_h") && json.at("font_page_h").is_number_unsigned()) {
+        manifest.font_page_h = static_cast<u32>(
+            std::min<u64>(json.at("font_page_h").get<u64>(), 65535)); // runtime 17
+    }
     NxAssets::ParseManifestExtras(json, manifest); // "composites", long font keys
     if (json.contains("tables") && json.at("tables").is_object()) {
         for (const auto& [tname, arr] : json.at("tables").items()) {
@@ -1147,12 +1476,21 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
             vals.reserve(arr.size());
             for (const auto& v : arr)
                 vals.push_back(v.is_string() ? v.get<std::string>() : std::string{});
-            manifest.tables.emplace(tname, std::move(vals));
+            size_t longest = 0;
+            for (const auto& v : vals)
+                longest = std::max(longest, v.size());
+            if (manifest.tables.emplace(tname, std::move(vals)).second)
+                manifest.table_max_len[tname] = longest;
         }
     }
     manifest.find_spec = json.value("find", std::string{});
     manifest.trace_target = json.value("trace", std::string{});
-    manifest.dump_registry = json.value("dump_registry", false);
+    manifest.dump_registry = Common::DSMod::DevToolsEnabled && json.value("dump_registry", false);
+    manifest.uses_clock_keys = JsonReferencesClockKeys(json); // the data file may add to it
+    manifest.uses_host_keys = JsonReferencesHostKeys(json);   // likewise
+    if (json.contains("module_tick_hidden")) {
+        manifest.module_tick_hidden = json.at("module_tick_hidden").get<bool>();
+    }
     manifest.describe_string = json.value("describe", std::string{});
     if (json.contains("frame_hook")) {
         const auto hook = json.at("frame_hook").get<std::string>();
@@ -1168,8 +1506,18 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
     if (json.contains("haptics")) {
         ParseHaptics(json.at("haptics"), manifest.haptics);
     }
+    // "nav" (runtime 17): controller navigation of the second screen (mod_nav.cpp).
+    ParseNav(json, manifest.nav);
     if (json.contains("anim_hz") && json.at("anim_hz").is_number()) {
         manifest.anim_hz = static_cast<u32>(std::clamp(json.at("anim_hz").get<f64>(), 1.0, 240.0));
+    }
+    // "preload": picture sources to decode once the package is up (PumpNxAssets).
+    if (json.contains("preload") && json.at("preload").is_array()) {
+        for (const auto& p : json.at("preload")) {
+            if (p.is_string() && !p.get<std::string>().empty() && manifest.preload.size() < 1024) {
+                manifest.preload.push_back(p.get<std::string>());
+            }
+        }
     }
     // "page_binds" -- edge-triggered automatic page switches. Absent/empty = no behaviour change
     // for every package that predates this.
@@ -1262,6 +1610,15 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                     widget.hidden_icons = w.value("hidden_icons", std::vector<std::string>{});
                     widget.pill = w.value("pill", false);
                     widget.frame = w.value("frame", 2);
+                    widget.border = static_cast<s32>(w.value("border", 3));
+                    widget.text_inset = static_cast<s32>(w.value("text_inset", 12));
+                    widget.gap = static_cast<s32>(w.value("gap", -1));
+                    if (w.contains("label_offset") && w.at("label_offset").is_array() &&
+                        w.at("label_offset").size() == 2) {
+                        const auto& lo = w.at("label_offset");
+                        widget.label_offset = {static_cast<s32>(ParseNumber(lo[0])),
+                                               static_cast<s32>(ParseNumber(lo[1]))};
+                    }
                     widget.pulse = w.value("pulse", false);
                     if (w.contains("keep_min"))
                         widget.keep_min = ParseKeepBound(w.at("keep_min"), widget.keep_min_i);
@@ -1272,7 +1629,6 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                         widget.hide_eq_on = true;
                     }
                     widget.area_bind = w.value("area_bind", std::string{});
-                    widget.area_season_bind = w.value("area_season_bind", std::string{});
                     widget.marker_x_bind = w.value("marker_x_bind", std::string{});
                     widget.marker_y_bind = w.value("marker_y_bind", std::string{});
                     widget.marker_scale = static_cast<float>(w.value("marker_scale", 1.0));
@@ -1281,9 +1637,6 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                     widget.actor_y_bind = w.value("actor_y_bind", std::string{});
                     widget.actor_icon = w.value("actor_icon", std::string{});
                     widget.actor_reveal_required = w.value("actor_reveal_required", false);
-                    widget.actor_pulse_scale =
-                        static_cast<float>(w.value("actor_pulse_scale", 0.5));
-                    widget.actor_pulse_ms = static_cast<float>(w.value("actor_pulse_ms", 667.0));
                     widget.follow_window = static_cast<float>(w.value("follow_window", 0.0));
                     widget.marker_src = w.value("marker_src", std::string{});
                     for (const auto& [key, target] :
@@ -1307,12 +1660,15 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                             }
                         }
                     }
+                    widget.src_fade_ms =
+                        static_cast<s32>(std::clamp(w.value("src_fade_ms", 0), 0, 1000));
+                    widget.src_fade_bind = w.value("src_fade_bind", std::string{});
                     if (w.contains("rect") && w.at("rect").is_array() && w.at("rect").size() == 4) {
                         for (size_t i = 0; i < 4; ++i) {
-                            widget.rect[i] = static_cast<s32>(ParseNumber(w.at("rect")[i]));
+                            widget.rect[i] = ParseCoordinate(w.at("rect")[i]);
                         }
                     }
-                    widget.text = w.value("text", std::string{});
+                    widget.text = StringOr(w, "text");
                     widget.bind = w.value("bind", std::string{});
                     if (w.contains("names") && w.at("names").is_array()) {
                         for (const auto& n : w.at("names"))
@@ -1331,14 +1687,41 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                     }
                     widget.color = ParseColor(w, "color", ToPixelOrder(widget.color));
                     widget.bg = ParseColor(w, "bg", ToPixelOrder(widget.bg));
+                    if (w.contains("outline")) {
+                        widget.text_outline = ParseColor(w, "outline", 0u);
+                        widget.text_outline_px =
+                            std::clamp(static_cast<s32>(w.value("outline_px", 2)), 0, 12);
+                    }
+                    if (w.contains("rise") && w.at("rise").is_number())
+                        widget.text_rise = std::clamp(w.at("rise").get<float>(), -8.0f, 8.0f);
+                    // Leaning text (runtime 22): "slant_deg", or the common
+                    // 9 degree "italic": true.
+                    if (w.contains("slant_deg") && w.at("slant_deg").is_number()) {
+                        widget.text_slant =
+                            std::clamp(w.at("slant_deg").get<float>(), -30.0f, 30.0f);
+                    } else if (w.value("italic", false)) {
+                        widget.text_slant = 9.0f;
+                    }
                     widget.text_scale = static_cast<s32>(w.value("text_scale", 3));
                     widget.on_tap = w.value("on_tap", std::string{});
+                    widget.on_hold = w.value("on_hold", std::string{});
+                    widget.hold_ms = static_cast<s32>(
+                        w.contains("hold_ms") ? ParseNumber(w.at("hold_ms")) : 0);
+                    widget.on_swipe_left = w.value("on_swipe_left", std::string{});
+                    widget.on_swipe_right = w.value("on_swipe_right", std::string{});
+                    widget.on_swipe_up = w.value("on_swipe_up", std::string{});
+                    widget.on_swipe_down = w.value("on_swipe_down", std::string{});
+                    widget.on_pan = w.value("on_pan", std::string{});
+                    widget.on_pinch = w.value("on_pinch", std::string{});
+                    widget.swipe_px = static_cast<s32>(
+                        w.contains("swipe_px") ? ParseNumber(w.at("swipe_px")) : 0);
                     widget.id = w.value("id", std::string{});
                     widget.repeat = w.contains("repeat") ? ParseNumber(w.at("repeat")) : 0;
                     widget.repeat_bind = w.value("repeat_bind", std::string{});
                     widget.repeat_div = static_cast<s32>(w.value("repeat_div", 1));
                     widget.repeat_cols = static_cast<s32>(w.value("repeat_cols", 0));
-                    widget.repeat_row_dy = static_cast<s32>(w.value("repeat_row_dy", 0));
+                    widget.repeat_row_dy =
+                        w.contains("repeat_row_dy") ? ParseCoordinate(w.at("repeat_row_dy")) : 0;
                     widget.pack = w.value("pack", false);
                     if (w.contains("scroll")) {
                         // A region id, or an inline region definition (first one wins per id).
@@ -1352,13 +1735,82 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                             }
                         }
                     }
-                    widget.repeat_dx = static_cast<s32>(
-                        w.contains("repeat_dx") ? ParseNumber(w.at("repeat_dx")) : 0);
-                    widget.repeat_dy = static_cast<s32>(
-                        w.contains("repeat_dy") ? ParseNumber(w.at("repeat_dy")) : 0);
+                    if (w.contains("scroll_follow")) {
+                        const std::string f = w.at("scroll_follow").is_string()
+                                                  ? w.at("scroll_follow").get<std::string>()
+                                                  : "";
+                        if (f == "x") {
+                            widget.scroll_follow = ScrollRegion::AxisX;
+                        } else if (f == "y") {
+                            widget.scroll_follow = ScrollRegion::AxisY;
+                        } else if (f != "xy" && f != "yx") {
+                            LOG_WARNING(Core,
+                                        "DSMod: widget '{}': \"scroll_follow\" must be \"x\", \"y\" or "
+                                        "\"xy\"; using xy",
+                                        widget.id);
+                        }
+                    }
+                    widget.repeat_dx =
+                        w.contains("repeat_dx") ? ParseCoordinate(w.at("repeat_dx")) : 0;
+                    widget.repeat_dy =
+                        w.contains("repeat_dy") ? ParseCoordinate(w.at("repeat_dy")) : 0;
                     widget.pan_zoom = w.value("pan_zoom", false);
                     widget.min_zoom = w.value("min_zoom", 1.0f);
                     widget.max_zoom = w.value("max_zoom", 8.0f);
+                    // Bound default view (runtime 15, mod_view_default.h):
+                    // a non-map pan_zoom widget only (a map has view_rect_*_bind).
+                    if (w.contains("view_zoom_bind") || w.contains("view_cx_bind") ||
+                        w.contains("view_cy_bind")) {
+                        ViewDefaultBinds vd;
+                        vd.zoom_bind = w.value("view_zoom_bind", std::string{});
+                        vd.cx_bind = w.value("view_cx_bind", std::string{});
+                        vd.cy_bind = w.value("view_cy_bind", std::string{});
+                        vd.reset_bind = w.value("view_reset_bind", std::string{});
+                        if (!widget.pan_zoom || widget.type == WidgetType::Map ||
+                            vd.zoom_bind.empty() || vd.cx_bind.empty() || vd.cy_bind.empty()) {
+                            LOG_WARNING(Core,
+                                        "DSMod: widget '{}': view_zoom_bind / view_cx_bind / "
+                                        "view_cy_bind need all three on a non-map pan_zoom "
+                                        "widget; ignored",
+                                        widget.id);
+                        } else {
+                            widget.view_default =
+                                std::make_shared<const ViewDefaultBinds>(std::move(vd));
+                        }
+                    }
+                    // Image "pan_bounds" {u0, v0, u1, v1}: the part of the src_rect picture the
+                    // pan / zoom window may show (fractions, each clamped to 0..1). Older runtimes
+                    // ignore the key.
+                    if (w.contains("pan_bounds")) {
+                        const auto& pb = w.at("pan_bounds");
+                        std::array<float, 4> bounds{0.0f, 0.0f, 1.0f, 1.0f};
+                        bool numbers = pb.is_array() && pb.size() == 4;
+                        for (size_t i = 0; numbers && i < 4; ++i) {
+                            numbers = pb[i].is_number();
+                            if (numbers) {
+                                bounds[i] =
+                                    std::clamp(static_cast<float>(pb[i].get<double>()), 0.0f, 1.0f);
+                            }
+                        }
+                        if (!numbers) {
+                            LOG_WARNING(Core,
+                                        "DSMod: widget '{}': pan_bounds needs four numbers "
+                                        "[u0, v0, u1, v1]; ignored",
+                                        widget.id);
+                        } else if (bounds[2] <= bounds[0] || bounds[3] <= bounds[1]) {
+                            LOG_WARNING(Core,
+                                        "DSMod: widget '{}': pan_bounds [{}, {}, {}, {}] is empty "
+                                        "or inverted (u1 <= u0 or v1 <= v0); ignored",
+                                        widget.id, bounds[0], bounds[1], bounds[2], bounds[3]);
+                        } else if (widget.type != WidgetType::Image || !widget.pan_zoom) {
+                            LOG_WARNING(Core,
+                                        "DSMod: widget '{}': pan_bounds needs a pan_zoom image "
+                                        "widget; ignored",
+                                        widget.id);
+                        } else {
+                            widget.pan_bounds = bounds;
+                        }
+                    }
                     // Tap-select / drag-and-drop.
                     if (w.contains("payload")) {
                         const auto& pv = w.at("payload");
@@ -1418,6 +1870,22 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                     widget.line_gap = static_cast<s32>(w.value("line_gap", -1));
                     widget.icon_silhouette =
                         w.value("icon_style", std::string{"color"}) == "silhouette";
+                    widget.color_markup = w.value("color_markup", false);
+                    widget.outline_copy = w.value("outline_copy", false);
+                    // Runtime 17: text-sized Label/Button boxes and grouped Value numbers.
+                    const auto r17_flag = [&w](const char* key) {
+                        return w.contains(key) && w.at(key).is_boolean() && w.at(key).get<bool>();
+                    };
+                    widget.auto_w = r17_flag("auto_w");
+                    widget.fit_text = r17_flag("fit_text");
+                    widget.text_min_scale =
+                        std::clamp(static_cast<s32>(w.value("text_min_scale", 1)), 1, 128);
+                    widget.text_center_h =
+                        std::clamp(static_cast<s32>(w.value("text_center_h", 0)), 0, 16384);
+                    widget.group = r17_flag("group");
+                    if (w.contains("group_sep") && w.at("group_sep").is_string()) {
+                        widget.group_sep = w.at("group_sep").get<std::string>();
+                    }
                     widget.tap_block = w.value("tap_block", false);
                     // A tap-only block let a drag on a panel pan the map underneath; both keys
                     // now own the whole gesture.
@@ -1426,6 +1894,10 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                                                               w.at("input_block").get<bool>());
                     widget.haptic = ParseHapticOverride(w);
                     widget.anim = ParseWidgetAnim(w);
+                    ParseImageStyleKeys(w, widget); // runtime 16
+                    if (widget.type == WidgetType::Chart) {
+                        widget.chart = ParseChartSpec(w, widget, page.id, page.widgets.size());
+                    }
                     if (widget.type == WidgetType::Map) {
                         widget.map_extras = ParseMapWidgetExtras(w);
                     }
@@ -1441,6 +1913,13 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                 }
             }
             page.no_auto_leave = page_json.value("no_auto_leave", false);
+            if (page_json.contains("nav_order") && page_json.at("nav_order").is_array()) {
+                for (const auto& id : page_json.at("nav_order")) {
+                    if (id.is_string()) {
+                        page.nav_order.push_back(id.get<std::string>());
+                    }
+                }
+            }
             manifest.pages.push_back(std::move(page));
         }
     }
@@ -1558,6 +2037,32 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
             s.custom_marker_icon = st.value("custom_marker_icon", s.custom_marker_icon);
             s.custom_marker_back_icon =
                 st.value("custom_marker_back_icon", s.custom_marker_back_icon);
+            s.door_prefix = st.value("door_prefix", s.door_prefix);
+            if (st.contains("structural_prefixes") && st.at("structural_prefixes").is_array()) {
+                s.structural_prefixes.clear();
+                for (const auto& prefix : st.at("structural_prefixes")) {
+                    if (prefix.is_string()) {
+                        s.structural_prefixes.push_back(prefix.get<std::string>());
+                    }
+                }
+            }
+            s.door_closed_suffix = st.value("door_closed_suffix", s.door_closed_suffix);
+            s.door_open_suffix = st.value("door_open_suffix", s.door_open_suffix);
+            s.door_opened_left = st.value("door_opened_left", s.door_opened_left);
+            s.door_opened_right = st.value("door_opened_right", s.door_opened_right);
+            s.collected_suffix = st.value("collected_suffix", s.collected_suffix);
+            s.collected_fallback = st.value("collected_fallback", s.collected_fallback);
+            s.collectible_kind = st.value("collectible_kind", s.collectible_kind);
+            s.item_blink_period = std::max<u32>(
+                2u, static_cast<u32>(st.value("item_blink_period", s.item_blink_period)));
+            s.item_blink_low = std::clamp(st.value("item_blink_low", s.item_blink_low), 0.0f, 1.0f);
+            s.player_blink_period = std::max<u32>(
+                2u, static_cast<u32>(st.value("player_blink_period", s.player_blink_period)));
+            s.player_blink_low =
+                std::clamp(st.value("player_blink_low", s.player_blink_low), 0.0f, 1.0f);
+            s.pin_outer = std::clamp(static_cast<s32>(st.value("pin_outer", s.pin_outer)), 0, 256);
+            s.pin_inner = std::clamp(static_cast<s32>(st.value("pin_inner", s.pin_inner)), 0, 256);
+            s.pin_core = std::clamp(static_cast<s32>(st.value("pin_core", s.pin_core)), 0, 256);
         }
         if (mj.contains("icons")) {
             for (const auto& [name, cell] : mj.at("icons").items()) {
@@ -1587,6 +2092,26 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
             // Flags are ints: true/false stay 1/0, a number is a multi-state value.
             manifest.flag_defaults[name] =
                 value.is_boolean() ? (value.get<bool>() ? 1 : 0) : ParseNumber(value);
+        }
+    }
+    if (json.contains("persist_flags")) {
+        // Runtime flags kept across sessions (mod_persist.h): restored at load over "flags".
+        const auto& list = json.at("persist_flags");
+        if (!list.is_array()) {
+            LOG_WARNING(Core, "DSMod: \"persist_flags\" must be an array of flag names");
+        } else {
+            for (const auto& entry : list) {
+                if (!entry.is_string() || entry.get<std::string>().empty()) {
+                    LOG_WARNING(Core, "DSMod: \"persist_flags\" entry {} is not a flag name",
+                                entry.dump());
+                    continue;
+                }
+                auto name = entry.get<std::string>();
+                if (std::find(manifest.persist_flags.begin(), manifest.persist_flags.end(),
+                              name) == manifest.persist_flags.end()) {
+                    manifest.persist_flags.push_back(std::move(name));
+                }
+            }
         }
     }
     if (json.contains("derived")) {
@@ -1692,6 +2217,24 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
                 action.frames = a.value("frames", 4u);
                 action.repeat = a.value("repeat", 1u);
                 action.button_neg = a.value("button_neg", std::string{});
+                // RunAction skips a chord that does not parse; say so once, here, rather than on
+                // every tap or enforce tick.
+                const auto valid_chord = [](std::string_view chord) {
+                    return InputTokens::ParseChord(chord, [](std::string_view button) {
+                               bool ok{};
+                               ParseButton(std::string{button}, ok);
+                               return ok;
+                           }).has_value();
+                };
+                for (const auto* chord : {&action.button, &action.button_neg}) {
+                    if ((chord == &action.button || !chord->empty()) && !valid_chord(*chord)) {
+                        LOG_WARNING(Core,
+                                    "DSMod: action '{}': input chord '{}' not understood; the "
+                                    "action is skipped (a positive axis before another token "
+                                    "needs \"++\", e.g. \"LX++A\")",
+                                    name, *chord);
+                    }
+                }
                 action.counter = a.value("counter", std::string{});
                 action.target = a.contains("target") ? ParseNumber(a.at("target")) : 0;
                 action.modulo = a.contains("modulo") ? ParseNumber(a.at("modulo")) : 0;
@@ -1788,23 +2331,14 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
             }
         }
     }
+    if (json.contains("settings")) {
+        // Runtime 17: the built-in "@settings" page (mod_settings.h). Last: it reads the canvas,
+        // pages, actions, "flags" and "persist_flags" parsed above.
+        ApplySettings(ParseSettings(json.at("settings")), manifest);
+    }
 }
 
-std::optional<nlohmann::json> ReadJson(const FileSys::VirtualFile& file) {
-    if (!file) {
-        return std::nullopt;
-    }
-    std::vector<u8> bytes(file->GetSize());
-    if (file->Read(bytes.data(), bytes.size(), 0) != bytes.size()) {
-        return std::nullopt;
-    }
-    try {
-        return nlohmann::json::parse(bytes.begin(), bytes.end());
-    } catch (const std::exception& e) {
-        LOG_ERROR(Core, "DSMod: JSON parse failed: {}", e.what());
-        return std::nullopt;
-    }
-}
+
 } // namespace
 
 bool ParseMapAreasJson(const nlohmann::json& areas,
@@ -1829,6 +2363,42 @@ bool ParseDualScreenManifest(const nlohmann::json& json, Manifest& out) noexcept
     }
 }
 
+bool PrepareDualScreenManifestReload(const nlohmann::json& json, const Manifest& current,
+                                     Manifest& out) noexcept {
+    try {
+        if (!json.is_object()) {
+            return false;
+        }
+        if (const auto title = json.find("title_id"); title != json.end()) {
+            if (!title->is_string()) {
+                return false;
+            }
+            auto value = title->get<std::string>();
+            std::ranges::transform(value, value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::toupper(c));
+            });
+            if (value != std::format("{:016X}", current.title_id)) {
+                return false;
+            }
+        }
+        Manifest candidate = current;
+        candidate.pages.clear();
+        candidate.actions.clear();
+        candidate.tables.clear();
+        candidate.table_max_len.clear();
+        candidate.derived.clear();
+        candidate.page_binds.clear();
+        ParseManifestJson(json, candidate);
+        if (candidate.format != 1 || (!candidate.debug_page && candidate.pages.empty())) {
+            return false;
+        }
+        out = std::move(candidate);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool IsUsableDualScreenManifest(const nlohmann::json& json) noexcept {
     try {
         Manifest candidate;
@@ -1838,6 +2408,11 @@ bool IsUsableDualScreenManifest(const nlohmann::json& json) noexcept {
     } catch (const std::exception&) {
         return false;
     }
+}
+
+bool NavDefaultOn(const nlohmann::json* manifest, const nlohmann::json* package) noexcept {
+    // (A package needing more than this runtime is gated before it is parsed.)
+    return PackageMinRuntime(manifest, package) >= 17;
 }
 
 u32 PackageMinRuntime(const nlohmann::json* manifest, const nlohmann::json* package) noexcept {
@@ -1855,7 +2430,11 @@ u32 PackageMinRuntime(const nlohmann::json* manifest, const nlohmann::json* pack
                                                        : static_cast<u32>(v);
         }
         if (it->is_number_integer()) {
-            return it->get<s64>() < 0 ? std::numeric_limits<u32>::max() : 0;
+            // Parsed text gives a non-negative number as unsigned; JSON built in code may hold a
+            // signed one.
+            const s64 v = it->get<s64>();
+            return v < 0 ? std::numeric_limits<u32>::max()
+                         : static_cast<u32>(std::min<s64>(v, std::numeric_limits<u32>::max()));
         }
         if (it->is_string()) {
             const auto& text = it->get_ref<const std::string&>();
@@ -1893,7 +2472,7 @@ Manifest ModRuntime::UpdateRequiredManifest(u64 title_id, u32 required,
     m.background = 0xFF101014u;
     Page page;
     page.id = "update_required";
-    page.title = "UPDATE EDEN";
+    page.title = "UPDATE EDEN DUO";
     const auto label = [&page](std::string id, s32 y, std::string text, s32 scale, u32 color) {
         Widget w;
         w.type = WidgetType::Label;
@@ -1912,14 +2491,14 @@ Manifest ModRuntime::UpdateRequiredManifest(u64 title_id, u32 required,
     band.bg = 0xFFE0202Au;
     band.color = 0;
     page.widgets.push_back(std::move(band));
-    label("update_title", 360, "UPDATE EDEN", 14, 0xFFFFFFFFu);
-    label("update_line1", 500, "This package needs a newer Eden", 7, 0xFFE6ECF2u);
+    label("update_title", 360, "UPDATE EDEN DUO", 14, 0xFFFFFFFFu);
+    label("update_line1", 500, "This package needs a newer Eden Duo", 7, 0xFFE6ECF2u);
     const std::string runtime =
         required == std::numeric_limits<u32>::max()
-            ? fmt::format("runtime ?, have {}", DualScreenRuntimeVersion)
-            : fmt::format("runtime {}, have {}", required, DualScreenRuntimeVersion);
+            ? std::format("runtime ?, have {}", DualScreenRuntimeVersion)
+            : std::format("runtime {}, have {}", required, DualScreenRuntimeVersion);
     label("update_line2", 580, runtime, 7, 0xFFFFC040u);
-    label("update_line3", 660, "Update Eden to use it.", 7, 0xFFE6ECF2u);
+    label("update_line3", 660, "Update Eden Duo to use it.", 7, 0xFFE6ECF2u);
     std::string dir = mod_dir.substr(0, 60);
     label("update_package", 800, dir, 4, 0xFF8890A0u);
     m.pages.push_back(std::move(page));
@@ -1946,6 +2525,15 @@ std::optional<Manifest> ModRuntime::IdleManifest(u64 title_id) {
     back.color = 0;
     back.id = "idle_back";
     page.widgets.push_back(std::move(back));
+    // Eden Duo "No Companion: Black": the same page, black only.
+    if (VideoCore::DSMod::SecondScreenOptions::WithoutCompanion() ==
+        VideoCore::DSMod::NoCompanion::Black) {
+        m.pages.push_back(std::move(page));
+        m.valid = true;
+        LOG_INFO(Core, "DSMod: title {:016X} has no package; the second screen stays black",
+                 title_id);
+        return m;
+    }
     Widget icon;
     icon.type = WidgetType::Image;
     icon.src = "icon:";
@@ -1978,18 +2566,30 @@ std::optional<Manifest> ModRuntime::Discover(System& system, u64 title_id,
     auto subdirs = load_dir->GetSubdirectories();
     std::ranges::sort(subdirs,
                       [](const auto& a, const auto& b) { return a->GetName() < b->GetName(); });
+    {
+        std::string names;
+        for (const auto& subdir : subdirs) {
+            names += names.empty() ? "" : ", ";
+            names += subdir->GetName();
+        }
+        LOG_INFO(Core, "DSMod: scanning '{}' for title {:016X}: [{}], {} disabled add-on(s)",
+                 load_dir->GetFullPath(), title_id, names, disabled.size());
+    }
 
     for (const auto& subdir : subdirs) {
         if (std::ranges::find(disabled, subdir->GetName()) != disabled.end()) {
+            if (subdir->GetSubdirectory("dualscreen")) {
+                LOG_INFO(Core, "DSMod: '{}' skipped: turned off in Add-ons", subdir->GetName());
+            }
             continue;
         }
         const auto ds_dir = subdir->GetSubdirectory("dualscreen");
         if (!ds_dir) {
-            LOG_DEBUG(Core, "DSMod: '{}' has no dualscreen/ folder", subdir->GetName());
+            LOG_INFO(Core, "DSMod: '{}' skipped: no dualscreen/ folder", subdir->GetName());
             continue;
         }
         try {
-            const auto manifest_json = ReadJson(ds_dir->GetFile("manifest.json"));
+            const auto manifest_json = ReadPackageJson(ds_dir->GetFile("manifest.json"));
             if (!manifest_json) {
                 continue;
             }
@@ -2008,7 +2608,7 @@ std::optional<Manifest> ModRuntime::Discover(System& system, u64 title_id,
                 std::ranges::transform(title, title.begin(), [](unsigned char c) {
                     return static_cast<char>(std::toupper(c));
                 });
-                if (title != fmt::format("{:016X}", title_id)) {
+                if (title != std::format("{:016X}", title_id)) {
                     LOG_WARNING(Core, "DSMod: '{}' belongs to a different title",
                                 subdir->GetName());
                     continue;
@@ -2018,8 +2618,13 @@ std::optional<Manifest> ModRuntime::Discover(System& system, u64 title_id,
             // package for a newer runtime may use keys, formats or module features this build
             // cannot parse. It is selected (it is the user's package for this game) but replaced
             // by the built-in "update Eden" page.
+            const auto package_file = subdir->GetFile("package.json");
+            const auto package_json = ReadPackageJson(package_file);
+            if (package_file && (!package_json || !package_json->is_object())) {
+                LOG_WARNING(Core, "DSMod: malformed package metadata in {}", subdir->GetName());
+                continue;
+            }
             {
-                const auto package_json = ReadJson(subdir->GetFile("package.json"));
                 const u32 required =
                     PackageMinRuntime(&*manifest_json, package_json ? &*package_json : nullptr);
                 if (required > DualScreenRuntimeVersion) {
@@ -2043,6 +2648,10 @@ std::optional<Manifest> ModRuntime::Discover(System& system, u64 title_id,
             manifest.mod_dir_name = subdir->GetName();
             manifest.asset_dir = ds_dir;
             ParseManifestJson(*manifest_json, manifest);
+            if (!manifest_json->contains("nav") && package_json &&
+                NavDefaultOn(&*manifest_json, &*package_json)) {
+                manifest.nav.enabled = true; // min_runtime >= 17 declared in package.json
+            }
 
             // Per-build data file, named like the cheat convention: first 8 bytes of the build id.
             // Cheat files use both cases in the wild (Eden's own loader probes upper then lower),
@@ -2061,11 +2670,15 @@ std::optional<Manifest> ModRuntime::Discover(System& system, u64 title_id,
             }
             for (const auto& candidate :
                  {build_id_short + ".json", build_id_lower + ".json", std::string{"data.json"}}) {
-                const auto data_json = ReadJson(ds_dir->GetFile(candidate));
+                const auto data_json = ReadPackageJson(ds_dir->GetFile(candidate));
                 if (!data_json) {
                     continue;
                 }
                 manifest.data_file = candidate;
+                manifest.uses_clock_keys =
+                    manifest.uses_clock_keys || JsonReferencesClockKeys(*data_json);
+                manifest.uses_host_keys =
+                    manifest.uses_host_keys || JsonReferencesHostKeys(*data_json);
                 if (data_json->contains("points")) {
                     ParsePoints(data_json->at("points"), manifest);
                 }
@@ -2210,6 +2823,8 @@ std::optional<Manifest> ModRuntime::Discover(System& system, u64 title_id,
     return std::nullopt;
 }
 
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+/// Console "reload" (dev-tools builds only).
 void ModRuntime::ReloadManifest() {
     std::scoped_lock bridge_lock{guest_bridge_mutex};
     if (system.GetDualScreenGuestMailbox().second != 0) {
@@ -2225,29 +2840,59 @@ void ModRuntime::ReloadManifest() {
         LOG_WARNING(Core, "DSMod reload: no asset dir");
         return;
     }
-    if (const auto mj = ReadJson(manifest.asset_dir->GetFile("manifest.json"))) {
-        if (const u32 required = PackageMinRuntime(&*mj, nullptr);
-            required > DualScreenRuntimeVersion) {
-            LOG_WARNING(Core,
-                        "DSMod reload skipped: the package now needs runtime {} (have {}); "
-                        "restart the game",
-                        required, DualScreenRuntimeVersion);
-            return;
+    const auto mj = ReadPackageJson(manifest.asset_dir->GetFile("manifest.json"));
+    if (!mj || !mj->is_object()) {
+        // Nothing may change then: the data file's "derived" would otherwise be appended to the
+        // old list, and every cache below would be dropped for a package that did not reload.
+        LOG_WARNING(Core, "DSMod reload skipped: manifest.json does not parse");
+        return;
+    }
+    const auto package_parent = manifest.asset_dir->GetParentDirectory();
+    const auto package_file = package_parent ? package_parent->GetFile("package.json") : nullptr;
+    const auto package_json = ReadPackageJson(package_file);
+    if (package_file && (!package_json || !package_json->is_object())) {
+        LOG_WARNING(Core, "DSMod reload skipped: invalid package.json");
+        return;
+    }
+    if (const u32 required = PackageMinRuntime(&*mj, package_json ? &*package_json : nullptr);
+        required > DualScreenRuntimeVersion) {
+        LOG_WARNING(Core, "DSMod reload skipped: package needs runtime {} (have {}); restart",
+                    required, DualScreenRuntimeVersion);
+        return;
+    }
+    Manifest replacement;
+    if (!PrepareDualScreenManifestReload(*mj, manifest, replacement)) {
+        LOG_WARNING(Core, "DSMod reload skipped: invalid or unusable manifest.json");
+        return;
+    }
+    // Validate the complete replacement before stopping a worker or shutting down the module.
+    // Do not destroy an instance during a competing pause/resume transition.
+    // Its destructor may need the write service to release temporary native input.
+    if (!RunWithGuestStopped([this] {
+            StopRedrawWorker();
+            ShutdownGameModule();
+        })) {
+        LOG_WARNING(Core, "DSMod reload deferred: guest suspension is busy; retry reload");
+        return;
+    }
+    {
+        manifest = std::move(replacement);
+        derived_order_list = nullptr;
+        shared_page.reset();
+        if (!mj->contains("nav")) {
+            // As Discover: a min_runtime >= 17 in package.json (next to dualscreen/) turns the
+            // default navigation on too.
+            const auto parent = manifest.asset_dir->GetParentDirectory();
+            const auto pj = parent ? ReadPackageJson(parent->GetFile("package.json")) : std::nullopt;
+            if (pj && NavDefaultOn(&*mj, &*pj)) {
+                manifest.nav.enabled = true;
+            }
         }
-        ShutdownGameModule();
-        // Wipe what the file owns before re-reading it: emplace keeps the first value it saw, so a
-        // stale action would survive an edit and quietly ignore the change.
-        manifest.pages.clear();
-        manifest.actions.clear();
-        manifest.tables.clear();
-        manifest.derived.clear();
-        derived_order_list = nullptr; // re-parsed in place: recompute the evaluation order
-        shared_page.reset();          // pages re-parsed: no job may be handed the old copy
-        manifest.page_binds.clear();  // re-read fresh, not accumulated across reloads
-        ParseManifestJson(*mj, manifest);
     }
     if (!manifest.data_file.empty()) {
-        if (const auto dj = ReadJson(manifest.asset_dir->GetFile(manifest.data_file))) {
+        if (const auto dj = ReadPackageJson(manifest.asset_dir->GetFile(manifest.data_file))) {
+            manifest.uses_clock_keys = manifest.uses_clock_keys || JsonReferencesClockKeys(*dj);
+            manifest.uses_host_keys = manifest.uses_host_keys || JsonReferencesHostKeys(*dj);
             if (dj->contains("points")) {
                 manifest.points.clear();
                 ParsePoints(dj->at("points"), manifest);
@@ -2274,8 +2919,14 @@ void ModRuntime::ReloadManifest() {
     image_failed.clear();
     ResetNxAssets();
     canvas.SetFont(nullptr, nullptr);
+    canvas.SetFontPages(nullptr);
     font_metrics = {};
     font_ready = false;
+    DropFontPages(); // runtime 17 paged font
+    font_module_attempts = 0;
+    font_retry_tick = 0;
+    font_epoch = {};
+    font_redecode = false;
     {
         // Same reasoning as above, for the map_state_mutex cluster.
         std::scoped_lock mlk{map_state_mutex};
@@ -2306,7 +2957,10 @@ void ModRuntime::ReloadManifest() {
         // of hazard already guarded for `image_cache`/`map_state_mutex` above, real for these
         // fields too because PublishGpuComposite can run on the redraw worker.
         std::scoped_lock composite_lock{gpu_composite_mutex};
-        atlas_published = false;
+        last_atlas_key.clear();
+        last_atlas_image.reset();
+        last_hud_hash_valid = false;
+        hud_slot_canvas = nullptr;
         map_pub_current.reset();
         map_pub_previous.reset();
         map_pub_epoch = 0;
@@ -2322,6 +2976,7 @@ void ModRuntime::ReloadManifest() {
         std::scoped_lock view_lock{view_mutex};
         view_state.clear();
         map_follow_state.clear();
+        ++follow_state_epoch;
     }
     if (!manifest.pages.empty() && current_page >= manifest.pages.size())
         current_page = manifest.pages.size() - 1;
@@ -2335,12 +2990,22 @@ void ModRuntime::ReloadManifest() {
         map_records_page = ~size_t{0};
     }
     derived_index.clear();
+    derived_held.clear();
+    // Caches keyed by the old manifest's objects or its symbols.
+    text_scan_cache.clear();
+    text_scan_attempt.clear();
+    entry_array_cache.clear();
+    pattern_cache.clear();
+    symbol_cache.clear();
+    method_info_cache.clear();
     page_bind_state.clear(); // re-arm cold against the fresh manifest.page_binds
+    chart_sampler.Reset();   // runtime 17: chart keys follow the new pages
     ResetInteraction("reload");
     CancelAnimations("reload");
     LOG_INFO(Core, "DSMod reloaded: {} pages, {} points, {} derived", manifest.pages.size(),
              manifest.points.size(), manifest.derived.size());
     InitializeGameModule();
 }
+#endif
 
 } // namespace Core::Mods

@@ -49,10 +49,20 @@ public:
             }
         }
     }
+    /// Emulated time since boot (runtime 16 @game.seconds, runtime 21 @perf.*): the wall clock
+    /// since this object was made -- there is no guest clock to ask here.
+    [[nodiscard]] std::chrono::nanoseconds GetGlobalTimeNs() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - epoch);
+    }
+    [[nodiscard]] std::chrono::microseconds GetGlobalTimeUs() const {
+        return std::chrono::duration_cast<std::chrono::microseconds>(GetGlobalTimeNs());
+    }
 
 private:
     std::mutex mutex;
     std::vector<std::shared_ptr<EventType>> events;
+    std::chrono::steady_clock::time_point epoch{std::chrono::steady_clock::now()};
 };
 
 } // namespace Core::Timing

@@ -26,14 +26,20 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <format>
 
 #include <cstdlib>
 #include <filesystem>
+#include "common/dsmod_dev_tools.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
+#include "core/core.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/mods/mod_expr.h"
 #include "core/mods/mod_runtime.h"
 #include "core/mods/mod_runtime_shared.h"
 #include "hid_core/frontend/emulated_controller.h"
+#include "hid_core/hid_core.h"
 
 namespace Core::Mods {
 
@@ -46,10 +52,10 @@ constexpr s64 Il2CppStringChars = 0x14;
 } // namespace
 
 bool ModRuntime::AddressIsSane(VAddr address, u64 size) const {
-    if (address == 0 || size == 0) {
+    if (!IsOwnerContext() || address == 0 || size == 0) {
         return false;
     }
-    return system.ApplicationMemory().IsValidVirtualAddressRange(address, size);
+    return OwnerMemory().IsValidVirtualAddressRange(address, size);
 }
 
 /// The heap region as the running process actually laid it out. The old fixed window
@@ -58,30 +64,40 @@ bool ModRuntime::AddressIsSane(VAddr address, u64 size) const {
 /// every sweep quietly found nothing. Ask the page table; the constants remain only as the
 /// fallback for the moment before a process exists.
 VAddr ModRuntime::HeapLow() const {
-    if (heap_low == 0) {
-        if (auto* const process = system.ApplicationProcess(); process != nullptr) {
-            const u64 start = GetInteger(process->GetPageTable().GetHeapRegionStart());
-            // The *region* is a 128 GB reservation, almost all unmapped. Sweeping it whole means
-            // 33M page probes that never finish in time -- which is exactly why energy and the
-            // player read `unresolved` under NCE while the old fixed 1.25 GB window worked. Bound
-            // the walk to the committed heap plus a margin, so it stays a couple of GB.
-            const u64 committed = process->GetPageTable().GetNormalMemorySize();
-            const u64 region = process->GetPageTable().GetHeapRegionSize();
-            if (start != 0 && committed != 0) {
-                heap_low = start;
-                const u64 span = std::min<u64>(region, committed + 0x40000000ULL); // +1 GB slack
-                heap_high = start + span;
-                LOG_INFO(Core, "DSMod: heap {:X}..{:X} (committed {} MiB of {} MiB region)",
-                         heap_low, heap_high, committed >> 20, region >> 20);
+    // Any thread may ask (the tick thread, module callbacks on asset workers). The bounds are
+    // found under heap_bounds_mutex and published high first, then low (release); a caller that
+    // sees low != 0 therefore sees high too.
+    if (heap_low.load(std::memory_order_acquire) == 0) {
+        std::scoped_lock lock{heap_bounds_mutex};
+        if (heap_low.load(std::memory_order_relaxed) == 0) {
+            if (auto* const process = OwnerProcess(); process != nullptr) {
+                const u64 start = GetInteger(process->GetPageTable().GetHeapRegionStart());
+                // The *region* is a 128 GB reservation, almost all unmapped. Sweeping it whole
+                // means 33M page probes that never finish in time -- which is exactly why energy
+                // and the player read `unresolved` under NCE while the old fixed 1.25 GB window
+                // worked. Bound the walk to the committed heap plus a margin, so it stays a
+                // couple of GB.
+                const u64 committed = process->GetPageTable().GetNormalMemorySize();
+                const u64 region = process->GetPageTable().GetHeapRegionSize();
+                if (start != 0 && committed != 0) {
+                    const u64 span =
+                        std::min<u64>(region, committed + 0x40000000ULL); // +1 GB slack
+                    heap_high.store(start + span, std::memory_order_relaxed);
+                    heap_low.store(start, std::memory_order_release);
+                    LOG_INFO(Core, "DSMod: heap {:X}..{:X} (committed {} MiB of {} MiB region)",
+                             start, start + span, committed >> 20, region >> 20);
+                }
             }
         }
     }
-    return heap_low != 0 ? heap_low : 0x21'80000000ULL;
+    const VAddr low = heap_low.load(std::memory_order_acquire);
+    return low != 0 ? low : 0x21'80000000ULL;
 }
 
 VAddr ModRuntime::HeapHigh() const {
     HeapLow();
-    return heap_high != 0 ? heap_high : 0x21'D0000000ULL;
+    const VAddr high = heap_high.load(std::memory_order_acquire);
+    return high != 0 ? high : 0x21'D0000000ULL;
 }
 
 /// Renders one captured register in whatever form makes it identifiable. A wide spy sweep is only
@@ -93,29 +109,29 @@ std::string ModRuntime::DescribeGuestValue(u64 value) const {
         return "0";
     }
     if (value < 0x10000) {
-        return fmt::format("{}", value); // an index, a count, a small enum
+        return std::format("{}", value); // an index, a count, a small enum
     }
     // Negative ints matter more than they look: Lua's pseudo-indices are constants like
     // LUA_GLOBALSINDEX (-10002), so a small negative argument names the API family outright.
     // A 32-bit int arrives with the top half cleared, having been written through a w register.
     const auto small_negative = [](s64 v) { return v < 0 && v > -0x10000; };
     if (small_negative(static_cast<s64>(value))) {
-        return fmt::format("{}", static_cast<s64>(value));
+        return std::format("{}", static_cast<s64>(value));
     }
     if ((value >> 32) == 0 && small_negative(static_cast<s32>(value))) {
-        return fmt::format("{}", static_cast<s32>(value));
+        return std::format("{}", static_cast<s32>(value));
     }
     // The "main region" the loader hands us spans the heap as well as the module, so an offset
     // into it is not on its own evidence of anything -- read the bytes first and only fall back
     // to the label.
     const std::string label = (main_region_size != 0 && value >= main_region_begin &&
                                value < main_region_begin + main_region_size)
-                                  ? fmt::format("main+{:X}", value - main_region_begin)
-                                  : fmt::format("{:X}", value);
+                                  ? std::format("main+{:X}", value - main_region_begin)
+                                  : std::format("{:X}", value);
     if (!AddressIsSane(value, sizeof(u64))) {
         return label; // not a pointer we can follow
     }
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     // A readable NUL-terminated ASCII run is the strongest signal there is.
     std::string text;
     for (u64 i = 0; i < 40 && AddressIsSane(value + i, 1); ++i) {
@@ -130,9 +146,9 @@ std::string ModRuntime::DescribeGuestValue(u64 value) const {
         text.push_back(static_cast<char>(ch));
     }
     if (text.size() >= 2) { // "_G" is a real Lua key: two characters is already a strong hit
-        return fmt::format("\"{}\"", text);
+        return std::format("\"{}\"", text);
     }
-    return fmt::format("{}->{:X}", label, memory.Read64(value));
+    return std::format("{}->{:X}", label, memory.Read64(value));
 }
 
 /// Reads another point purely to use as an array index. Guarded so a data file that points a
@@ -159,7 +175,7 @@ bool ModRuntime::WalkList(VAddr list, const ChainHop& hop, s64 index, VAddr& out
     if (index < 0 || index >= MaxListWalk) {
         return false;
     }
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     if (!AddressIsSane(list + static_cast<VAddr>(hop.list_next), sizeof(u64))) {
         return false;
     }
@@ -194,7 +210,7 @@ bool ModRuntime::WalkList(VAddr list, const ChainHop& hop, s64 index, VAddr& out
 
 VAddr ModRuntime::ScanForU32Text(const TextScan& spec) const {
     // One codepoint per 32-bit word. Walks the game heap once; the caller caches the result.
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     const VAddr Begin = HeapLow(), End = HeapLow() + 0x10000000ULL;
     for (VAddr at = Begin; at < End; at += 4) {
         if (!AddressIsSane(at, 4))
@@ -304,7 +320,7 @@ bool ModRuntime::ResolvePoint(const DataPoint& point, VAddr& address_out, s64 ar
             if (!AddressIsSane(address, sizeof(u64))) {
                 return false;
             }
-            address = system.ApplicationMemory().Read64(address);
+            address = OwnerMemory().Read64(address);
             if (hop.static_fields) {
                 const auto methods_offset = DetectMethodsOffset(address);
                 if (!methods_offset) {
@@ -335,7 +351,7 @@ bool ModRuntime::ResolvePoint(const DataPoint& point, VAddr& address_out, s64 ar
         if (!AddressIsSane(address, sizeof(u64))) {
             return false;
         }
-        address = system.ApplicationMemory().Read64(address);
+        address = OwnerMemory().Read64(address);
         if (point.chain[i] == StaticFieldsToken) {
             // "static_fields": the class' static block. In every IL2CPP layout so far it follows
             // the method table by four pointers, so detecting one gives the other.
@@ -420,7 +436,7 @@ bool ModRuntime::ReadPoint(const DataPoint& point, s64& value_out, s64 array_ind
         value_out = static_cast<s64>(address);
         return true;
     }
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     const auto read = [&](u64 size) { return AddressIsSane(address, size); };
     if (const u32 width = IntegerWidth(point.type); width != 0 && point.HasModifiers()) {
         if (!read(width)) {
@@ -481,7 +497,7 @@ bool ModRuntime::ReadPoint(const DataPoint& point, s64& value_out, s64 array_ind
         const u32 raw = memory.Read32(address);
         f32 as_float{};
         std::memcpy(&as_float, &raw, sizeof(as_float));
-        value_out = static_cast<s64>(as_float);
+        value_out = SaturatingToS64(as_float);
         return true;
     }
     }
@@ -496,7 +512,7 @@ std::optional<std::string> ModRuntime::ReadPointText(const DataPoint& point,
     if (!ResolvePoint(point, address, array_index) || !AddressIsSane(address, sizeof(u64))) {
         return std::nullopt;
     }
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     if (point.type == ValueType::Utf32String) {
         // The game keeps some UI labels as one codepoint per 32-bit word, inline at the address
         // rather than behind a handle -- read straight through until the terminator.
@@ -549,7 +565,7 @@ void ModRuntime::SampleState(StateSnapshot& out) {
     // a widget binds to it without caring which of the two it was.
     for (const auto& [name, value] : sequence_values) {
         out.floats[name] = value;
-        out.ints[name] = static_cast<s64>(value);
+        out.ints[name] = SaturatingToS64(value);
     }
     for (const auto& [name, value] : sequence_addresses) {
         out.addresses[name] = value;
@@ -560,7 +576,7 @@ void ModRuntime::SampleState(StateSnapshot& out) {
     // The slots this runtime is steering are state too: publish them as "@name" so a page can
     // mark the selected cell the way the game marks it.
     for (const auto& [cname, cval] : counters) {
-        out.ints["@" + cname] = cval;
+        out.ints[counter_keys(cname)] = cval;
     }
     for (const auto& [name, point] : manifest.points) {
         // A plain point is an array of one, so both kinds go through the same loop. How many
@@ -572,8 +588,9 @@ void ModRuntime::SampleState(StateSnapshot& out) {
             }
         }
         for (s64 i = 0; i < count; ++i) {
-            const std::string key =
-                point.count > 1 || !point.count_bind.empty() ? name + std::to_string(i) : name;
+            const std::string& key = point.count > 1 || !point.count_bind.empty()
+                                          ? element_keys(name, static_cast<size_t>(i))
+                                          : name;
             VAddr address{};
             out.addresses[key] = ResolvePoint(point, address, i) ? address : 0;
             if (point.type == ValueType::Utf16String || point.type == ValueType::CString ||
@@ -592,7 +609,7 @@ void ModRuntime::SampleState(StateSnapshot& out) {
                 // A float point keeps its fraction. Truncating a position held in metres to whole
                 // metres quantises a map marker to visible steps.
                 if (point.type == ValueType::F32 && AddressIsSane(address, 4)) {
-                    const u32 raw = system.ApplicationMemory().Read32(address);
+                    const u32 raw = OwnerMemory().Read32(address);
                     f32 exact{};
                     std::memcpy(&exact, &raw, sizeof(exact));
                     out.floats[key] = exact;
@@ -648,6 +665,15 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
                     for (const auto& src : d.nonzero_sources) {
                         wait = wait || waits(src);
                     }
+                } else if (!d.countdown_now.empty()) {
+                    wait = (!d.countdown_target.is_const && waits(d.countdown_target.name)) ||
+                           waits(d.countdown_now);
+                } else if (d.expr_program) {
+                    // An expression may name derived values declared after it: like every other
+                    // form it waits for them (topological), so declaration order does not matter.
+                    for (const auto& ref : d.expr_program->refs) {
+                        wait = wait || waits(ref);
+                    }
                 } else {
                     for (const auto& term : d.terms) {
                         wait = wait || waits(term.first);
@@ -666,16 +692,14 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
         }
         derived_order_list = list.data();
         derived_order_size = list.size();
-        derived_reads_interaction = std::ranges::any_of(list, [](const DerivedPoint& d) {
-            const auto at = [](const std::string& name) { return name.starts_with('@'); };
-            return at(d.select) || at(d.select_then) || at(d.select_else) ||
-                   at(d.hold_last_nonzero) || at(d.hold_gate) ||
-                   std::ranges::any_of(d.terms, [&](const auto& t) { return at(t.first); });
-        });
         // Which values the post-tap pass must recompute.
         derived_volatile.assign(list.size(), 0);
         const auto is_volatile_key = [](const std::string& name) {
-            return name.starts_with('@') || name.starts_with("view_custom:");
+            // The runtime 16 clock keys and the runtime 21 device / perf keys are published
+            // before the first pass and do not change between the two: reading them does not
+            // make a value volatile.
+            return (name.starts_with('@') && !IsClockKey(name) && !IsHostValueKey(name)) ||
+                   name.starts_with("view_custom:");
         };
         for (size_t i = 0; i < list.size(); ++i) {
             const DerivedPoint& d = list[i];
@@ -690,6 +714,12 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
                 vol = vol || is_volatile_key(src);
             for (const auto& term : d.terms)
                 vol = vol || is_volatile_key(term.first);
+            vol = vol || (!d.countdown_target.is_const && is_volatile_key(d.countdown_target.name)) ||
+                  is_volatile_key(d.countdown_now);
+            if (d.expr_program) {
+                for (const auto& ref : d.expr_program->refs)
+                    vol = vol || is_volatile_key(ref);
+            }
             derived_volatile[i] = vol ? 1 : 0;
         }
         // A value computed from a volatile derived value is volatile itself. Every derived-typed
@@ -716,6 +746,13 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
                 one(src);
             for (const auto& term : d.terms)
                 one(term.first);
+            if (!d.countdown_target.is_const)
+                one(d.countdown_target.name);
+            one(d.countdown_now);
+            if (d.expr_program) {
+                for (const auto& ref : d.expr_program->refs)
+                    one(ref);
+            }
         };
         for (bool changed = true; changed;) {
             changed = false;
@@ -730,6 +767,12 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
                 }
             }
         }
+        // The post-tap pass runs whenever any value is volatile. This used to be a separate,
+        // narrower test (select/hold/terms only) that missed "cmp" and "nonzero" over "@flag:",
+        // so a package whose only interaction reads were those (P5R) drew one frame of
+        // pre-tap derived values after every tap.
+        derived_reads_interaction =
+            std::ranges::any_of(derived_volatile, [](u8 v) { return v != 0; });
     }
     const auto lookup = [&snapshot](const std::string& key) -> std::optional<f64> {
         if (const auto f = snapshot.floats.find(key); f != snapshot.floats.end()) {
@@ -740,6 +783,7 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
         }
         return std::nullopt;
     };
+    const ExprLookup expr_lookup = lookup; // built once per pass, not per expression
     const auto publish = [&snapshot](const std::string& name, f64 v) {
         if (!std::isfinite(v)) {
             return;
@@ -760,7 +804,8 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
                 s64 hits = 0;
                 bool missing = d.any_eq_count <= 0;
                 for (s64 k = 0; k < d.any_eq_count && !missing; ++k) {
-                    const auto v = snapshot.ints.find(d.any_eq_array + std::to_string(k));
+                    const auto v =
+                        snapshot.ints.find(element_keys(d.any_eq_array, static_cast<size_t>(k)));
                     if (v == snapshot.ints.end()) {
                         missing = true;
                     } else if (v->second == d.any_eq_value) {
@@ -847,6 +892,24 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
                 }
                 continue;
             }
+            if (!d.countdown_now.empty()) {
+                if (const auto v = EvaluateCountdown(d, expr_lookup)) {
+                    publish(d.name, *v);
+                }
+                continue;
+            }
+            if (d.expr_program) {
+                // Runtime 17. floor/round apply to the result like they do to terms.
+                if (auto v = EvaluateExpr(*d.expr_program, expr_lookup)) {
+                    if (d.floor) {
+                        *v = std::floor(*v);
+                    } else if (d.round) {
+                        *v = std::round(*v);
+                    }
+                    publish(d.name, *v);
+                }
+                continue;
+            }
             f64 sum = d.add;
             bool missing = false;
             for (const auto& [src, factor] : d.terms) {
@@ -870,60 +933,147 @@ void ModRuntime::EvaluateDerived(StateSnapshot& snapshot, bool volatile_only) {
     }
 }
 
-bool ModRuntime::WritePointValue(const DataPoint& point, s64 value, s64 array_index,
-                                 std::optional<f64> as_float) {
+std::optional<ModRuntime::GuestStore> ModRuntime::PlanPointWrite(
+    const DataPoint& point, s64 value, s64 array_index, std::optional<f64> as_float) const {
     if (point.popcount || point.is_pointer) {
         LOG_WARNING(Core, "DSMod: refusing to write a {} point",
                     point.popcount ? "popcount" : "pointer");
-        return false;
+        return std::nullopt;
     }
     u32 width = IntegerWidth(point.type);
     if (width == 0) {
         if (point.type != ValueType::F32) {
-            return false; // strings are read-only
+            return std::nullopt; // strings are read-only
         }
         width = 4; // historical behaviour: an integer written into the word
     }
     VAddr address{};
     if (!ResolvePoint(point, address, array_index) || !AddressIsSane(address, width)) {
-        return false;
+        return std::nullopt;
     }
-    auto& memory = system.ApplicationMemory();
+    GuestStore store{.address = address, .width = width};
     if (point.type == ValueType::F32 && as_float.has_value()) {
         // A float source (a map position) lands as the float itself, not as an integer word.
         const f32 f = static_cast<f32>(*as_float);
         u32 bits{};
         std::memcpy(&bits, &f, sizeof(bits));
-        memory.Write32(address, bits);
-        return true;
+        store.bits = bits;
+        return store;
     }
-    u64 raw = static_cast<u64>(value);
+    const u64 raw = static_cast<u64>(value);
     if (point.shift != 0 || point.has_mask) {
         // Only the point's own bits change: a flag point cannot clobber its neighbours.
-        const u64 old = width == 1   ? memory.Read8(address)
-                        : width == 2 ? memory.Read16(address)
-                        : width == 4 ? memory.Read32(address)
-                                     : memory.Read64(address);
         const u64 field_mask = point.has_mask ? point.mask : ~u64{0};
-        const u64 field = point.shift >= 64 ? 0 : field_mask << point.shift;
-        const u64 bits = point.shift >= 64 ? 0 : (raw & field_mask) << point.shift;
-        raw = (old & ~field) | (bits & field);
+        store.field = point.shift >= 64 ? 0 : field_mask << point.shift;
+        store.bits = point.shift >= 64 ? 0 : (raw & field_mask) << point.shift;
+    } else {
+        store.bits = raw;
     }
-    switch (width) {
-    case 1:
-        memory.Write8(address, static_cast<u8>(raw));
-        break;
-    case 2:
-        memory.Write16(address, static_cast<u16>(raw));
-        break;
-    case 8:
-        memory.Write64(address, raw);
-        break;
-    default:
-        memory.Write32(address, static_cast<u32>(raw));
-        break;
+    return store;
+}
+
+std::optional<ModRuntime::GuestExpect> ModRuntime::ExpectUnchanged(const DataPoint& point,
+                                                                   s64 array_index) const {
+    const u32 width = point.type == ValueType::F32 ? 4 : IntegerWidth(point.type);
+    VAddr address{};
+    if (width == 0 || !ResolvePoint(point, address, array_index) ||
+        !AddressIsSane(address, width)) {
+        return std::nullopt;
     }
-    return true;
+    auto& memory = OwnerMemory();
+    const u64 now = width == 1   ? memory.Read8(address)
+                    : width == 2 ? memory.Read16(address)
+                    : width == 4 ? memory.Read32(address)
+                                 : memory.Read64(address);
+    return GuestExpect{.address = address, .width = width, .bits = now};
+}
+
+bool ModRuntime::RunWithGuestStopped(const std::function<void()>& fn) {
+    // A module's destroy callback may restore guarded temporary writes while reload
+    // already owns the suspension. Only this runtime on this thread may reuse it.
+    static thread_local const ModRuntime* stopped_runtime{};
+    if (stopped_runtime == this) {
+        fn();
+        return true;
+    }
+    const auto guarded = [&] {
+        const auto* previous = stopped_runtime;
+        stopped_runtime = this;
+        SCOPE_EXIT { stopped_runtime = previous; };
+        fn();
+    };
+    // Single core: this CoreTiming callback already runs between guest time slices. Multi-core:
+    // suspend the application's threads without pausing core timing (which this thread drives).
+    if (!system.IsMulticore()) {
+        guarded();
+        return true;
+    }
+    return system.RunWithGuestThreadsSuspended(guarded);
+}
+
+bool ModRuntime::ApplyGuestStores(std::span<const GuestExpect> expects,
+                                  std::span<const GuestStore> stores) {
+    auto& memory = OwnerMemory();
+    const auto width_mask = [](u32 width) {
+        return width >= 8 ? ~u64{0} : (u64{1} << (width * 8)) - 1;
+    };
+    const auto read = [&memory](VAddr address, u32 width) -> u64 {
+        return width == 1   ? memory.Read8(address)
+               : width == 2 ? memory.Read16(address)
+               : width == 4 ? memory.Read32(address)
+                            : memory.Read64(address);
+    };
+    const auto partial = [&](const GuestStore& s) {
+        return (s.field & width_mask(s.width)) != width_mask(s.width);
+    };
+    bool applied = false;
+    const auto apply = [&] {
+        for (const auto& e : expects) {
+            if (((read(e.address, e.width) ^ e.bits) & e.field & width_mask(e.width)) != 0) {
+                return; // the guest changed underneath: write nothing
+            }
+        }
+        for (const auto& s : stores) {
+            u64 raw = s.bits;
+            if (partial(s)) {
+                raw = (read(s.address, s.width) & ~s.field) | (s.bits & s.field);
+            }
+            switch (s.width) {
+            case 1:
+                memory.Write8(s.address, static_cast<u8>(raw));
+                break;
+            case 2:
+                memory.Write16(s.address, static_cast<u16>(raw));
+                break;
+            case 8:
+                memory.Write64(s.address, raw);
+                break;
+            default:
+                memory.Write32(s.address, static_cast<u32>(raw));
+                break;
+            }
+        }
+        applied = true;
+    };
+    // One whole-word store is already a single store: no reason to stop the guest for it.
+    if (expects.empty() && stores.size() == 1 && !partial(stores.front())) {
+        apply();
+        return applied;
+    }
+    // Several stores, a read-modify-write or a check: done while no guest thread runs, so the
+    // guest never sees half a slot, both halves of a swap holding one item, or a lost update to
+    // a neighbouring bit. When the application cannot be stalled right now (a pause/resume in
+    // progress) the batch is applied as before this path existed, rather than dropping the tap.
+    if (!RunWithGuestStopped(apply)) {
+        apply();
+    }
+    return applied;
+}
+
+bool ModRuntime::WritePointValue(const DataPoint& point, s64 value, s64 array_index,
+                                 std::optional<f64> as_float) {
+    const auto store = PlanPointWrite(point, value, array_index, as_float);
+    return store && ApplyGuestStores({}, std::span{&*store, 1});
 }
 
 /// True while player 1's left stick is pushed past a drift dead zone, or a direction (d-pad or the
@@ -984,7 +1134,7 @@ std::optional<s64> ModRuntime::FindEntryArray(const ArrayFind& spec, s64 value_o
         cursor = HeapBegin;
     }
     const VAddr slice_end = std::min<VAddr>(HeapEnd, cursor + PagesPerTick * 0x1000);
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     // Under NCE the module's data segment (where vtables live) is mapped at a different offset
     // from the text base than under Dynarmic, so the precomputed `main + vtable` is wrong by a
     // constant that is the same for every class. Discovered once from the inventory array's shape
@@ -1137,7 +1287,7 @@ std::optional<s64> ModRuntime::FindEntryArray(const ArrayFind& spec, s64 value_o
 /// read current==max forever. Confirmed once, then re-verified cheaply; a full re-scan only runs
 /// while unconfirmed or after the chosen array is freed.
 std::optional<s64> ModRuntime::SelectLiveInventory(const ArrayFind& spec, s64 value_off) const {
-    auto& memory = system.ApplicationMemory();
+    auto& memory = OwnerMemory();
     const u64 vtable =
         main_region_begin + static_cast<u64>(spec.vtable) + static_cast<u64>(nce_vtable_delta);
     // Hash a candidate's value column so a change between scans is detectable.
@@ -1191,7 +1341,7 @@ std::optional<s64> ModRuntime::SelectLiveInventory(const ArrayFind& spec, s64 va
     // SLICED candidate sweep. A full-heap scan in one call every N ticks is what made the game
     // stutter while unconfirmed (idle -- no value change to confirm on, so it swept 650k pages
     // over and over); firing a missile changed a value, confirmed the copy, and the sweep stopped,
-    // which is exactly why it "ran great when I fire". Sweeping a bounded slice per frame removes
+    // which is exactly why it ran smoothly while firing. Sweeping a bounded slice per frame removes
     // the stall: one lap finishes in a few seconds, and a value that moves within a lap confirms.
     constexpr u64 PagesPerTick = 4096;
     const VAddr HeapBegin = HeapLow();
@@ -1262,14 +1412,14 @@ bool ModRuntime::InGameplay() const {
     // Exploration override for games whose package has no points yet: with nothing to read,
     // neither source below can ever open the gate, and every search tool stays parked.
     // Never set this together with a tool that drives the pad on its own.
-    static const bool assume = std::getenv("EDEN_DSMOD_ASSUME_GAMEPLAY") != nullptr;
+    static const bool assume = Common::DSMod::DevEnvironment("EDEN_DSMOD_ASSUME_GAMEPLAY") != nullptr;
     if (assume) {
         return true;
     }
     // A trigger file lets a person mark "I am in-game now" from outside -- the moment it appears,
     // the search tools (which collect their baseline the first frame gameplay is true) begin, on
     // real in-game memory rather than the title screen. Removing it pauses them again.
-    static const char* const trigger = std::getenv("EDEN_DSMOD_GAMEPLAY_TRIGGER");
+    static const char* const trigger = Common::DSMod::DevEnvironment("EDEN_DSMOD_GAMEPLAY_TRIGGER");
     if (trigger != nullptr) {
         return std::filesystem::exists(trigger);
     }
@@ -1294,48 +1444,24 @@ bool ModRuntime::InGameplayHonest() const {
 /// Re-apply state the game keeps undoing. Rules are cheap: a tick counter comparison, and at most
 /// one guest call in flight at a time (RunAction is a no-op for Call while one is armed).
 void ModRuntime::ApplyEnforceRules(const StateSnapshot& snapshot) {
-    // A call that never traps back would otherwise block every later call for the rest of the
-    // session, silently. Give up on it and unpatch, so the mod keeps working.
-    // Only a call that went in and never came back is stuck. Waiting for the hook is not: the
-    // game calls it when it calls it, and unpatching from this thread while a guest thread is
-    // about to trap on it is a race that corrupts the borrow.
-    // Only a call that went in and never came back is stuck. *Waiting* for the hook is not a
-    // fault: the hook is whatever the game happens to call, and a game standing still in a save
-    // room can go a minute without running a line of script. Giving up on the wait and re-arming
-    // on the next poll opens a gap, and the one call the game does make lands in it -- which is
-    // how a sequence can work perfectly in the menus and never fire again in play.
-    {
-        std::scoped_lock bridge_lock{guest_bridge_mutex};
-        if (call_state == CallState::InCall && tick_count - call_started_tick > StuckCallTicks) {
-            // Give up on the attempt, but do not touch guest memory to do it. Unpatching from this
-            // thread while a guest thread is about to trap on the same address is a race, and the
-            // leftover breakpoint is harmless: whichever thread hits it next finds it in
-            // patched_original, puts the instruction back and carries on.
-            LOG_WARNING(Core,
-                        "DSMod: a call went in and never came back; abandoning it after {} ticks",
-                        StuckCallTicks);
-            call_state = CallState::Idle;
-            call_seq = nullptr;
-        }
-    }
-    ApplyPatches();
+    MaintainGuestBridge();
 #if EDEN_DSMOD_BUILD_DEV_TOOLS
     ApplyEnforceRulesDevToolsImpl(snapshot);
-#endif
-    if (!cmd_action.empty()) {
+    if (!dev.cmd_action.empty()) {
         // A console-fired action. A sequence can only be armed while the call machinery is idle
         // (StartSequence silently declines otherwise), so hold it until then and take the turn
         // ahead of the polled sequences.
-        const auto it = manifest.actions.find(cmd_action);
+        const auto it = manifest.actions.find(dev.cmd_action);
         if (it == manifest.actions.end()) {
-            LOG_INFO(Core, "DSMod action '{}': no such action", cmd_action);
-            cmd_action.clear();
-        } else if (call_state == CallState::Idle && (!cmd_action_ingame || last_in_game != 0)) {
-            LOG_INFO(Core, "DSMod action '{}': running", cmd_action);
+            LOG_INFO(Core, "DSMod action '{}': no such action", dev.cmd_action);
+            dev.cmd_action.clear();
+        } else if (call_state == CallState::Idle && (!dev.cmd_action_ingame || last_in_game != 0)) {
+            LOG_INFO(Core, "DSMod action '{}': running", dev.cmd_action);
             RunAction(it->second, snapshot);
-            cmd_action.clear();
+            dev.cmd_action.clear();
         }
     }
+#endif
     RunPolledSequences(snapshot);
     if (manifest.enforce.empty()) {
         return;
@@ -1366,6 +1492,34 @@ void ModRuntime::ApplyEnforceRules(const StateSnapshot& snapshot) {
             RunAction(action->second, snapshot);
         }
     }
+}
+
+void ModRuntime::MaintainGuestBridge() {
+    // A call that never traps back would otherwise block every later call for the rest of the
+    // session, silently. Give up on it and unpatch, so the mod keeps working.
+    // Only a call that went in and never came back is stuck. Waiting for the hook is not: the
+    // game calls it when it calls it, and unpatching from this thread while a guest thread is
+    // about to trap on it is a race that corrupts the borrow.
+    // Only a call that went in and never came back is stuck. *Waiting* for the hook is not a
+    // fault: the hook is whatever the game happens to call, and a game standing still in a save
+    // room can go a minute without running a line of script. Giving up on the wait and re-arming
+    // on the next poll opens a gap, and the one call the game does make lands in it -- which is
+    // how a sequence can work perfectly in the menus and never fire again in play.
+    {
+        std::scoped_lock bridge_lock{guest_bridge_mutex};
+        if (call_state == CallState::InCall && tick_count - call_started_tick > StuckCallTicks) {
+            // Give up on the attempt, but do not touch guest memory to do it. Unpatching from this
+            // thread while a guest thread is about to trap on the same address is a race, and the
+            // leftover breakpoint is harmless: whichever thread hits it next finds it in
+            // patched_original, puts the instruction back and carries on.
+            LOG_WARNING(Core,
+                        "DSMod: a call went in and never came back; abandoning it after {} ticks",
+                        StuckCallTicks);
+            call_state = CallState::Idle;
+            call_seq = nullptr;
+        }
+    }
+    ApplyPatches();
 }
 
 } // namespace Core::Mods

@@ -19,11 +19,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <span>
 #include "common/stb.h"
 
 #include <cstdlib>
 #include <fstream>
+#include "common/dsmod_dev_tools.h"
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/mods/mod_runtime.h"
@@ -100,7 +102,7 @@ void ModRuntime::DrivePageBinds(const StateSnapshot& snapshot) {
             continue;
         }
         Action action;
-        action.name = fmt::format("page_bind:{}", bind.point);
+        action.name = std::format("page_bind:{}", bind.point);
         action.kind = ActionKind::Page;
         action.page = target.page;
         action.transition = target.transition;
@@ -117,7 +119,7 @@ void ModRuntime::DrivePageBinds(const StateSnapshot& snapshot) {
 
 float ModRuntime::AnimTimeScale() {
     static const float scale = [] {
-        const char* const v = std::getenv("EDEN_DSMOD_ANIM_SCALE");
+        const char* const v = Common::DSMod::DevEnvironment("EDEN_DSMOD_ANIM_SCALE");
         const float f = v != nullptr ? std::strtof(v, nullptr) : 1.0f;
         return f > 0.0f ? std::min(f, 100.0f) : 1.0f;
     }();
@@ -126,8 +128,11 @@ float ModRuntime::AnimTimeScale() {
 
 void ModRuntime::DumpAnimFrame(std::span<const u32> pixels, u32 w, u32 h,
                                const std::string& label) {
+    if constexpr (!Common::DSMod::DevToolsEnabled) {
+        return;
+    }
     static const std::string dir = [] {
-        const char* const v = std::getenv("EDEN_DSMOD_ANIM_DUMP");
+        const char* const v = Common::DSMod::DevEnvironment("EDEN_DSMOD_ANIM_DUMP");
         return v != nullptr ? std::string{v} : std::string{};
     }();
     if (dir.empty() || pixels.size() < static_cast<size_t>(w) * h) {
@@ -142,7 +147,7 @@ void ModRuntime::DumpAnimFrame(std::span<const u32> pixels, u32 w, u32 h,
         rgba[i * 4 + 2] = static_cast<u8>(p);
         rgba[i * 4 + 3] = 0xFF;
     }
-    const std::string path = fmt::format("{}/{:04}_{}.png", dir, anim_dump_seq++, label);
+    const std::string path = std::format("{}/{:04}_{}.png", dir, anim_dump_seq++, label);
     std::thread([path, w, h, rgba = std::move(rgba)] {
         stbi_write_png(path.c_str(), static_cast<int>(w), static_cast<int>(h), 4, rgba.data(),
                        static_cast<int>(w) * 4);
@@ -289,16 +294,23 @@ bool ModRuntime::DrivePageTransition(const StateSnapshot& snapshot, u64 sig, u32
         const auto t0 = std::chrono::steady_clock::now();
         canvas.Resize(target_w, target_h);
         LoadFont();
+        // The canvas keeps raw pointers: the atlases are held in canvas_font_ref /
+        // canvas_icon_ref until the next SetFont, not by a temporary.
         if (font_metrics.Valid()) {
-            // Same reasoning as PublishUi's identical block (mod_redraw.cpp).
-            canvas.SetFont(GetImage(manifest.font_atlas_src).get(), &font_metrics);
+            const bool paged = font_pages != nullptr && font_metrics.page_h > 0; // runtime 17
+            canvas_font_ref = paged ? nullptr : GetImage(manifest.font_atlas_src);
+            canvas.SetFont(canvas_font_ref.get(), &font_metrics);
+            canvas.SetFontPages(paged ? font_pages.get() : nullptr);
+        } else {
+            canvas_font_ref.reset();
+            canvas.SetFont(nullptr, nullptr);
+            canvas.SetFontPages(nullptr);
         }
         {
-            std::shared_ptr<const Image> icon_atlas;
             bool icon_pending = false;
             const FontMetrics* const icons =
-                manifest.msbt.Enabled() ? NxIconFont(icon_atlas, icon_pending) : nullptr;
-            canvas.SetIconFont(icon_atlas.get(), icons, icon_pending);
+                manifest.msbt.Enabled() ? NxIconFont(canvas_icon_ref, icon_pending) : nullptr;
+            canvas.SetIconFont(canvas_icon_ref.get(), icons, icon_pending);
         }
         // 1. The page being left, frozen as it was on screen: the canvas already holds it after a
         //    CPU frame (or the previous target, when a transition is interrupted); otherwise
@@ -343,6 +355,7 @@ bool ModRuntime::DrivePageTransition(const StateSnapshot& snapshot, u64 sig, u32
         // call below, outside the dispatch mailbox -- bump so a worker job already in flight for
         // the page being LEFT cannot land its stale publish after this transition's.
         redraw_dispatch_generation.fetch_add(1, std::memory_order_relaxed);
+        redraw_authority_generation.fetch_add(1, std::memory_order_relaxed);
         ApplyViewCorrections();
         page_anim = {};
         page_anim.active = true;
@@ -362,18 +375,18 @@ bool ModRuntime::DrivePageTransition(const StateSnapshot& snapshot, u64 sig, u32
                                         static_cast<s32>(target_h) / 2, 0, 0};
                 origin_note = " origin unresolved, using canvas centre";
             } else {
-                origin_note = fmt::format(" origin [{},{},{},{}]", page_anim.req.origin[0],
+                origin_note = std::format(" origin [{},{},{},{}]", page_anim.req.origin[0],
                                           page_anim.req.origin[1], page_anim.req.origin[2],
                                           page_anim.req.origin[3]);
             }
         }
-        const std::string line = fmt::format(
+        const std::string line = std::format(
             "DSMod transition {} '{}' -> '{}' {} ms: start {:.2f} ms ({}){}",
             TransitionLogName(req.kind), pages[req.from].id, pages[req.to].id, req.duration_ms,
             page_anim.start_ms, reuse ? "old page reused, new page drawn" : "both pages drawn",
             origin_note);
         LOG_INFO(Core, "{}", line);
-        if (const char* const p = std::getenv("EDEN_DSMOD_CMD")) {
+        if (const char* const p = Common::DSMod::DevEnvironment("EDEN_DSMOD_CMD")) {
             std::ofstream f(std::string(p) + ".out", std::ios::app);
             if (f) {
                 f << line << '\n';
@@ -397,6 +410,7 @@ bool ModRuntime::DrivePageTransition(const StateSnapshot& snapshot, u64 sig, u32
         // already in flight for whatever was showing before can't publish over whatever gets shown
         // next.
         redraw_dispatch_generation.fetch_add(1, std::memory_order_relaxed);
+        redraw_authority_generation.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     static thread_local RuntimeStageStats stats;
@@ -462,7 +476,7 @@ bool ModRuntime::DrivePageTransition(const StateSnapshot& snapshot, u64 sig, u32
                              page_anim.req.kind, eased, page_anim.req.shadow);
         }
         DumpAnimFrame(out, target_w, target_h,
-                      fmt::format("{}_f{:02}_p{:03}", TransitionLogName(page_anim.req.kind),
+                      std::format("{}_f{:02}_p{:03}", TransitionLogName(page_anim.req.kind),
                                   page_anim.frames, static_cast<int>(t * 1000.0f)));
     });
     const double ms =
@@ -472,13 +486,13 @@ bool ModRuntime::DrivePageTransition(const StateSnapshot& snapshot, u64 sig, u32
     page_anim.compose_max_ms = std::max(page_anim.compose_max_ms, ms);
     if (t >= 1.0f) {
         page_anim.active = false;
-        const std::string line = fmt::format(
+        const std::string line = std::format(
             "DSMod transition done: {} frame(s) in {:.0f} ms, frame avg {:.2f} ms max {:.2f} ms, "
             "target redrawn {}x",
             page_anim.frames, elapsed, page_anim.compose_ms / page_anim.frames,
             page_anim.compose_max_ms, page_anim.redraws);
         LOG_INFO(Core, "{}", line);
-        if (const char* const p = std::getenv("EDEN_DSMOD_CMD")) {
+        if (const char* const p = Common::DSMod::DevEnvironment("EDEN_DSMOD_CMD")) {
             std::ofstream f(std::string(p) + ".out", std::ios::app);
             if (f) {
                 f << line << '\n';

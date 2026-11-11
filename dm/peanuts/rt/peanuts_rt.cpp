@@ -6,15 +6,18 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "common/fs/path_util.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/mods/mod_module.h"
 #include "core/mods/mod_runtime.h"
 #include "peanuts_rt.h"
 
@@ -46,6 +49,15 @@ struct PnRtAccess {
     }
     static const std::string& Name(const ModRuntime& rt) {
         return rt.manifest.name;
+    }
+    /// R5: "<module name>" when a native module instance runs, "none" when the package has no
+    /// module, else the loader's / module's error text.
+    static std::string Module(const ModRuntime& rt) {
+        if (rt.game_module && rt.game_module_instance) {
+            const auto* const api = rt.game_module->Api();
+            return api && api->name ? api->name : "unnamed";
+        }
+        return rt.module_error.empty() ? "none" : "error: " + rt.module_error;
     }
 };
 } // namespace Core::Mods
@@ -151,6 +163,26 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
         if (!sys.romfs_root) {
             LOG_WARNING(Core, "peanuts_rt: romfs_dir '{}' is not a directory", config->romfs_dir);
         }
+    }
+    if (config->save_dir != nullptr) {
+        sys.save_root = FileSys::OpenHostDirectory(config->save_dir);
+    }
+    if (config->sysfont_dir != nullptr) {
+        sys.sysfont_root = FileSys::OpenHostDirectory(config->sysfont_dir);
+    }
+    // R5: the data directory behind Common::FS::GetEdenPath (persisted flags, "user:" assets) and
+    // the private staging directory native modules are copied to before dlopen (mod_module.cpp
+    // refuses to run on Android without one).
+    {
+        std::filesystem::path data = config->data_dir != nullptr ? config->data_dir : "";
+        if (data.empty()) {
+            std::error_code ec;
+            data = std::filesystem::temp_directory_path(ec) / "peanuts_rt";
+        }
+        Common::FS::SetEdenDir(data);
+        std::error_code ec;
+        std::filesystem::create_directories(data / "dualscreen-code", ec);
+        Core::Mods::SetModuleCacheDirectory(data / "dualscreen-code");
     }
     auto& aux = sys.gpu.DSModAux();
     aux.width.store(config->panel_w != 0 ? config->panel_w : 1280);
@@ -262,11 +294,12 @@ size_t pn_rt_status(PnRt* rt, char* buf, size_t n) {
         return static_cast<size_t>(std::snprintf(buf, n, "no runtime"));
     }
     const auto& r = *rt->runtime;
-    const int len = std::snprintf(buf, n, "%s page=%s tick=%llu frames=%llu err=%s",
+    const int len = std::snprintf(buf, n, "%s page=%s tick=%llu frames=%llu module=%s err=%s",
                                   Core::Mods::PnRtAccess::Name(r).c_str(),
                                   Core::Mods::PnRtAccess::PageId(r).c_str(),
                                   static_cast<unsigned long long>(Core::Mods::PnRtAccess::Ticks(r)),
                                   static_cast<unsigned long long>(rt->frames_taken),
+                                  Core::Mods::PnRtAccess::Module(r).c_str(),
                                   rt->last_error.empty() ? "-" : rt->last_error.c_str());
     return len < 0 ? 0 : std::min(static_cast<size_t>(len), n - 1);
 }

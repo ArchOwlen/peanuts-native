@@ -13,6 +13,12 @@
 //     BeginRecord (what a tap hit-tests against), DrawAtlasLayer (area markers, region labels,
 //     array-point pins, the player's custom markers, the player, a second actor),
 //     DrawMarkerPicture (a marker_src picture), DrawPinFallback (the diamond pin, visit reports).
+//     Runtime 14: the base picture may come from a text point (map "image_bind"), DrawOverlays
+//     places bound pictures in world space over it (map "overlays"), and array-point pins may
+//     draw per-slot pictures sized in world units with a bar, a dim state and a frame / tint.
+//     Runtime 22: the whole view may turn about the widget centre (map "view_rotate_bind",
+//     clockwise degrees): the base picture and overlays are drawn turned (CPU, nearest), every
+//     marker / label / pin is placed through the same turn but stays upright.
 //     On the GPU path (draw_list) the map, pulse and atlas glyphs are emitted as quads; glyphs that
 //     must sit above the labels still go into the canvas.
 //   - The map label bitmaps: a region name rendered once with its outline, then blitted.
@@ -34,9 +40,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <fmt/format.h>
+#include <format>
 
 #include "common/logging.h"
+#include "core/mods/mod_map_view_rect.h"
 #include "core/mods/mod_ui.h"
 #include "core/mods/mod_ui_internal.h"
 
@@ -69,10 +76,14 @@ std::shared_ptr<const LabelBitmap> MapLabelBitmap(const Canvas& target, const st
     static std::unordered_map<std::string, std::shared_ptr<const LabelBitmap>> cache;
     std::scoped_lock lock{MapLabelBitmapMutex()};
     const FontMetrics* const fm = target.HasFont() ? target.font_metrics : nullptr;
-    const std::string key = fmt::format(
+    // A paged font (runtime 17) has no atlas image: its page cache stands for it in the key.
+    const void* const atlas_id =
+        !target.HasFont() ? nullptr
+        : target.font_atlas != nullptr ? static_cast<const void*>(target.font_atlas)
+                                       : static_cast<const void*>(target.font_pages);
+    const std::string key = std::format(
         "{}\x1f{}\x1f{:08X}\x1f{:08X}\x1f{}\x1f{}\x1f{}\x1f{}", text, scale, color, outline_color,
-        outline, static_cast<const void*>(target.HasFont() ? target.font_atlas : nullptr),
-        static_cast<const void*>(fm), fm != nullptr ? fm->line_height : 0);
+        outline, atlas_id, static_cast<const void*>(fm), fm != nullptr ? fm->line_height : 0);
     if (const auto it = cache.find(key); it != cache.end()) {
         return it->second;
     }
@@ -82,6 +93,7 @@ std::shared_ptr<const LabelBitmap> MapLabelBitmap(const Canvas& target, const st
     Canvas tmp;
     if (target.HasFont()) {
         tmp.SetFont(target.font_atlas, target.font_metrics);
+        tmp.SetFontPages(target.font_pages); // runtime 17 paged font
     }
     const s32 o = std::clamp(outline, 0, 16);
     const s32 text_w = tmp.MeasureText(text, scale);
@@ -104,6 +116,12 @@ std::shared_ptr<const LabelBitmap> MapLabelBitmap(const Canvas& target, const st
         }
     }
     tmp.DrawText(ox, oy, text, scale, color);
+    // A glyph whose font page is still loading drew blank: hand this picture out uncached.
+    const bool partial = tmp.TakeGlyphsPending();
+    const auto keep = [&](LabelBitmap&& b) {
+        auto made = std::make_shared<const LabelBitmap>(std::move(b));
+        return partial ? made : cache.emplace(key, std::move(made)).first->second;
+    };
     // Keep only the inked box: the margins for accents / descenders are mostly empty, and every
     // redraw blits the whole picture.
     const auto& px = tmp.Pixels();
@@ -121,8 +139,7 @@ std::shared_ptr<const LabelBitmap> MapLabelBitmap(const Canvas& target, const st
     LabelBitmap bmp;
     bmp.text_w = text_w;
     if (x1 < x0) {
-        return cache.emplace(key, std::make_shared<const LabelBitmap>(std::move(bmp)))
-            .first->second; // nothing inked
+        return keep(std::move(bmp)); // nothing inked
     }
     bmp.image.w = static_cast<u32>(x1 - x0 + 1);
     bmp.image.h = static_cast<u32>(y1 - y0 + 1);
@@ -133,7 +150,7 @@ std::shared_ptr<const LabelBitmap> MapLabelBitmap(const Canvas& target, const st
     }
     bmp.ox = ox - x0;
     bmp.oy = oy - y0;
-    return cache.emplace(key, std::make_shared<const LabelBitmap>(std::move(bmp))).first->second;
+    return keep(std::move(bmp));
 }
 
 /// The area a Map widget shows this draw: named by the room (or area) string point, by the
@@ -159,24 +176,9 @@ void SelectMapArea(const WidgetDrawContext& ctx, std::string& area, std::string&
     if (area.empty() && !widget.area_bind.empty()) {
         const auto zone = snapshot.ints.find(widget.area_bind);
         if (zone != snapshot.ints.end()) {
-            // A season-aware game: zone*4+season indexes a seasonally-tinted copy of the
-            // same map. The plain zone id -- then the fixed widget.area -- remain the
-            // fallback for a season point that does not resolve.
-            if (!widget.area_season_bind.empty()) {
-                if (const auto season = snapshot.ints.find(widget.area_season_bind);
-                    season != snapshot.ints.end() && season->second >= 0 && season->second < 4) {
-                    if (const auto mapped =
-                            manifest.zone_area.find(zone->second * 4 + season->second);
-                        mapped != manifest.zone_area.end()) {
-                        area = mapped->second;
-                    }
-                }
-            }
-            if (area.empty()) {
-                if (const auto mapped = manifest.zone_area.find(zone->second);
-                    mapped != manifest.zone_area.end()) {
-                    area = mapped->second;
-                }
+            if (const auto mapped = manifest.zone_area.find(zone->second);
+                mapped != manifest.zone_area.end()) {
+                area = mapped->second;
             }
         }
     }
@@ -205,11 +207,16 @@ public:
           rw{ctx.rw}, rh{ctx.rh}, area{area_}, geo{geo_} {}
 
     void Draw();
+    /// FrameView alone (ProbeMapView): the view this draw would use, into the record fields.
+    bool ProbeView(MapDrawRecord& out);
 
 private:
     // Phases, in draw order.
     bool FrameView();     ///< false: nothing more to draw (no extent, no first sample)
     bool DrawBaseLayer(); ///< false: the picture underlay is missing
+    /// Runtime 22: DrawBaseLayer's picture, cross-fade and pulse for a turned view (CPU).
+    void DrawTurnedBase(const std::string& key, const std::shared_ptr<const Image>& drawn,
+                        const CompositeLevel& level, const std::string& composite_name);
     void BeginRecord();
     void DrawAtlasLayer(); ///< area markers, labels, pins, custom markers, player, actor
     void DrawAreaMarkers();
@@ -219,11 +226,29 @@ private:
     void DrawSecondActor();
     void DrawMarkerPicture();
     void DrawPinFallback();
+    void DrawFallbackPin(s32 cxm, s32 cym);
+    void DrawOverlays(); ///< runtime 14: map "overlays", over the base picture, under markers
 
     // Helpers.
+    /// The UNTURNED view: a world point's canvas x / y before the runtime 22 turn. Pictures that
+    /// live in world space (base, overlays) are laid out with these and then drawn turned.
     [[nodiscard]] float to_x(float wx) const;
     [[nodiscard]] float to_y(float wy) const;
+    /// Where a world point is drawn: to_x / to_y turned about the widget centre (runtime 22).
+    [[nodiscard]] std::array<float, 2> pt(float wx, float wy) const;
+    /// A picture whose unturned canvas rect is (qx, qy, qw, qh), drawn turned by `turn` about the
+    /// widget centre, clipped to the widget (source region sx/sy/sw/sh of the image).
+    void blit_turned(const Image& img, float qx, float qy, float qw, float qh, s32 sx, s32 sy,
+                     s32 sw, s32 sh, u32 tint);
     [[nodiscard]] bool visible(float px, float py) const;
+    /// A picture into the canvas at (qx, qy, qw, qh), clipped to the widget, tinted (ARGB).
+    void blit_clipped(const Image& img, float qx, float qy, float qw, float qh, u32 tint);
+    /// Runtime 24: blit_clipped with `mask`'s alpha (bilinear, stretched over the whole quad)
+    /// multiplying the picture's alpha, then `alpha` (0..255) on top.
+    void blit_masked(const Image& img, const Image& mask, float qx, float qy, float qw, float qh,
+                     u32 alpha);
+    /// A solid rect into the canvas, clipped to the widget.
+    void fill_clipped(float l, float t, float w, float h, u32 argb);
     bool group_visible(const std::string& group, float& alpha) const;
     void draw_labels();
     void emit_atlas_tinted(float ux, float uy, float uw, float uh, float qx, float qy, float qw,
@@ -263,12 +288,20 @@ private:
     // FrameView: the area's extent, the live player position, and the view (centre `cx`/`cy`,
     // `ppw` canvas px per world unit, `cxpix`/`cypix` the widget centre on the canvas).
     bool image_mode{};
+    /// The base picture: the area's `image`, or the key a map "image_bind" text point names.
+    std::string base_image;
     float min_x{}, max_x{}, min_y{}, max_y{};
     float span_x{}, span_y{};
     bool have_player = false;
     float wx_player = 0.0f, wy_player = 0.0f;
     float ppw{}, cx{}, cy{};
     float cxpix{}, cypix{};
+    /// Runtime 22: the view's clockwise turn in degrees [0, 360) and its cosine / sine.
+    float turn{0.0f};
+    float turn_c{1.0f}, turn_s{0.0f};
+    /// The pinch's lower zoom limit this frame: the widget's min_zoom, or with a bound view rect
+    /// the whole-area fit relative to the rect fit (runtime 14).
+    float zoom_min{1.0f};
     // DrawBaseLayer: the raster size and the whole area's on-screen rectangle.
     s32 iw{}, ih{};
     float img_l{}, img_t{};
@@ -282,6 +315,13 @@ private:
     s32 ItemIconSize{}, DoorIconSize{};
     float item_blink{};
     s32 PlayerIcon{};
+    // For the record (MapDrawRecord's change-tracking fields): where the live marker painted,
+    // whether anything else was drawn from the clock, and which pictures were used.
+    std::array<s32, 4> marker_px{};
+    bool uses_clock = false;
+    u64 content = 0;
+    void add_marker_px(s32 bx, s32 by, s32 bw, s32 bh);
+    void add_content(const void* picture);
 };
 
 void GeometryMapDraw::Draw() {
@@ -293,9 +333,14 @@ void GeometryMapDraw::Draw() {
     }
     map_extras = widget.map_extras.get();
     BeginRecord();
+    DrawOverlays();
     atlas = (images && !manifest.icon_atlas.empty()) ? images(manifest.icon_atlas) : nullptr;
     if (atlas != nullptr && manifest.icon_cell > 0) {
         DrawAtlasLayer();
+    } else {
+        // No icon atlas: array-point pins that draw their own pictures still show.
+        ItemIconSize = manifest.map_style.item_icon;
+        DrawDynamicMarkers();
     }
     if (!labels_drawn) {
         draw_labels(); // no icon atlas (yet): the names still show
@@ -303,8 +348,55 @@ void GeometryMapDraw::Draw() {
     DrawMarkerPicture();
     DrawPinFallback();
     if (!image_mode && widget.area_label) {
-        canvas.DrawText(x + 12, y + rh - 24, area, widget.text_scale, widget.color);
+        canvas.DrawText(x + widget.label_offset[0], y + rh - widget.label_offset[1], area,
+                        widget.text_scale, widget.color);
     }
+    if (record != nullptr) {
+        add_content(atlas.get());
+        record->marker_box = marker_px;
+        record->clock_dependent = uses_clock;
+        record->content_id = content;
+    }
+}
+
+bool GeometryMapDraw::ProbeView(MapDrawRecord& out) {
+    if (!FrameView()) {
+        return false;
+    }
+    out.page_id = page.id;
+    out.widget_index = widget_index;
+    out.area = area;
+    out.rect = {x, y, rw, rh};
+    out.cx = cx;
+    out.cy = cy;
+    out.ppw = ppw;
+    out.min_x = min_x;
+    out.min_y = min_y;
+    out.max_x = max_x;
+    out.max_y = max_y;
+    out.rotation = turn;
+    out.view_key = widget.id.empty() ? page.id + "#" + std::to_string(widget_index) : widget.id;
+    return true;
+}
+
+void GeometryMapDraw::add_marker_px(s32 bx, s32 by, s32 bw, s32 bh) {
+    if (bw <= 0 || bh <= 0) {
+        return;
+    }
+    if (marker_px[2] <= 0 || marker_px[3] <= 0) {
+        marker_px = {bx, by, bw, bh};
+        return;
+    }
+    const s32 x0 = std::min(marker_px[0], bx), y0 = std::min(marker_px[1], by);
+    const s32 x1 = std::max(marker_px[0] + marker_px[2], bx + bw);
+    const s32 y1 = std::max(marker_px[1] + marker_px[3], by + bh);
+    marker_px = {x0, y0, x1 - x0, y1 - y0};
+}
+
+void GeometryMapDraw::add_content(const void* picture) {
+    content = (content ^ static_cast<u64>(reinterpret_cast<uintptr_t>(picture))) *
+                  0x100000001B3ULL +
+              0x9E3779B97F4A7C15ULL;
 }
 
 bool GeometryMapDraw::FrameView() {
@@ -313,7 +405,15 @@ bool GeometryMapDraw::FrameView() {
     // the live pin all behave as before. Fog of war is suppressed: the picture is
     // whole, there is no reveal grid, and MarkVisitedAt would build one that blanks
     // the map.
-    image_mode = !geo->second.image.empty();
+    base_image = geo->second.image;
+    if (const MapWidgetExtras* mx = widget.map_extras.get();
+        mx != nullptr && !mx->image_bind.empty()) {
+        if (const auto t = snapshot.texts.find(mx->image_bind);
+            t != snapshot.texts.end() && !t->second.empty()) {
+            base_image = t->second; // runtime 14: the bound picture overrides the area's
+        }
+    }
+    image_mode = !base_image.empty();
     // One uniform pixels-per-world scale drives the base image AND every marker, so the
     // map keeps the world's real proportions instead of being stretched to fill the
     // widget (the area is ~2.9:1 but the panel is ~1.25:1, which squashed it tall).
@@ -341,8 +441,61 @@ bool GeometryMapDraw::FrameView() {
     // Before the first valid sample (including after an area change), draw only the
     // widget background; another area's cached centre must never leak across.
     const bool follow = widget.follow_window > 0.0f;
-    const std::string fkey =
-        (widget.id.empty() ? page.id + "#" + std::to_string(widget_index) : widget.id) + "@" + area;
+    const std::string vkey =
+        widget.id.empty() ? page.id + "#" + std::to_string(widget_index) : widget.id;
+    const std::string fkey = vkey + "@" + area;
+    zoom_min = widget.min_zoom;
+    // Bound default view (runtime 14, map "view_rect_*_bind"): when the four values resolve, the
+    // base view (zoom 1, pan 0) is that rect fitted into the widget, and a new rect glides the
+    // base there unless the user's own view is in effect (then it holds, like the follow
+    // centre). A transiently missing rect keeps the last one shown in this area; with none yet,
+    // the view falls back to the area fit / follow framing below. The shown base is kept per
+    // widget AND area ("<id>@<area>#rect_c" / "#rect_z", restored with the follow state by a
+    // narrowed marker redraw); "<id>#zmin" tells the pinch (ZoomLimits) how far out it may go.
+    bool rect_base = false;
+    if (const MapWidgetExtras* mx = widget.map_extras.get(); mx != nullptr && mx->HasViewRect()) {
+        const auto& b = mx->view_rect_binds;
+        const auto r = NormaliseViewRect(
+            SnapshotNumber(snapshot, b[0]), SnapshotNumber(snapshot, b[1]),
+            SnapshotNumber(snapshot, b[2]), SnapshotNumber(snapshot, b[3]), mx->view_rect_pad);
+        const bool user_view =
+            widget.pan_zoom && MapViewCustom(view.zoom, view.pan_x, view.pan_y, view.gliding);
+        std::optional<MapBaseView> shown;
+        std::unique_lock<std::mutex> rect_lk;
+        if (follow_state != nullptr && follow_state_mutex != nullptr) {
+            rect_lk = std::unique_lock<std::mutex>{*follow_state_mutex};
+        }
+        if (follow_state != nullptr) {
+            const auto c = follow_state->find(fkey + "#rect_c");
+            const auto z = follow_state->find(fkey + "#rect_z");
+            if (c != follow_state->end() && z != follow_state->end()) {
+                shown = MapBaseView{c->second[0], c->second[1], z->second[0]};
+            }
+        }
+        if (r.has_value()) {
+            const MapBaseView target = FitWorldRect(*r, rw, rh);
+            if (!shown.has_value()) {
+                shown = target;
+            } else if (StepBaseGlide(*shown, target, user_view)) {
+                settling = true;
+            }
+        }
+        if (shown.has_value()) {
+            rect_base = true;
+            cx = shown->cx;
+            cy = shown->cy;
+            ppw = shown->ppw;
+            zoom_min = RectMinZoom(FitWorldRect({min_x, min_y, max_x, max_y}, rw, rh).ppw, ppw,
+                                   widget.min_zoom);
+        }
+        if (follow_state != nullptr) {
+            if (shown.has_value()) {
+                (*follow_state)[fkey + "#rect_c"] = {shown->cx, shown->cy};
+                (*follow_state)[fkey + "#rect_z"] = {shown->ppw, 0.0f};
+            }
+            (*follow_state)[vkey + "#zmin"] = {zoom_min, 0.0f};
+        }
+    }
     // Locked whenever follow_state_mutex is given (see RenderPage's declaration in mod_ui.h).
     // Held only around the lookup, not the draw work that follows.
     bool have_cached_follow = false;
@@ -358,7 +511,7 @@ bool GeometryMapDraw::FrameView() {
             cached_follow_value = cached_follow->second;
         }
     }
-    if (follow && !have_player && !have_cached_follow && !image_mode) {
+    if (!rect_base && follow && !have_player && !have_cached_follow && !image_mode) {
         if (draw_list != nullptr) {
             // The bounded solid background is the complete initial follow view. Mark
             // the composite active so the GPU publishes it while waiting for the
@@ -367,7 +520,9 @@ bool GeometryMapDraw::FrameView() {
         }
         return false;
     }
-    if (follow) {
+    if (rect_base) {
+        // cx / cy / ppw: the bound view rect's fit, set above.
+    } else if (follow) {
         ppw = static_cast<float>(rw) / widget.follow_window;
         if (!have_player && !have_cached_follow) {
             // A picture map with no position yet: its centre, at the follow zoom.
@@ -461,7 +616,7 @@ bool GeometryMapDraw::FrameView() {
     // convention the gesture code uses for pictures -- so a drag moves the rooms
     // with the finger and a pinch zooms about the point between the fingers.
     if (widget.pan_zoom) {
-        const float z = std::clamp(view.zoom, widget.min_zoom, widget.max_zoom);
+        const float z = std::clamp(view.zoom, std::min(zoom_min, widget.max_zoom), widget.max_zoom);
         const float halfw = static_cast<float>(rw) * 0.5f;
         const float halfh = static_cast<float>(rh) * 0.5f;
         cx += (view.pan_x + halfw / z - halfw) / ppw;
@@ -510,6 +665,12 @@ bool GeometryMapDraw::FrameView() {
     }
     cxpix = static_cast<float>(x) + static_cast<float>(rw) * 0.5f;
     cypix = static_cast<float>(y) + static_cast<float>(rh) * 0.5f;
+    turn = MapViewTurnDegrees(widget, snapshot);
+    if (turn != 0.0f) {
+        const double rad = static_cast<double>(turn) * 3.14159265358979323846 / 180.0;
+        turn_c = static_cast<float>(std::cos(rad));
+        turn_s = static_cast<float>(std::sin(rad));
+    }
     return true;
 }
 
@@ -521,8 +682,240 @@ float GeometryMapDraw::to_y(float wy) const { // world Y is up; screen down
     return cypix - (wy - cy) * ppw;
 }
 
+std::array<float, 2> GeometryMapDraw::pt(float wx, float wy) const {
+    const float dx = (wx - cx) * ppw;
+    const float dy = -(wy - cy) * ppw;
+    if (turn == 0.0f) {
+        return {cxpix + dx, cypix + dy};
+    }
+    // Clockwise on the y-down canvas.
+    return {cxpix + dx * turn_c - dy * turn_s, cypix + dx * turn_s + dy * turn_c};
+}
+
+void GeometryMapDraw::blit_turned(const Image& img, float qx, float qy, float qw, float qh, s32 sx,
+                                  s32 sy, s32 sw, s32 sh, u32 tint) {
+    if (!img.Valid() || !(qw > 0.0f) || !(qh > 0.0f) || sw <= 0 || sh <= 0 || (tint >> 24) == 0) {
+        return;
+    }
+    // A small fully transparent picture (a placeholder base such as a 1x1 clear PNG) would only
+    // cost a pass over the whole widget.
+    if (img.pixels.size() <= 4096 &&
+        std::ranges::all_of(img.pixels, [](u32 p) { return (p >> 24) == 0; })) {
+        return;
+    }
+    // Shared edges round alike, so neighbouring tiles still abut after the turn.
+    const s32 ix = static_cast<s32>(std::lround(qx));
+    const s32 iy = static_cast<s32>(std::lround(qy));
+    const s32 iw = static_cast<s32>(std::lround(qx + qw)) - ix;
+    const s32 ih = static_cast<s32>(std::lround(qy + qh)) - iy;
+    if (iw <= 0 || ih <= 0) {
+        return;
+    }
+    const auto clip = canvas.Clip();
+    const s32 l = std::max(x, clip[0]), t = std::max(y, clip[1]);
+    const s32 r = std::min(x + rw, clip[0] + clip[2]), b = std::min(y + rh, clip[1] + clip[3]);
+    if (r <= l || b <= t) {
+        return;
+    }
+    canvas.SetClip(l, t, r - l, b - t);
+    canvas.DrawImageTurned(ix, iy, iw, ih, img, sx, sy, sw, sh, tint, turn,
+                           cxpix - static_cast<float>(ix), cypix - static_cast<float>(iy));
+    canvas.SetClip(clip[0], clip[1], clip[2], clip[3]);
+}
+
 bool GeometryMapDraw::visible(float px, float py) const {
     return px >= x && px < x + rw && py >= y && py < y + rh;
+}
+
+void GeometryMapDraw::blit_clipped(const Image& img, float qx, float qy, float qw, float qh,
+                                   u32 tint) {
+    if (!img.Valid() || qw <= 0.0f || qh <= 0.0f) {
+        return;
+    }
+    const float l = std::max(qx, static_cast<float>(x));
+    const float t = std::max(qy, static_cast<float>(y));
+    const float r = std::min(qx + qw, static_cast<float>(x + rw));
+    const float b = std::min(qy + qh, static_cast<float>(y + rh));
+    if (r <= l || b <= t) {
+        return;
+    }
+    const s32 dl = static_cast<s32>(std::lround(l)), dt = static_cast<s32>(std::lround(t));
+    const s32 dw = static_cast<s32>(std::lround(r)) - dl,
+              dh = static_cast<s32>(std::lround(b)) - dt;
+    if (dw <= 0 || dh <= 0) {
+        return;
+    }
+    const float fw = static_cast<float>(img.w), fh = static_cast<float>(img.h);
+    const float u0 = (l - qx) / qw, v0 = (t - qy) / qh;
+    const float u1 = (r - qx) / qw, v1 = (b - qy) / qh;
+    canvas.DrawImageRegion(dl, dt, dw, dh, img, static_cast<s32>(u0 * fw),
+                           static_cast<s32>(v0 * fh),
+                           std::max(1, static_cast<s32>(std::lround((u1 - u0) * fw))),
+                           std::max(1, static_cast<s32>(std::lround((v1 - v0) * fh))), tint);
+}
+
+void GeometryMapDraw::blit_masked(const Image& img, const Image& mask, float qx, float qy,
+                                  float qw, float qh, u32 alpha) {
+    if (!img.Valid() || !mask.Valid() || !(qw > 0.0f) || !(qh > 0.0f) || alpha == 0) {
+        return;
+    }
+    const auto clip = canvas.Clip();
+    const float l = std::max({qx, static_cast<float>(x), static_cast<float>(clip[0])});
+    const float t = std::max({qy, static_cast<float>(y), static_cast<float>(clip[1])});
+    const float r = std::min({qx + qw, static_cast<float>(x + rw),
+                              static_cast<float>(clip[0] + clip[2])});
+    const float b = std::min({qy + qh, static_cast<float>(y + rh),
+                              static_cast<float>(clip[1] + clip[3])});
+    const s32 dl = static_cast<s32>(std::lround(l)), dt = static_cast<s32>(std::lround(t));
+    const s32 dw = static_cast<s32>(std::lround(r)) - dl,
+              dh = static_cast<s32>(std::lround(b)) - dt;
+    if (r <= l || b <= t || dw <= 0 || dh <= 0) {
+        return;
+    }
+    // Composed at screen resolution for the visible part only: memory stays bounded by the
+    // widget whatever the picture and mask sizes are.
+    Image out;
+    out.w = static_cast<u32>(dw);
+    out.h = static_cast<u32>(dh);
+    out.pixels.resize(size_t{out.w} * out.h);
+    const float mw = static_cast<float>(mask.w), mh = static_cast<float>(mask.h);
+    const s32 mx_max = static_cast<s32>(mask.w) - 1, my_max = static_cast<s32>(mask.h) - 1;
+    for (s32 j = 0; j < dh; ++j) {
+        const float v = (static_cast<float>(dt + j) + 0.5f - qy) / qh;
+        const u32 sy = std::min(img.h - 1, static_cast<u32>(std::max(0.0f, v * img.h)));
+        const float my = std::clamp(v * mh - 0.5f, 0.0f, static_cast<float>(my_max));
+        const s32 my0 = static_cast<s32>(my);
+        const s32 my1 = std::min(my0 + 1, my_max);
+        const float fy = my - static_cast<float>(my0);
+        const u32* const row = img.pixels.data() + size_t{sy} * img.w;
+        const u32* const m0 = mask.pixels.data() + size_t(my0) * mask.w;
+        const u32* const m1 = mask.pixels.data() + size_t(my1) * mask.w;
+        u32* const dst = out.pixels.data() + size_t(j) * out.w;
+        for (s32 i = 0; i < dw; ++i) {
+            const float u = (static_cast<float>(dl + i) + 0.5f - qx) / qw;
+            const u32 sx = std::min(img.w - 1, static_cast<u32>(std::max(0.0f, u * img.w)));
+            const float mx = std::clamp(u * mw - 0.5f, 0.0f, static_cast<float>(mx_max));
+            const s32 mx0 = static_cast<s32>(mx);
+            const s32 mx1 = std::min(mx0 + 1, mx_max);
+            const float fx = mx - static_cast<float>(mx0);
+            const float top = static_cast<float>(m0[mx0] >> 24) * (1.0f - fx) +
+                              static_cast<float>(m0[mx1] >> 24) * fx;
+            const float bottom = static_cast<float>(m1[mx0] >> 24) * (1.0f - fx) +
+                                 static_cast<float>(m1[mx1] >> 24) * fx;
+            const float m = top + (bottom - top) * fy; // 0..255
+            const u32 p = row[sx];
+            const u32 a = static_cast<u32>(
+                std::lround(static_cast<float>(p >> 24) * m * static_cast<float>(alpha) /
+                            (255.0f * 255.0f)));
+            dst[i] = (std::min<u32>(a, 255) << 24) | (p & 0x00FFFFFFu);
+        }
+    }
+    canvas.DrawImageRegion(dl, dt, dw, dh, out, 0, 0, dw, dh, 0xFFFFFFFFu);
+}
+
+void GeometryMapDraw::fill_clipped(float l, float t, float w, float h, u32 argb) {
+    const s32 x0 = std::max(x, static_cast<s32>(std::lround(l)));
+    const s32 y0 = std::max(y, static_cast<s32>(std::lround(t)));
+    const s32 x1 = std::min(x + rw, static_cast<s32>(std::lround(l + w)));
+    const s32 y1 = std::min(y + rh, static_cast<s32>(std::lround(t + h)));
+    if (x1 > x0 && y1 > y0) {
+        canvas.FillRect(x0, y0, x1 - x0, y1 - y0, argb);
+    }
+}
+
+// Missing/nonfinite headings preserve the classic unrotated marker. Runtime 22: a heading is a
+// map-frame angle, so on a turned view it turns with the map (a marker without a heading bind
+// stays upright like every other marker).
+static float MarkerDegrees(const Widget& widget, const StateSnapshot& snapshot) {
+    if (!widget.map_extras || widget.map_extras->marker_rotate_bind.empty())
+        return 0.0f;
+    const auto& key = widget.map_extras->marker_rotate_bind;
+    const auto f = snapshot.floats.find(key);
+    const float degrees = f != snapshot.floats.end() ? static_cast<float>(f->second)
+                                                     : static_cast<float>(snapshot.GetInt(key));
+    const float heading = std::isfinite(degrees) ? std::fmod(degrees, 360.0f) : 0.0f;
+    return std::fmod(heading + MapViewTurnDegrees(widget, snapshot), 360.0f);
+}
+
+// Runtime 14: map "overlays" -- pictures placed in world space over the base picture and under
+// the markers (into the canvas, which the GPU path composites over the map quad), panning and
+// zooming with the map. An image still loading draws nothing yet.
+void GeometryMapDraw::DrawOverlays() {
+    if (map_extras == nullptr || !images) {
+        return;
+    }
+    for (const auto& ov : map_extras->overlays) {
+        if (!ov.show.Empty() && !GateOpen(ov.show, snapshot)) {
+            continue;
+        }
+        const std::string* key = &ov.src;
+        if (!ov.src_bind.empty()) {
+            if (const auto t = snapshot.texts.find(ov.src_bind);
+                t != snapshot.texts.end() && !t->second.empty()) {
+                key = &t->second;
+            }
+        }
+        if (key->empty() || ov.opacity <= 0.0f) {
+            continue;
+        }
+        const float l = to_x(std::min(ov.x0, ov.x1));
+        const float r = to_x(std::max(ov.x0, ov.x1));
+        const float t = to_y(std::max(ov.y0, ov.y1));
+        const float b = to_y(std::min(ov.y0, ov.y1));
+        // Tiled native maps can contain hundreds of pictures. Request only the
+        // visible ones, so a close follow view does not decode the whole world.
+        // A turned view (runtime 22) tests the turned corners' bounding box.
+        float bl = l, bt = t, br = r, bb = b;
+        if (turn != 0.0f) {
+            bl = bt = 3.4e38f;
+            br = bb = -3.4e38f;
+            for (const auto& c : {pt(ov.x0, ov.y0), pt(ov.x0, ov.y1), pt(ov.x1, ov.y0),
+                                  pt(ov.x1, ov.y1)}) {
+                bl = std::min(bl, c[0]);
+                br = std::max(br, c[0]);
+                bt = std::min(bt, c[1]);
+                bb = std::max(bb, c[1]);
+            }
+        }
+        if (br <= x || bb <= y || bl >= x + rw || bt >= y + rh) {
+            continue;
+        }
+        std::shared_ptr<const Image> pic;
+        if (!ov.src_detail_bind.empty() && std::max(r - l, b - t) > ov.detail_threshold) {
+            const auto detail = snapshot.texts.find(ov.src_detail_bind);
+            if (detail != snapshot.texts.end() && !detail->second.empty()) {
+                pic = images(detail->second);
+                if (pic && !pic->Valid())
+                    pic.reset();
+            }
+        }
+        if (!pic)
+            pic = images(*key); // keep the overview while detail loads
+        add_content(pic.get());
+        if (pic == nullptr || !pic->Valid()) {
+            continue;
+        }
+        const u32 a = static_cast<u32>(std::lround(ov.opacity * 255.0f));
+        // Runtime 24: a bound alpha mask. A named mask that is not loaded yet draws nothing (the
+        // overlay is never shown unmasked by accident); an empty point means no mask.
+        if (!ov.mask_bind.empty()) {
+            const auto m = snapshot.texts.find(ov.mask_bind);
+            if (m != snapshot.texts.end() && !m->second.empty()) {
+                const auto mask = images(m->second);
+                add_content(mask.get());
+                if (turn == 0.0f && mask != nullptr && mask->Valid()) {
+                    blit_masked(*pic, *mask, l, t, r - l, b - t, a);
+                }
+                continue;
+            }
+        }
+        if (turn != 0.0f) {
+            blit_turned(*pic, l, t, r - l, b - t, 0, 0, static_cast<s32>(pic->w),
+                        static_cast<s32>(pic->h), (a << 24) | 0x00FFFFFFu);
+            continue;
+        }
+        blit_clipped(*pic, l, t, r - l, b - t, (a << 24) | 0x00FFFFFFu);
+    }
 }
 
 bool GeometryMapDraw::DrawBaseLayer() {
@@ -532,7 +925,7 @@ bool GeometryMapDraw::DrawBaseLayer() {
     // A prerendered underlay ignores the cap and draws at its native size (a 2048x2048
     // game map stays 2048x2048); the same cache entry serves the blit below.
     if (image_mode) {
-        const std::shared_ptr<const Image> underlay = images ? images(geo->second.image) : nullptr;
+        const std::shared_ptr<const Image> underlay = images ? images(base_image) : nullptr;
         if (underlay == nullptr || underlay->w == 0 || underlay->h == 0) {
             return false;
         }
@@ -552,8 +945,7 @@ bool GeometryMapDraw::DrawBaseLayer() {
             iw = std::max(16, static_cast<s32>(lf * span_x / span_y));
         }
     }
-    const std::string key =
-        image_mode ? geo->second.image : fmt::format("map:{}@{}x{}", area, iw, ih);
+    const std::string key = image_mode ? base_image : std::format("map:{}@{}x{}", area, iw, ih);
     // The whole area's on-screen rectangle; the visible slice of the (possibly huge,
     // when zoomed) image is what gets blitted, and door boxes snap to its raster grid.
     img_l = to_x(min_x);
@@ -563,8 +955,10 @@ bool GeometryMapDraw::DrawBaseLayer() {
     // The GPU compositor builds/caches its map endpoints in PublishGpuComposite.
     // Calling the ordinary image provider here would still build the animated CPU
     // map before taking the GPU branch, defeating the purpose of the fade texture.
-    const std::shared_ptr<const Image> drawn =
-        draw_list == nullptr && images ? images(key) : nullptr;
+    // Runtime 22: a turned view always draws its base on the CPU (a GPU map quad is axis-aligned).
+    AuxDrawList* const gpu = turn == 0.0f ? draw_list : nullptr;
+    const std::shared_ptr<const Image> drawn = gpu == nullptr && images ? images(key) : nullptr;
+    add_content(drawn.get());
     // A composite with extra levels is one packed picture: sample the level nearest the
     // on-screen scale (the smallest one still >= 0.8 source px per screen px).
     CompositeLevel level{0, 0, 0, 0, 1.0f};
@@ -599,6 +993,10 @@ bool GeometryMapDraw::DrawBaseLayer() {
         level = {0, 0, static_cast<u32>(iw), static_cast<u32>(ih), 1.0f};
         packed_w = static_cast<u32>(iw);
         packed_h = static_cast<u32>(ih);
+    }
+    if (turn != 0.0f) {
+        DrawTurnedBase(key, drawn, level, composite_name);
+        return true;
     }
     if (draw_list != nullptr || (drawn != nullptr && drawn->Valid())) {
         const float vl = std::max(static_cast<float>(x), img_l);
@@ -644,6 +1042,7 @@ bool GeometryMapDraw::DrawBaseLayer() {
                     if (const auto f = snapshot.ints.find("@fade:" + composite_name);
                         f != snapshot.ints.end() && f->second < 1000) {
                         const std::shared_ptr<const Image> prev = images(key + "#prev");
+                        add_content(prev.get());
                         if (prev != nullptr && prev->w == drawn->w && prev->h == drawn->h) {
                             canvas.DrawImageRegion(static_cast<s32>(vl), static_cast<s32>(vt),
                                                    static_cast<s32>(vr - vl),
@@ -669,6 +1068,7 @@ bool GeometryMapDraw::DrawBaseLayer() {
                 const std::shared_ptr<const Image> pulse =
                     draw_list == nullptr && images ? images(pulse_key) : nullptr;
                 if (draw_list != nullptr || (pulse != nullptr && pulse->Valid())) {
+                    uses_clock = true; // BlinkAlpha(snapshot.tick) below
                     // Period and peak come from the package (map.style.marker_pulse_period
                     // / _peak, default 90 ticks and 0.7); see MapStyle.
                     const float pa =
@@ -703,6 +1103,49 @@ bool GeometryMapDraw::DrawBaseLayer() {
     return true;
 }
 
+void GeometryMapDraw::DrawTurnedBase(const std::string& key,
+                                     const std::shared_ptr<const Image>& drawn,
+                                     const CompositeLevel& level,
+                                     const std::string& composite_name) {
+    if (draw_list != nullptr) {
+        // The canvas is composited over the (solid background) quads: clear what earlier widgets
+        // painted here, as the GPU base does, then paint the turned base into the canvas.
+        draw_list->active = true;
+        canvas.ClearRect(x, y, rw, rh);
+    }
+    if (drawn == nullptr || !drawn->Valid() || !(dest_w > 0.0f) || !(dest_h > 0.0f)) {
+        return;
+    }
+    const s32 lx = static_cast<s32>(level.x), ly = static_cast<s32>(level.y);
+    const s32 lw = static_cast<s32>(level.w), lh = static_cast<s32>(level.h);
+    u32 tint = 0xFFFFFFFFu;
+    if (!composite_name.empty()) {
+        if (const auto f = snapshot.ints.find("@fade:" + composite_name);
+            f != snapshot.ints.end() && f->second < 1000) {
+            const std::shared_ptr<const Image> prev = images(key + "#prev");
+            add_content(prev.get());
+            if (prev != nullptr && prev->w == drawn->w && prev->h == drawn->h) {
+                blit_turned(*prev, img_l, img_t, dest_w, dest_h, lx, ly, lw, lh, 0xFFFFFFFFu);
+                const u32 a = static_cast<u32>(std::clamp<s64>(f->second, 0, 1000) * 255 / 1000);
+                tint = (a << 24) | 0x00FFFFFFu;
+            }
+        }
+    }
+    blit_turned(*drawn, img_l, img_t, dest_w, dest_h, lx, ly, lw, lh, tint);
+    if (!image_mode && key.size() > 4) {
+        const std::shared_ptr<const Image> pulse = images ? images("pulse:" + key.substr(4)) : nullptr;
+        if (pulse != nullptr && pulse->Valid()) {
+            uses_clock = true;
+            const float pa =
+                BlinkAlpha(snapshot.tick, manifest.map_style.marker_pulse_period, 0.0f) *
+                manifest.map_style.marker_pulse_peak;
+            const u32 a = static_cast<u32>(std::clamp(pa, 0.0f, 1.0f) * 255.0f);
+            blit_turned(*pulse, img_l, img_t, dest_w, dest_h, 0, 0, static_cast<s32>(pulse->w),
+                        static_cast<s32>(pulse->h), (a << 24) | 0x00FFFFFFu);
+        }
+    }
+}
+
 // Map groups (the page's visibility options): a gated group is not drawn and its
 // markers cannot be tapped; its opacity multiplies the member's own.
 bool GeometryMapDraw::group_visible(const std::string& group, float& alpha) const {
@@ -720,7 +1163,9 @@ bool GeometryMapDraw::group_visible(const std::string& group, float& alpha) cons
         // Live view zoom (1 = the default window): names that would overlap at
         // the whole-island view wait for a pinch.
         const float zoom =
-            widget.pan_zoom ? std::clamp(view.zoom, widget.min_zoom, widget.max_zoom) : 1.0f;
+            widget.pan_zoom
+                ? std::clamp(view.zoom, std::min(zoom_min, widget.max_zoom), widget.max_zoom)
+                : 1.0f;
         if (zoom + 1e-4f < g->second.min_zoom) {
             return false;
         }
@@ -764,6 +1209,10 @@ void GeometryMapDraw::BeginRecord() {
         r.min_y = min_y;
         r.max_x = max_x;
         r.max_y = max_y;
+        r.rotation = turn;
+        r.view_key =
+            widget.id.empty() ? page.id + "#" + std::to_string(widget_index) : widget.id;
+        r.render_serial = CurrentRenderSerial();
         record = &r;
     }
 }
@@ -777,7 +1226,24 @@ void GeometryMapDraw::draw_labels() {
     }
     const MapWidgetExtras::LabelStyle style =
         map_extras != nullptr ? map_extras->label_style : MapWidgetExtras::LabelStyle{};
+    std::vector<const MapLabel*> labels;
+    labels.reserve(geo->second.labels.size());
     for (const auto& label : geo->second.labels) {
+        labels.push_back(&label);
+    }
+    if (style.avoid_overlap && map_extras != nullptr) {
+        const auto priority = [&](const MapLabel* label) {
+            const auto group = map_extras->groups.find(label->group);
+            return group != map_extras->groups.end() ? group->second.min_zoom : 0.0f;
+        };
+        // Stable ties retain manifest order; fine-grained names win over broad region names.
+        std::stable_sort(labels.begin(), labels.end(), [&](const auto* a, const auto* b) {
+            return priority(a) > priority(b);
+        });
+    }
+    std::vector<std::array<s32, 4>> occupied;
+    for (const auto* candidate : labels) {
+        const auto& label = *candidate;
         if ((!label.show.Empty() && !GateOpen(label.show, snapshot)) ||
             (!label.hide.Empty() && GateOpen(label.hide, snapshot))) {
             continue;
@@ -805,8 +1271,9 @@ void GeometryMapDraw::draw_labels() {
         if (bmp == nullptr || !bmp->image.Valid()) {
             continue;
         }
-        const s32 qx = static_cast<s32>(std::lround(to_x(label.x))) - bmp->ox - bmp->text_w / 2;
-        const s32 qy = static_cast<s32>(std::lround(to_y(label.y))) - bmp->oy - (scale * 5) / 2;
+        const auto at = pt(label.x, label.y); // runtime 22: placed through the turn, upright
+        const s32 qx = static_cast<s32>(std::lround(at[0])) - bmp->ox - bmp->text_w / 2;
+        const s32 qy = static_cast<s32>(std::lround(at[1])) - bmp->oy - (scale * 5) / 2;
         const s32 bw = static_cast<s32>(bmp->image.w);
         const s32 bh = static_cast<s32>(bmp->image.h);
         const s32 l = std::max(qx, x), t = std::max(qy, y);
@@ -815,6 +1282,29 @@ void GeometryMapDraw::draw_labels() {
             continue;
         }
         const u32 a = static_cast<u32>(std::lround(std::clamp(alpha, 0.0f, 1.0f) * 255.0f));
+        if (style.avoid_overlap) {
+            bool visible_ink = false;
+            if (a != 0) {
+                for (s32 row = t - qy; row < b - qy && !visible_ink; ++row) {
+                    const auto first = bmp->image.pixels.begin() + row * bw + l - qx;
+                    visible_ink = std::any_of(first, first + r - l,
+                                              [](u32 pixel) { return (pixel >> 24) != 0; });
+                }
+            }
+            if (!visible_ink) {
+                continue;
+            }
+            // Reserve only the visible clipped bitmap. Hidden, empty and offscreen labels
+            // never reach this point, so they cannot suppress a visible neighbour.
+            constexpr s32 gap = 4;
+            if (std::any_of(occupied.begin(), occupied.end(), [&](const auto& box) {
+                    return l < box[2] + gap && r + gap > box[0] &&
+                           t < box[3] + gap && b + gap > box[1];
+                })) {
+                continue;
+            }
+            occupied.push_back({l, t, r, b});
+        }
         canvas.DrawImageRegion(l, t, r - l, b - t, bmp->image, l - qx, t - qy, r - l, b - t,
                                (a << 24) | 0x00FFFFFFu);
     }
@@ -834,7 +1324,8 @@ void GeometryMapDraw::DrawAtlasLayer() {
     DoorIconSize = manifest.map_style.door_icon;
     // Uncollected items blink white-ish on the game's minimap (a scalar ping-pong,
     // ~1 Hz); the same pulse dims their icon here.
-    item_blink = BlinkAlpha(snapshot.tick, 72, 0.45f);
+    item_blink = BlinkAlpha(snapshot.tick, std::max<u32>(2, manifest.map_style.item_blink_period),
+                            manifest.map_style.item_blink_low);
     // The markers' live flags (hidden / opened / collected / unveiled / veiled) are read
     // straight off the Manifest, not through the snapshot, while
     // ModRuntime::UpdateHiddenMarkers writes them holding map_state_mutex for its whole body.
@@ -880,7 +1371,9 @@ void GeometryMapDraw::emit_atlas_tinted(float ux, float uy, float uw, float uh, 
     const float cuy = uy + uh * (t - qy) / qh;
     const float cuw = uw * (r - l) / qw;
     const float cuh = uh * (b - t) / qh;
-    if (draw_list != nullptr && !to_canvas) {
+    // A turned view paints its base into the HUD canvas, which the compositor draws last; a
+    // slot-1 quad would end up underneath it, so glyphs go into the canvas too when turned.
+    if (draw_list != nullptr && !to_canvas && turn == 0.0f) {
         draw_list->quads.push_back({1u, cux / aw, cuy / ah, (cux + cuw) / aw, (cuy + cuh) / ah, l,
                                     t, r - l, b - t, alpha, cr, cg, cb});
     } else {
@@ -923,21 +1416,26 @@ void GeometryMapDraw::DrawAreaMarkers() {
         }
         // An opened door shows an "opened" atlas cell, and a collected item shows its
         // "acquired" glyph and stops pulsing. The package names those cells (marker
-        // .open_icon / .collected_icon); left unset, each falls back to the Door-prefix /
-        // suffix and "<icon>Adquired" naming (Dread's own minimap atlas has the halves
+        // .open_icon / .collected_icon); left unset, each falls back to map.style's door /
+        // collected naming, whose defaults are Dread's own minimap atlas (the halves
         // DoorOpenedL/R, DoorEmmyOpen, DoorThermalOpen and DoorThermalTrapOpen for exactly
         // that state, which <actor>:DOOR:Opened reports -- written by the door component,
         // main+0x8DA688 -- so a Dread package need not declare them).
+        const MapStyle& style = manifest.map_style;
+        const bool is_door =
+            !style.door_prefix.empty() && marker.icon.starts_with(style.door_prefix);
         std::string shown = marker.icon;
         if (marker.opened) {
             std::string open_name = marker.open_icon;
-            if (open_name.empty() && marker.icon.starts_with("Door")) {
-                if (marker.icon.ends_with("Closed")) {
-                    open_name = marker.icon.substr(0, marker.icon.size() - 6) + "Open";
+            if (open_name.empty() && is_door) {
+                if (!style.door_closed_suffix.empty() &&
+                    marker.icon.ends_with(style.door_closed_suffix)) {
+                    const size_t base = marker.icon.size() - style.door_closed_suffix.size();
+                    open_name = marker.icon.substr(0, base) + style.door_open_suffix;
                 } else if (marker.icon.ends_with("L")) {
-                    open_name = "DoorOpenedL";
+                    open_name = style.door_opened_left;
                 } else if (marker.icon.ends_with("R")) {
-                    open_name = "DoorOpenedR";
+                    open_name = style.door_opened_right;
                 }
             }
             if (!open_name.empty() && manifest.icon_cells.contains(open_name)) {
@@ -945,12 +1443,13 @@ void GeometryMapDraw::DrawAreaMarkers() {
             }
         }
         if (marker.collected) {
-            const std::string want =
-                !marker.collected_icon.empty() ? marker.collected_icon : marker.icon + "Adquired";
+            const std::string want = !marker.collected_icon.empty()
+                                         ? marker.collected_icon
+                                         : marker.icon + style.collected_suffix;
             if (manifest.icon_cells.contains(want)) {
                 shown = want;
-            } else if (manifest.icon_cells.contains("ItemAdquired")) {
-                shown = "ItemAdquired";
+            } else if (manifest.icon_cells.contains(style.collected_fallback)) {
+                shown = style.collected_fallback;
             }
         }
         const auto cell = manifest.icon_cells.find(shown);
@@ -961,21 +1460,23 @@ void GeometryMapDraw::DrawAreaMarkers() {
         // Fog of war: an icon stays hidden until its cell is revealed, so items and
         // doors appear as the map does rather than all at once. Image-mode areas
         // have no grid, so their markers are always visible. A "collectible" icon
-        // (marker.collectible, default kind == "Items") also waits for the
+        // (marker.collectible, default kind == map.style collectible_kind) also waits for the
         // game to unveil it (seen, or its hiding block found); until then its room
         // pulses instead, as on the minimap.
         if (!image_mode && is_visited && !is_visited(area, marker.x, marker.y)) {
             continue;
         }
-        const bool collectible = marker.collectible.value_or(marker.kind == "Items");
+        const bool collectible = marker.collectible.value_or(marker.kind == style.collectible_kind);
         if (collectible && marker.veiled && !marker.collected) {
             continue; // hidden in a block the player has not found: no icon
         }
-        const float mx = to_x(marker.x);
-        const float my = to_y(marker.y);
-        const bool is_door = marker.icon.rfind("Door", 0) == 0;
-        const bool structural =
-            marker.structural.value_or(is_door || marker.icon.rfind("Blockage", 0) == 0);
+        const auto at = pt(marker.x, marker.y);
+        const float mx = at[0];
+        const float my = at[1];
+        const bool structural = marker.structural.value_or(
+            is_door || std::ranges::any_of(style.structural_prefixes, [&](const std::string& p) {
+                return !p.empty() && marker.icon.starts_with(p);
+            }));
         const s32 sz = structural ? DoorIconSize : marker.size > 0 ? marker.size : ItemIconSize;
         if (!marker.has_box && !visible(mx, my)) {
             continue;
@@ -1003,6 +1504,18 @@ void GeometryMapDraw::DrawAreaMarkers() {
             qy = img_t + static_cast<float>(r0) / static_cast<float>(ih) * dest_h;
             qw = std::max(static_cast<float>(c1 - c0 + 1) / static_cast<float>(iw) * dest_w, 4.0f);
             qh = std::max(static_cast<float>(r1 - r0 + 1) / static_cast<float>(ih) * dest_h, 4.0f);
+            if (turn != 0.0f) {
+                // Runtime 22: the box's centre goes through the turn; the glyph stays upright,
+                // spanning the box across the nearer screen axes.
+                const float ccx = qx + qw * 0.5f - cxpix, ccy = qy + qh * 0.5f - cypix;
+                const float tx = cxpix + ccx * turn_c - ccy * turn_s;
+                const float ty = cypix + ccx * turn_s + ccy * turn_c;
+                if (std::fabs(turn_s) > std::fabs(turn_c)) {
+                    std::swap(qw, qh);
+                }
+                qx = tx - qw * 0.5f;
+                qy = ty - qh * 0.5f;
+            }
         } else {
             // Point icon (item/station) or a boxless door: fixed pixel square. A
             // door's L "[" and R "]" halves share a world position, so nudge them a
@@ -1037,6 +1550,9 @@ void GeometryMapDraw::DrawAreaMarkers() {
             }
         }
         const float alpha = collectible && !marker.collected ? item_blink : 1.0f;
+        if (collectible && !marker.collected) {
+            uses_clock = true;
+        }
         emit_atlas(ux, uy, uw, uh, qx, qy, qw, qh, alpha * marker_alpha);
     }
 }
@@ -1051,6 +1567,8 @@ void GeometryMapDraw::emit_pin(float ux, float uy, float uw, float uh, float qx,
 }
 
 void GeometryMapDraw::DrawDynamicMarkers() {
+    // The animated markers' clock: the tick runs at 60 Hz.
+    const u64 clock_ms = snapshot.tick * 1000 / 60;
     for (const auto& dm : geo->second.dynamic_markers) {
         if ((!dm.show.Empty() && !GateOpen(dm.show, snapshot)) ||
             (!dm.hide.Empty() && GateOpen(dm.hide, snapshot))) {
@@ -1060,6 +1578,22 @@ void GeometryMapDraw::DrawDynamicMarkers() {
         if (!group_visible(dm.group, dm_alpha) || dm_alpha <= 0.0f) {
             continue;
         }
+        // Time-animated def: this tick's frame picture (shared by every slot) and pulse.
+        std::shared_ptr<const Image> frame_pic;
+        if (!dm.frames.empty()) {
+            const auto& key = dm.frames[MarkerFrameAt(dm.frames.size(), dm.frame_ms, clock_ms)];
+            frame_pic = images ? images(key) : nullptr;
+            add_content(frame_pic.get());
+            if (frame_pic && !frame_pic->Valid()) {
+                frame_pic.reset();
+            }
+        }
+        const auto pulse = MarkerPulseAt(dm.pulse, clock_ms);
+        dm_alpha *= std::clamp(pulse[0], 0.0f, 1.0f);
+        if (dm_alpha <= 0.0f) {
+            continue;
+        }
+        const float pulse_size = std::max(0.0f, pulse[1]);
         const s64 selected = snapshot.GetInt("@map_sel:" + dm.group, -1);
         const s32 base_sz = dm.size > 0 ? dm.size : ItemIconSize;
         const s32 sel_sz = dm.selected_size > 0 ? dm.selected_size : base_sz;
@@ -1070,9 +1604,85 @@ void GeometryMapDraw::DrawDynamicMarkers() {
             }
             return out;
         };
+        // Runtime 14: a slot's look beyond its icon.
+        struct Look {
+            bool dim{false};
+            u32 tint{0};  ///< 0 = none
+            u32 frame{0}; ///< 0 = none
+            std::optional<float> bar;
+        };
         struct Deferred {
             float qx, qy, sz;
             std::pair<s32, s32> cell;
+            std::shared_ptr<const Image> pic;
+            Look look;
+        };
+        const bool have_atlas = atlas != nullptr && manifest.icon_cell > 0 && cp > 0.0f;
+        const auto slot_int = [&](const std::string& pattern, s64 i) -> std::optional<s64> {
+            if (pattern.empty()) {
+                return std::nullopt;
+            }
+            const auto v = SnapshotNumber(snapshot, slot_key(pattern, i));
+            return v ? std::optional<s64>{static_cast<s64>(*v)} : std::nullopt;
+        };
+        const auto look_of = [&](s64 i) {
+            Look look;
+            if (const auto d = slot_int(dm.dim_bind, i)) {
+                look.dim = *d != 0;
+            }
+            look.tint = static_cast<u32>(slot_int(dm.tint_bind, i).value_or(0));
+            look.frame = static_cast<u32>(slot_int(dm.frame_color_bind, i).value_or(0));
+            if (const auto v = slot_int(dm.bar_bind, i)) {
+                const s64 mx =
+                    dm.bar_max_bind.empty() ? dm.bar_max : slot_int(dm.bar_max_bind, i).value_or(0);
+                if (mx > 0) {
+                    look.bar =
+                        std::clamp(static_cast<float>(*v) / static_cast<float>(mx), 0.0f, 1.0f);
+                }
+            }
+            return look;
+        };
+        // One slot: the bar beneath the icon, the icon (picture or atlas cell) tinted / dimmed,
+        // then its frame.
+        const auto draw_slot = [&](float qx, float qy, float sz, const std::pair<s32, s32>* cell,
+                                   const Image* pic, const Look& look) {
+            float cr = 1.0f, cg = 1.0f, cb = 1.0f, ca = dm_alpha;
+            if (look.tint != 0) {
+                cr = static_cast<float>((look.tint >> 16) & 0xFF) / 255.0f;
+                cg = static_cast<float>((look.tint >> 8) & 0xFF) / 255.0f;
+                cb = static_cast<float>(look.tint & 0xFF) / 255.0f;
+                ca *= static_cast<float>(look.tint >> 24) / 255.0f;
+            }
+            if (look.dim) {
+                cr *= 0.45f;
+                cg *= 0.45f;
+                cb *= 0.45f;
+            }
+            if (look.bar.has_value()) {
+                const float bh = dm.bar_h > 0 ? static_cast<float>(dm.bar_h)
+                                              : std::max(3.0f, std::round(sz / 8.0f));
+                fill_clipped(qx, qy + sz + 1.0f, sz, bh, dm.bar_bg);
+                fill_clipped(qx, qy + sz + 1.0f, std::round(sz * *look.bar), bh, dm.bar_color);
+            }
+            if (pic != nullptr) {
+                const auto ch = [](float v) {
+                    return static_cast<u32>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+                };
+                blit_clipped(*pic, qx, qy, sz, sz,
+                             (ch(ca) << 24) | (ch(cr) << 16) | (ch(cg) << 8) | ch(cb));
+            } else if (cell != nullptr) {
+                float ux, uy;
+                cell_uv(*cell, ux, uy);
+                emit_atlas_tinted(ux, uy, cp, cp, qx, qy, sz, sz, ca, cr, cg, cb, true);
+            }
+            if (look.frame != 0) {
+                const float f = dm.frame_px > 0 ? static_cast<float>(dm.frame_px)
+                                                : std::max(2.0f, std::round(sz / 16.0f));
+                fill_clipped(qx, qy, sz, f, look.frame);
+                fill_clipped(qx, qy + sz - f, sz, f, look.frame);
+                fill_clipped(qx, qy + f, f, sz - 2.0f * f, look.frame);
+                fill_clipped(qx + sz - f, qy + f, f, sz - 2.0f * f, look.frame);
+            }
         };
         std::optional<Deferred> deferred;
         // Positions: the float an f32 point publishes, not its truncated int.
@@ -1098,36 +1708,59 @@ void GeometryMapDraw::DrawDynamicMarkers() {
                 const auto mapped = dm.icon_by_kind.find(kv->second);
                 icon = mapped != dm.icon_by_kind.end() ? &mapped->second : &dm.icon_default;
             }
-            if (icon->empty()) {
-                continue;
+            // Runtime 14: a per-slot picture (a text point naming an image key) wins over the
+            // atlas icon; one still loading draws nothing yet.
+            std::shared_ptr<const Image> pic = frame_pic;
+            if (pic == nullptr && !dm.icon_src_bind.empty()) {
+                if (const auto t = snapshot.texts.find(slot_key(dm.icon_src_bind, i));
+                    t != snapshot.texts.end() && !t->second.empty()) {
+                    pic = images ? images(t->second) : nullptr;
+                    add_content(pic.get());
+                    if (pic == nullptr || !pic->Valid()) {
+                        continue;
+                    }
+                }
             }
-            const auto cell = manifest.icon_cells.find(*icon);
-            if (cell == manifest.icon_cells.end()) {
-                continue;
+            const std::pair<s32, s32>* cellp = nullptr;
+            if (pic == nullptr) {
+                if (icon->empty() || !have_atlas) {
+                    continue;
+                }
+                const auto cell = manifest.icon_cells.find(*icon);
+                if (cell == manifest.icon_cells.end()) {
+                    continue;
+                }
+                cellp = &cell->second;
             }
             const float wx = static_cast<float>(*vx) * dm.scale_x + dm.offset_x;
             const float wy = static_cast<float>(*vy) * dm.scale_y + dm.offset_y;
             const bool is_sel = selected == i;
-            const float sz = static_cast<float>(is_sel ? sel_sz : base_sz);
-            const float qx = to_x(wx) - dm.anchor_x * sz;
-            const float qy = to_y(wy) - dm.anchor_y * sz;
+            // A world-sized marker scales with the zoom (ppw includes it).
+            const float world_sz = dm.size_world > 0.0f
+                                       ? dm.size_world * ppw
+                                       : static_cast<float>(is_sel ? sel_sz : base_sz);
+            const float sz =
+                (dm.size_max > 0.0f ? std::min(world_sz, dm.size_max) : world_sz) * pulse_size;
+            const auto at = pt(wx, wy);
+            const float qx = at[0] - dm.anchor_x * sz;
+            const float qy = at[1] - dm.anchor_y * sz;
             const float hx = qx + sz * 0.5f, hy = qy + sz * 0.5f;
             if (record != nullptr && visible(hx, hy)) {
                 record->hits.push_back({dm.group, static_cast<s32>(i), hx, hy, wx, wy,
                                         static_cast<float>(*vx), static_cast<float>(*vy)});
             }
+            const Look look = look_of(i);
             if (is_sel) {
-                deferred = Deferred{qx, qy, sz, cell->second};
+                deferred = Deferred{qx,  qy,  sz, cellp != nullptr ? *cellp : std::pair<s32, s32>{},
+                                    pic, look};
                 continue;
             }
-            float ux, uy;
-            cell_uv(cell->second, ux, uy);
-            emit_pin(ux, uy, cp, cp, qx, qy, sz, sz, dm_alpha);
+            draw_slot(qx, qy, sz, cellp, pic.get(), look);
         }
         if (deferred) {
             const float hx = deferred->qx + deferred->sz * 0.5f;
             const float hy = deferred->qy + deferred->sz * 0.5f;
-            if (!dm.selected_icon.empty()) {
+            if (!dm.selected_icon.empty() && have_atlas) {
                 if (const auto ring = manifest.icon_cells.find(dm.selected_icon);
                     ring != manifest.icon_cells.end()) {
                     const float rs = dm.selected_icon_size > 0
@@ -1138,10 +1771,9 @@ void GeometryMapDraw::DrawDynamicMarkers() {
                     emit_pin(ux, uy, cp, cp, hx - rs * 0.5f, hy - rs * 0.5f, rs, rs, dm_alpha);
                 }
             }
-            float ux, uy;
-            cell_uv(deferred->cell, ux, uy);
-            emit_pin(ux, uy, cp, cp, deferred->qx, deferred->qy, deferred->sz, deferred->sz,
-                     dm_alpha);
+            draw_slot(deferred->qx, deferred->qy, deferred->sz,
+                      deferred->pic != nullptr ? nullptr : &deferred->cell, deferred->pic.get(),
+                      deferred->look);
         }
     }
 }
@@ -1165,12 +1797,13 @@ void GeometryMapDraw::DrawCustomMarkers() {
             LOG_INFO(Core,
                      "DSMod marker draw: world ({:.0f},{:.0f}) -> canvas "
                      "({:.0f},{:.0f}) widget [{},{} {}x{}] back={} glyph={}",
-                     cm.x, cm.y, to_x(cm.x), to_y(cm.y), x, y, rw, rh,
+                     cm.x, cm.y, pt(cm.x, cm.y)[0], pt(cm.x, cm.y)[1], x, y, rw, rh,
                      back != manifest.icon_cells.end(), glyph != manifest.icon_cells.end());
         }
     }
     for (const auto& cm : snapshot.custom_markers) {
-        const float mx = to_x(cm.x), my = to_y(cm.y);
+        const auto at = pt(cm.x, cm.y);
+        const float mx = at[0], my = at[1];
         if (!visible(mx, my)) {
             continue;
         }
@@ -1204,26 +1837,34 @@ void GeometryMapDraw::DrawLivePlayer() {
         if (report_visit && !image_mode) {
             report_visit(area, wx_player, wy_player);
         }
-        const float mx = to_x(wx_player);
-        const float my = to_y(wy_player);
+        const auto at = pt(wx_player, wy_player);
+        const float mx = at[0];
+        const float my = at[1];
         const auto cell = widget.marker_icon.empty() ? manifest.icon_cells.end()
                                                      : manifest.icon_cells.find(widget.marker_icon);
         if (cell != manifest.icon_cells.end()) {
             float ux, uy;
             cell_uv(cell->second, ux, uy);
-            emit_atlas(ux, uy, cp, cp, mx - static_cast<float>(PlayerIcon) * 0.5f,
-                       my - static_cast<float>(PlayerIcon) * 0.5f, static_cast<float>(PlayerIcon),
-                       static_cast<float>(PlayerIcon), BlinkAlpha(snapshot.tick, 48, 0.55f));
+            const float qx = mx - static_cast<float>(PlayerIcon) * 0.5f;
+            const float qy = my - static_cast<float>(PlayerIcon) * 0.5f;
+            const float qs = static_cast<float>(PlayerIcon);
+            // emit_atlas_tinted's own clip to the widget; the blit covers [s32(l), s32(r)).
+            const float l = std::max(qx, static_cast<float>(x));
+            const float t = std::max(qy, static_cast<float>(y));
+            const float r = std::min(qx + qs, static_cast<float>(x + rw));
+            const float b = std::min(qy + qs, static_cast<float>(y + rh));
+            if (r > l && b > t) {
+                const s32 bx = static_cast<s32>(std::floor(l)), by = static_cast<s32>(std::floor(t));
+                add_marker_px(bx, by, static_cast<s32>(std::ceil(r)) - bx,
+                              static_cast<s32>(std::ceil(b)) - by);
+            }
+            emit_atlas(ux, uy, cp, cp, qx, qy, qs, qs,
+                       BlinkAlpha(snapshot.tick,
+                                  std::max<u32>(2, manifest.map_style.player_blink_period),
+                                  manifest.map_style.player_blink_low));
         } else if (visible(mx, my) && widget.marker_src.empty()) {
             // (a marker_src picture is drawn below instead of the diamond)
-            const s32 cxm = static_cast<s32>(mx), cym = static_cast<s32>(my);
-            const auto diamond = [&](s32 r, u32 col) {
-                canvas.FillTriangle(cxm, cym - r, cxm + r, cym, cxm, cym + r, col);
-                canvas.FillTriangle(cxm, cym - r, cxm, cym + r, cxm - r, cym, col);
-            };
-            diamond(22, manifest.map_style.marker_back_color);
-            diamond(18, manifest.map_style.marker_colors[0]);
-            canvas.FillRect(cxm - 4, cym - 4, 8, 8, manifest.map_style.marker_glyph_color);
+            DrawFallbackPin(static_cast<s32>(mx), static_cast<s32>(my));
         }
     }
 }
@@ -1242,19 +1883,16 @@ void GeometryMapDraw::DrawSecondActor() {
             const bool actor_visible =
                 !widget.actor_reveal_required || (is_visited && is_visited(area, actor_x, actor_y));
             if (actor_visible) {
-                const float emx = to_x(actor_x);
-                const float emy = to_y(actor_y);
+                const auto at = pt(actor_x, actor_y);
+                const float emx = at[0];
+                const float emy = at[1];
                 float ux, uy;
                 cell_uv(ecell->second, ux, uy);
                 // Larger than Samus's marker and breathing in size rather than
-                // blinking, so the threat reads at a glance. The swing
-                // (widget.actor_pulse_scale) and cycle length (actor_pulse_ms) are
-                // package-declared; the defaults (0.5, 667 ms) give 1.3x..1.8x over ~0.7 s.
-                const u64 pulse_period_ticks = std::max<u64>(
-                    2, static_cast<u64>(std::lround(widget.actor_pulse_ms * 60.0f / 1000.0f)));
-                const float ph = BlinkAlpha(snapshot.tick, pulse_period_ticks, 0.0f);
-                const float es =
-                    static_cast<float>(PlayerIcon) * (1.3f + widget.actor_pulse_scale * ph);
+                // blinking, so the threat reads at a glance: 1.3x..1.8x over 40 ticks.
+                const float ph = BlinkAlpha(snapshot.tick, 40, 0.0f);
+                const float es = static_cast<float>(PlayerIcon) * (1.3f + 0.5f * ph);
+                uses_clock = true; // the breathing size
                 emit_atlas(ux, uy, cp, cp, emx - es * 0.5f, emy - es * 0.5f, es, es, 1.0f);
             }
         }
@@ -1267,14 +1905,39 @@ void GeometryMapDraw::DrawSecondActor() {
 void GeometryMapDraw::DrawMarkerPicture() {
     if (have_player && !geo->second.no_pin && !widget.marker_src.empty()) {
         const std::shared_ptr<const Image> mk = images ? images(widget.marker_src) : nullptr;
+        add_content(mk.get());
         const bool slot_free = manifest.icon_atlas.empty() || manifest.icon_cell <= 0;
         if (mk != nullptr && mk->Valid()) {
             const float mw =
                 widget.marker_size[0] > 0.0f ? widget.marker_size[0] : static_cast<float>(mk->w);
             const float mh =
                 widget.marker_size[1] > 0.0f ? widget.marker_size[1] : static_cast<float>(mk->h);
-            const float qx = to_x(wx_player) - widget.marker_anchor[0] * mw;
-            const float qy = to_y(wy_player) - widget.marker_anchor[1] * mh;
+            const auto at = pt(wx_player, wy_player);
+            const float qx = at[0] - widget.marker_anchor[0] * mw;
+            const float qy = at[1] - widget.marker_anchor[1] * mh;
+            const float degrees = MarkerDegrees(widget, snapshot);
+            const u32 tint = map_extras ? map_extras->marker_tint : 0xFFFFFFFFu;
+            if (degrees != 0.0f) {
+                const s32 ix = static_cast<s32>(std::lround(qx)),
+                          iy = static_cast<s32>(std::lround(qy));
+                const s32 iw = std::max(1, static_cast<s32>(std::lround(mw)));
+                const s32 ih = std::max(1, static_cast<s32>(std::lround(mh)));
+                const float px = widget.marker_anchor[0] * mw, py = widget.marker_anchor[1] * mh;
+                const auto bounds = TransformedImageBounds(ix, iy, iw, ih, degrees, 1.0f, px, py);
+                const auto clip = canvas.Clip();
+                const s32 left = std::max({x, clip[0], bounds[0]});
+                const s32 top = std::max({y, clip[1], bounds[1]});
+                const s32 right = std::min({x + rw, clip[0] + clip[2], bounds[2]});
+                const s32 bottom = std::min({y + rh, clip[1] + clip[3], bounds[3]});
+                if (right > left && bottom > top) {
+                    add_marker_px(left, top, right - left, bottom - top);
+                    canvas.SetClip(left, top, right - left, bottom - top);
+                    canvas.DrawImageTransformed(ix, iy, iw, ih, *mk, 0, 0, mk->w, mk->h, tint,
+                                                degrees, 1.0f, px, py);
+                    canvas.SetClip(clip[0], clip[1], clip[2], clip[3]);
+                }
+                return;
+            }
             const float l = std::max(qx, static_cast<float>(x));
             const float t = std::max(qy, static_cast<float>(y));
             const float r = std::min(qx + mw, static_cast<float>(x + rw));
@@ -1282,23 +1945,43 @@ void GeometryMapDraw::DrawMarkerPicture() {
             if (r > l && b > t) {
                 const float u0 = (l - qx) / mw, v0 = (t - qy) / mh;
                 const float u1 = (r - qx) / mw, v1 = (b - qy) / mh;
-                if (draw_list != nullptr && slot_free) {
+                if (draw_list != nullptr && slot_free && tint == 0xFFFFFFFFu && turn == 0.0f) {
                     draw_list->atlas_key = widget.marker_src;
                     draw_list->quads.push_back({1u, u0, v0, u1, v1, l, t, r - l, b - t, 1.0f});
                 } else {
                     const float fw = static_cast<float>(mk->w);
                     const float fh = static_cast<float>(mk->h);
+                    add_marker_px(
+                        static_cast<s32>(std::lround(l)), static_cast<s32>(std::lround(t)),
+                        static_cast<s32>(std::lround(r)) - static_cast<s32>(std::lround(l)),
+                        static_cast<s32>(std::lround(b)) - static_cast<s32>(std::lround(t)));
                     canvas.DrawImageRegion(
                         static_cast<s32>(std::lround(l)), static_cast<s32>(std::lround(t)),
                         static_cast<s32>(std::lround(r)) - static_cast<s32>(std::lround(l)),
                         static_cast<s32>(std::lround(b)) - static_cast<s32>(std::lround(t)), *mk,
                         static_cast<s32>(u0 * fw), static_cast<s32>(v0 * fh),
                         std::max(1, static_cast<s32>(std::lround((u1 - u0) * fw))),
-                        std::max(1, static_cast<s32>(std::lround((v1 - v0) * fh))), 0xFFFFFFFFu);
+                        std::max(1, static_cast<s32>(std::lround((v1 - v0) * fh))), tint);
                 }
             }
         }
     }
+}
+
+// The player pin without an atlas cell: two diamonds and a square core (map.style pin_*),
+// recorded as the live marker's box.
+void GeometryMapDraw::DrawFallbackPin(s32 cxm, s32 cym) {
+    const MapStyle& style = manifest.map_style;
+    const s32 reach = style.PinReach();
+    add_marker_px(cxm - reach - 1, cym - reach - 1, 2 * reach + 3, 2 * reach + 3);
+    const auto diamond = [&](s32 r, u32 col) {
+        canvas.FillTriangle(cxm, cym - r, cxm + r, cym, cxm, cym + r, col);
+        canvas.FillTriangle(cxm, cym - r, cxm, cym + r, cxm - r, cym, col);
+    };
+    diamond(style.pin_outer, style.marker_back_color);
+    diamond(style.pin_inner, style.marker_colors[0]);
+    canvas.FillRect(cxm - style.pin_core / 2, cym - style.pin_core / 2, style.pin_core,
+                    style.pin_core, style.marker_glyph_color);
 }
 
 // The atlas paths above only run when an icon atlas exists; an image-mode area
@@ -1307,17 +1990,11 @@ void GeometryMapDraw::DrawMarkerPicture() {
 void GeometryMapDraw::DrawPinFallback() {
     if (image_mode && have_player && !geo->second.no_pin && widget.marker_src.empty() &&
         (atlas == nullptr || manifest.icon_cell <= 0)) {
-        const float mx = to_x(wx_player);
-        const float my = to_y(wy_player);
+        const auto at = pt(wx_player, wy_player);
+        const float mx = at[0];
+        const float my = at[1];
         if (visible(mx, my)) {
-            const s32 cxm = static_cast<s32>(mx), cym = static_cast<s32>(my);
-            const auto diamond = [&](s32 r, u32 col) {
-                canvas.FillTriangle(cxm, cym - r, cxm + r, cym, cxm, cym + r, col);
-                canvas.FillTriangle(cxm, cym - r, cxm, cym + r, cxm - r, cym, col);
-            };
-            diamond(22, manifest.map_style.marker_back_color);
-            diamond(18, manifest.map_style.marker_colors[0]);
-            canvas.FillRect(cxm - 4, cym - 4, 8, 8, manifest.map_style.marker_glyph_color);
+            DrawFallbackPin(static_cast<s32>(mx), static_cast<s32>(my));
         }
     } else if (!image_mode && have_player && report_visit) {
         report_visit(area, wx_player, wy_player);
@@ -1386,11 +2063,201 @@ void DrawRoomBoxes(const WidgetDrawContext& ctx, const std::string& area,
         }
     }
     if (widget.area_label) {
-        canvas.DrawText(x + 12, y + rh - 24, area, widget.text_scale, widget.color);
+        canvas.DrawText(x + widget.label_offset[0], y + rh - widget.label_offset[1], area,
+                        widget.text_scale, widget.color);
     }
 }
 
 } // namespace
+
+float MapViewTurnDegrees(const Widget& widget, const StateSnapshot& snapshot) {
+    if (!widget.map_extras || widget.map_extras->view_rotate_bind.empty()) {
+        return 0.0f;
+    }
+    const auto& key = widget.map_extras->view_rotate_bind;
+    double degrees = 0.0;
+    if (const auto f = snapshot.floats.find(key); f != snapshot.floats.end()) {
+        degrees = f->second;
+    } else if (const auto i = snapshot.ints.find(key); i != snapshot.ints.end()) {
+        degrees = static_cast<double>(i->second);
+    } else {
+        return 0.0f; // missing: the classic north-up view
+    }
+    if (!std::isfinite(degrees)) {
+        return 0.0f;
+    }
+    degrees = std::fmod(degrees, 360.0);
+    if (degrees < 0.0) {
+        degrees += 360.0;
+    }
+    const float out = static_cast<float>(degrees);
+    return out >= 360.0f ? 0.0f : out;
+}
+
+std::optional<MapDrawRecord> ProbeMapView(const Manifest& manifest, const Page& page,
+                                          const StateSnapshot& snapshot, const Widget& widget,
+                                          size_t widget_index, const ViewState& views,
+                                          const MapFollowState& follow) {
+    // The Map case of RenderPage up to the end of FrameView, on copies: the follow state is
+    // advanced exactly as a draw would (glide step, pan correction) but in `scratch`, and nothing
+    // is drawn or reported.
+    if (widget.type != WidgetType::Map || widget.rect[2] <= 0 || widget.rect[3] <= 0) {
+        return std::nullopt;
+    }
+    static thread_local Canvas unused_canvas;
+    MapFollowState scratch = follow;
+    ViewTransform view{};
+    if (widget.pan_zoom) {
+        const std::string key =
+            widget.id.empty() ? page.id + "#" + std::to_string(widget_index) : widget.id;
+        if (const auto found = views.find(key); found != views.end()) {
+            view = found->second;
+        }
+    }
+    s32 x = widget.rect[0];
+    s32 y = widget.rect[1];
+    bool settling = false;
+    const ImageProvider no_images;
+    const TextProvider no_texts;
+    const VisitReporter no_report;
+    const VisitedQuery no_query;
+    const WidgetDrawContext ctx{.canvas = unused_canvas,
+                                .manifest = manifest,
+                                .page = page,
+                                .snapshot = snapshot,
+                                .images = no_images,
+                                .texts = no_texts,
+                                .draw_list = nullptr,
+                                .follow_state = &scratch,
+                                .report_visit = no_report,
+                                .is_visited = no_query,
+                                .map_records = nullptr,
+                                .follow_state_mutex = nullptr,
+                                .manifest_markers_mutex = nullptr,
+                                .settling = settling,
+                                .widget = widget,
+                                .widget_index = widget_index,
+                                .view = view,
+                                .x = x,
+                                .y = y,
+                                .rw = widget.rect[2],
+                                .rh = widget.rect[3],
+                                .value = 0,
+                                .maximum = 0};
+    std::string area;
+    std::string current_room;
+    SelectMapArea(ctx, area, current_room);
+    const auto geo = manifest.map_areas.find(area);
+    if (geo == manifest.map_areas.end()) {
+        return std::nullopt;
+    }
+    MapDrawRecord out;
+    if (!GeometryMapDraw{ctx, area, geo}.ProbeView(out)) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+std::array<s32, 4> PredictMapMarkerBox(const Manifest& manifest, const Widget& widget,
+                                       const StateSnapshot& snapshot, const MapDrawRecord& view,
+                                       const ImageProvider& images) {
+    // Mirrors GeometryMapDraw's live-marker draws (DrawLivePlayer, DrawMarkerPicture,
+    // DrawPinFallback) for the view the record holds: the same position lookup (FrameView) and
+    // the same world -> canvas mapping (to_x / to_y). Each box is widened a little and drawn
+    // unconditionally where its draw has a further condition, so this is a superset of the real
+    // box; the caller checks the draw's own marker_box against it anyway.
+    if (widget.marker_x_bind.empty() || widget.marker_y_bind.empty() || view.ppw <= 0.0f) {
+        return {};
+    }
+    const auto fx = snapshot.floats.find(widget.marker_x_bind);
+    const auto fy = snapshot.floats.find(widget.marker_y_bind);
+    if (fx == snapshot.floats.end() || fy == snapshot.floats.end()) {
+        return {};
+    }
+    const float wx = static_cast<float>(fx->second) * widget.marker_scale;
+    const float wy = static_cast<float>(fy->second) * widget.marker_scale;
+    if (!std::isfinite(wx) || !std::isfinite(wy)) {
+        return {};
+    }
+    const auto geo = manifest.map_areas.find(view.area);
+    if (geo == manifest.map_areas.end() || geo->second.no_pin) {
+        return {};
+    }
+    const s32 x = view.rect[0], y = view.rect[1], rw = view.rect[2], rh = view.rect[3];
+    const float cxpix = static_cast<float>(x) + static_cast<float>(rw) * 0.5f;
+    const float cypix = static_cast<float>(y) + static_cast<float>(rh) * 0.5f;
+    float mx = cxpix + (wx - view.cx) * view.ppw;
+    float my = cypix - (wy - view.cy) * view.ppw;
+    if (view.rotation != 0.0f) {
+        // Runtime 22: the same turn GeometryMapDraw::pt applies.
+        const double rad = static_cast<double>(view.rotation) * 3.14159265358979323846 / 180.0;
+        const float c = static_cast<float>(std::cos(rad)), s = static_cast<float>(std::sin(rad));
+        const float dx = mx - cxpix, dy = my - cypix;
+        mx = cxpix + dx * c - dy * s;
+        my = cypix + dx * s + dy * c;
+    }
+    constexpr s32 Pad = 2;
+    std::array<s32, 4> box{};
+    const auto add = [&box](float l, float t, float r, float b) {
+        const s32 bx0 = static_cast<s32>(std::floor(l)) - Pad;
+        const s32 by0 = static_cast<s32>(std::floor(t)) - Pad;
+        const s32 bx1 = static_cast<s32>(std::ceil(r)) + Pad;
+        const s32 by1 = static_cast<s32>(std::ceil(b)) + Pad;
+        if (bx1 <= bx0 || by1 <= by0) {
+            return;
+        }
+        if (box[2] <= 0 || box[3] <= 0) {
+            box = {bx0, by0, bx1 - bx0, by1 - by0};
+            return;
+        }
+        const s32 x0 = std::min(box[0], bx0), y0 = std::min(box[1], by0);
+        const s32 x1 = std::max(box[0] + box[2], bx1), y1 = std::max(box[1] + box[3], by1);
+        box = {x0, y0, x1 - x0, y1 - y0};
+    };
+    // A glyph or picture is clipped to the widget before it is drawn.
+    const auto add_clipped = [&](float qx, float qy, float qw, float qh) {
+        const float l = std::max(qx, static_cast<float>(x));
+        const float t = std::max(qy, static_cast<float>(y));
+        const float r = std::min(qx + qw, static_cast<float>(x + rw));
+        const float b = std::min(qy + qh, static_cast<float>(y + rh));
+        if (r > l && b > t) {
+            add(l, t, r, b);
+        }
+    };
+    if (!widget.marker_icon.empty()) {
+        const float p = static_cast<float>(manifest.map_style.marker_icon);
+        add_clipped(mx - p * 0.5f, my - p * 0.5f, p, p);
+    }
+    if (widget.marker_src.empty()) {
+        // The fallback pin (either path), not clipped to the widget: DrawFallbackPin's box
+        // about the truncated centre.
+        const float reach = static_cast<float>(manifest.map_style.PinReach());
+        add(std::floor(mx) - reach - 1.0f, std::floor(my) - reach - 1.0f,
+            std::floor(mx) + reach + 2.0f, std::floor(my) + reach + 2.0f);
+    } else if (images) {
+        const std::shared_ptr<const Image> mk = images(widget.marker_src);
+        if (mk != nullptr && mk->Valid()) {
+            const float mw =
+                widget.marker_size[0] > 0.0f ? widget.marker_size[0] : static_cast<float>(mk->w);
+            const float mh =
+                widget.marker_size[1] > 0.0f ? widget.marker_size[1] : static_cast<float>(mk->h);
+            const float qx = mx - widget.marker_anchor[0] * mw;
+            const float qy = my - widget.marker_anchor[1] * mh;
+            const float degrees = MarkerDegrees(widget, snapshot);
+            if (degrees == 0.0f) {
+                add_clipped(qx, qy, mw, mh);
+            } else {
+                const auto b = TransformedImageBounds(
+                    static_cast<s32>(std::lround(qx)), static_cast<s32>(std::lround(qy)),
+                    std::max(1, static_cast<s32>(std::lround(mw))),
+                    std::max(1, static_cast<s32>(std::lround(mh))), degrees, 1.0f,
+                    widget.marker_anchor[0] * mw, widget.marker_anchor[1] * mh);
+                add_clipped(b[0], b[1], b[2] - b[0], b[3] - b[1]);
+            }
+        }
+    }
+    return box;
+}
 
 void DrawMap(const WidgetDrawContext& ctx) {
     Canvas& canvas = ctx.canvas;

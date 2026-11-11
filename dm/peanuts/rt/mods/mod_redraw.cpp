@@ -26,15 +26,22 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <limits>
+#include <optional>
+#include <string>
+#include <vector>
 #include <span>
+#include <utility>
 
 #include <cstdlib>
 #include <fstream>
 #include "common/cityhash.h"
+#include "common/dsmod_dev_tools.h"
 #include "common/logging.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/mods/mod_font_pages.h"
 #include "core/mods/mod_runtime.h"
 #include "core/mods/mod_runtime_shared.h"
 #include "video_core/dsmod/aux_routing.h"
@@ -58,6 +65,19 @@ constexpr u64 MixHash(u64 x) {
 /// Set and cleared by RunRedrawJob. Both stay in this file: the variable has internal linkage, so a
 /// copy in another translation unit would never be set.
 thread_local const StateSnapshot* render_snapshot = nullptr;
+
+/// Set while WidgetDependencyHash computes a Map widget's "view" hash: everything the widget draws
+/// from except the live marker's position (marker_x_bind / marker_y_bind), for the redraw worker's
+/// marker-only redraw (RenderExtras::maps).
+thread_local bool hash_without_marker = false;
+
+/// The redraw worker's marker-only Map redraw (RenderExtras::maps): on unless
+/// EDEN_DSMOD_MARKER_REDRAW is 0/false.
+bool MarkerRedrawEnabled() {
+    static const bool enabled =
+        VideoCore::DSMod::DsmodEnvFlag("EDEN_DSMOD_MARKER_REDRAW", true);
+    return enabled;
+}
 
 /// The same font twice: glyph tables compared by value (FontGlyph is plain data).
 bool SameFontMetrics(const FontMetrics& a, const FontMetrics& b) {
@@ -196,6 +216,66 @@ u64 ModRuntime::UiSignature(const StateSnapshot& s, u32 target_w, u32 target_h) 
     return sig;
 }
 
+u64 UncoveredDrawInputsHash(const StateSnapshot& s) {
+    const std::hash<std::string> hs;
+    u64 hard = MixHash(s.drag.active ? 0xD1A6ULL : 0x0FFULL);
+    if (s.drag.active) {
+        hard = MixHash(hard ^ (static_cast<u64>(static_cast<u32>(s.drag.x)) << 32) ^
+                       static_cast<u32>(s.drag.y));
+        hard = MixHash(hard ^ static_cast<u64>(s.drag.hover) ^
+                       (static_cast<u64>(s.drag.source) << 32));
+    }
+    const auto uncovered_key = [](const std::string& k) {
+        // "@nav.": the controller focus frame (runtime 17) is a highlight, not a widget.
+        return k.starts_with("@drag") || k.starts_with("@scroll_on:") || k.starts_with("@nav.");
+    };
+    for (const auto& [k, v] : s.ints) {
+        if (uncovered_key(k)) {
+            hard ^= MixHash(hs(k) ^ MixHash(static_cast<u64>(v)));
+        }
+    }
+    for (const auto& [k, v] : s.texts) {
+        if (uncovered_key(k)) {
+            hard ^= MixHash(hs(k) ^ hs(v));
+        }
+    }
+    return hard;
+}
+
+std::pair<u64, u64> ModRuntime::UncoveredSignature(const StateSnapshot& s) const {
+    // The inputs of a page draw that no per-widget dependency hash (WidgetDependencyHash) is
+    // guaranteed to see, split by what a change needs (PublishUi):
+    //  hard: painted outside any widget's own rect (UncoveredDrawInputsHash).
+    //  soft: view transforms (pan/zoom, glides) and, while a map on this page was last drawn from
+    //        the clock (a blinking item, a pulsing marker picture), the clock itself.
+    const std::hash<std::string> hs;
+    const u64 hard = UncoveredDrawInputsHash(s);
+    u64 soft = 0x50F7ULL;
+    {
+        std::scoped_lock lk{view_mutex};
+        for (const auto& [key, vt] : view_state) {
+            u32 zb, px, py;
+            std::memcpy(&zb, &vt.zoom, 4);
+            std::memcpy(&px, &vt.pan_x, 4);
+            std::memcpy(&py, &vt.pan_y, 4);
+            soft ^= MixHash(hs(key) ^ (static_cast<u64>(zb) << 32) ^ (static_cast<u64>(px) << 16) ^
+                            py ^ (vt.gliding ? 0x61ULL : 0));
+        }
+    }
+    bool clock_map = false;
+    {
+        std::scoped_lock lk{map_records_mutex};
+        if (map_records_page == current_page) {
+            clock_map = std::ranges::any_of(map_draw_records_published,
+                                            [](const MapDrawRecord& r) { return r.clock_dependent; });
+        }
+    }
+    if (clock_map) {
+        soft ^= MixHash((tick_count / 4) * 0x9E3779B97F4A7C15ULL);
+    }
+    return {hard, soft};
+}
+
 u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
                                      const std::string& page_id, size_t source_index) const {
     const std::hash<std::string> hs;
@@ -231,7 +311,7 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
     // mod_ui_widget_state.cpp) plus the select-group highlight (RenderPage's highlight pass,
     // mod_ui.cpp; a drag's own hover highlight is not tracked here -- snapshot.drag.active forces
     // the full-page path instead, enforced explicitly in PublishUi's own `partial` condition). ---
-    add(w.need_bind);
+    add(w.need_bind.starts_with("!") ? w.need_bind.substr(1) : w.need_bind);
     add(w.hide_bind);
     if (w.anim) {
         add(w.anim->gate.point);
@@ -298,6 +378,18 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
     }
     // Image: which picture to draw (DrawImage, mod_ui.cpp).
     add(w.src_bind);
+    // Runtime 16: a bound angle, scale and tint (Image / Pips / Bar image).
+    add(w.rotate_bind);
+    add(w.scale_bind);
+    add(w.tint_bind);
+    // Runtime 17: a chart redraws when its ring buffer takes a sample (ChartSampler publishes the
+    // sample count as "@chart:<key>").
+    if (w.chart) {
+        static thread_local std::string chart_key; // no allocation per widget per scan
+        chart_key.assign("@chart:");
+        chart_key += w.chart->key;
+        add(chart_key);
+    }
     // A widget whose content changes purely with the clock -- a non-picture Map, a breathing Rect
     // outline (`pulse`), a spinning/trembling Image (`spin`/`shake`) -- needs a tick epoch folded
     // in here, or it would report "unchanged" on every tick that doesn't ALSO move a bound value,
@@ -323,15 +415,28 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
     // documented, not silently assumed away (same caveat this code carried when it lived in the
     // Map-only branch).
     if (w.pan_zoom) {
-        const std::string key = w.id.empty() ? page_id + "#" + std::to_string(source_index) : w.id;
-        std::scoped_lock lk{view_mutex};
-        if (const auto it = view_state.find(key); it != view_state.end()) {
+        const auto add_view = [&](const std::string& key, const ViewTransform& view) {
             u32 zb, px, py;
-            std::memcpy(&zb, &it->second.zoom, 4);
-            std::memcpy(&px, &it->second.pan_x, 4);
-            std::memcpy(&py, &it->second.pan_y, 4);
+            std::memcpy(&zb, &view.zoom, 4);
+            std::memcpy(&px, &view.pan_x, 4);
+            std::memcpy(&py, &view.pan_y, 4);
             h ^=
                 MixHash(hs(key) ^ (static_cast<u64>(zb) << 32) ^ (static_cast<u64>(px) << 16) ^ py);
+        };
+        std::scoped_lock lk{view_mutex};
+        if (!w.id.empty()) {
+            if (const auto it = view_state.find(w.id); it != view_state.end()) {
+                add_view(it->first, it->second);
+            }
+        } else {
+            // An unnamed widget's view is keyed by its EXPANDED index (RenderPage), which differs
+            // from `source_index` after a repeat template: take every unnamed view of the page.
+            const std::string prefix = page_id + "#";
+            for (const auto& [key, view] : view_state) {
+                if (key.starts_with(prefix)) {
+                    add_view(key, view);
+                }
+            }
         }
     }
     if (w.type != WidgetType::Map) {
@@ -356,10 +461,11 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
     // visibility group, a freshly revealed icon, a moved pin, or an in-flight reveal fade silently
     // stuck at its old picture until an unrelated redraw happened to also touch the map. ---
     add(w.area_bind);
-    add(w.area_season_bind);
     add(w.room_bind);
-    add(w.marker_x_bind);
-    add(w.marker_y_bind);
+    if (!hash_without_marker) {
+        add(w.marker_x_bind);
+        add(w.marker_y_bind);
+    }
     add(w.actor_x_bind);
     add(w.actor_y_bind);
     h ^= MixHash(water_gen * 0x100000001B3ULL + wall_gen * 0x9E3779B1u +
@@ -390,6 +496,16 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
         for (const auto& [name, group] : w.map_extras->groups) {
             add(group.show.point);
             add(group.hide.point);
+        }
+        // Runtime 14: the bound base picture and the overlays' pictures / gates.
+        add(w.map_extras->image_bind);
+        add(w.map_extras->marker_rotate_bind);
+        add(w.map_extras->view_rotate_bind); // runtime 22: the whole view turns
+        for (const auto& ov : w.map_extras->overlays) {
+            add(ov.src_bind);
+            add(ov.src_detail_bind);
+            add(ov.mask_bind); // runtime 24
+            add(ov.show.point);
         }
     }
     // The resolved area's own markers/labels/dynamic_markers -- read live by the Map case
@@ -424,10 +540,17 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
                 add(substitute(dm.x, i));
                 add(substitute(dm.y, i));
                 add(substitute(dm.kind, i));
+                // Runtime 14 per-slot picture / bar / dim / frame / tint.
+                add(substitute(dm.icon_src_bind, i));
+                add(substitute(dm.bar_bind, i));
+                add(substitute(dm.bar_max_bind, i));
+                add(substitute(dm.dim_bind, i));
+                add(substitute(dm.frame_color_bind, i));
+                add(substitute(dm.tint_bind, i));
             }
         }
     }
-    // A flat composite (F2 "flat": true) cross-fading a newly revealed layer in
+    // A flat composite ("flat": true) cross-fading a newly revealed layer in
     // (GeometryMapDraw::DrawBaseLayer, mod_ui_map_widget.cpp, "@fade:<composite>", 0..1000): not a
     // widget field, not a generation counter, and its composite name is resolved deep inside the
     // Map case's own image-key logic -- duplicating that resolution here is more risk than it is
@@ -442,6 +565,17 @@ u64 ModRuntime::WidgetDependencyHash(const Widget& w, const StateSnapshot& s,
             h ^= MixHash(hs(k) ^ MixHash(static_cast<u64>(v)));
         }
     }
+    // The player's own custom markers (GeometryMapDraw::DrawCustomMarkers): not bound values, so
+    // nothing above sees them move. UiSignature hashes them for the page; the page-level
+    // signature used to be the only thing that noticed, through the full-page redraw a changed
+    // signature with no dirty widget fell back to.
+    for (const auto& m : s.custom_markers) {
+        u32 fx, fy;
+        const float mx = m.x, my = m.y;
+        std::memcpy(&fx, &mx, 4);
+        std::memcpy(&fy, &my, 4);
+        fold(MixHash((static_cast<u64>(fx) << 32) ^ fy) ^ static_cast<u64>(m.color) ^ 5);
+    }
     return h;
 }
 
@@ -450,6 +584,8 @@ std::array<s32, 4> WidgetEffectiveRect(const Widget& w, u32 canvas_w, u32 canvas
                                        const StateSnapshot& snapshot, const Manifest& manifest,
                                        const FontMetrics* font, bool expanded);
 void MergeDirtyRects(std::vector<std::array<s32, 4>>& rects, s32 canvas_w, s32 canvas_h);
+s64 RectsArea(const std::vector<std::array<s32, 4>>& rects);
+std::array<s32, 4> RectsBox(const std::vector<std::array<s32, 4>>& rects);
 } // namespace
 
 u64 ModRuntime::RepeatTemplateDependencyHash(const Page& page, size_t index,
@@ -470,6 +606,11 @@ u64 ModRuntime::RepeatTemplateDependencyHash(const Page& page, size_t index,
                          (static_cast<u64>(static_cast<u32>(ScrollOffset(*region, s))) << 40) ^
                          static_cast<u64>(static_cast<u32>(m.row_h)));
             h ^= MixHash(0x5C0111000ULL + static_cast<u64>(s.GetInt("@scroll_on:" + region->id)));
+            if (m.max_offset_x > 0 || (region->axes & ScrollRegion::AxisX) != 0) {
+                h ^= MixHash(0x5C0112000ULL ^
+                             (static_cast<u64>(static_cast<u32>(ScrollOffsetX(*region, s))) << 8) ^
+                             (static_cast<u64>(static_cast<u32>(m.max_offset_x)) << 40));
+            }
         }
     }
     // ...and every element exactly as ExpandWidgets builds it this tick: which ones exist, where,
@@ -557,6 +698,12 @@ std::array<s32, 4> ModRuntime::RepeatElementsRect(const StateSnapshot& s, u32 cw
 
 void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     PumpNxAssets(snapshot); // land decoded game art, drive composites (never blocks)
+    if (font_pages != nullptr && font_pages->TakeLanded()) {
+        // Runtime 17: a font page landed -- text on it drew blank until now: repaint all, as for
+        // a landed module image.
+        ui_signature_valid = false;
+        module_images_landed = true;
+    }
     auto& aux = system.GPU().DSModAux();
     if (aux.rt_capture.load()) {
         ui_signature_valid = false;   // force a full redraw when we next draw widgets
@@ -567,6 +714,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     if (manifest.pages.empty()) {
         return; // a hot-reload could leave no pages; indexing below would be out of bounds
     }
+    aux.ui_bg.store(manifest.background, std::memory_order_relaxed); // Fit bars
     const auto& active = manifest.pages[std::min(current_page, manifest.pages.size() - 1)];
     if (active.mirror) {
         // The page asks for the game's own pixels rather than drawn widgets: hand the renderer a
@@ -589,7 +737,15 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     // this function dispatched it, so it cannot be folded into `ui_signature_valid` inline the way
     // the synchronous path's own `animating` still is, further down.
     if (dispatch_animating.exchange(false, std::memory_order_relaxed)) {
-        ui_signature_valid = false; // a view glide is in flight: redraw next tick regardless
+        // A view glide is in flight: its Map widgets redraw on the next publish regardless. Not
+        // an invalidation (ui_signature_valid) -- that repaints the whole page, which only the
+        // map needs (BuildRenderExtras adds the map rects for glide_owed).
+        render_extras.glide_owed = true;
+    }
+    // An Image widget cross-fade ("src_fade_ms") in flight: glide_owed above only re-arms Map
+    // widgets, so without this the fade would stop on its first frame (the outgoing picture).
+    if (image_fallback_state.fade_in_flight.exchange(false, std::memory_order_relaxed)) {
+        ui_signature_valid = false;
     }
     // Widget groups advance on real time; a group that starts moving on an odd tick is drawn from
     // the next published frame on.
@@ -650,7 +806,11 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     // here (not after DrivePageTransition) so a transition tick's own redraw-once bookkeeping is
     // untouched; BuildRenderExtras is only consulted below, after a transition has already had
     // first refusal.
-    const bool sig_changed = !ui_signature_valid || sig != last_ui_signature;
+    // Invalidated (an asset landed, a page was shown, the renderer handed the screen back, ...):
+    // the whole page is repainted whatever the dirty scan finds -- the scan tracks bound values,
+    // not these.
+    const bool full_owed = !ui_signature_valid;
+    const bool sig_changed = full_owed || sig != last_ui_signature || render_extras.glide_owed;
     if ((page_anim.active || page_anim_request.has_value()) &&
         DrivePageTransition(snapshot, sig, target_w, target_h)) {
         return; // this tick's transition frame is published
@@ -658,12 +818,20 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     if (!LockMapStateUnlessRaster(map_lock)) {
         return;
     }
+    // The dirty scan re-baselines (and reports nothing) on a new page or a reloaded manifest: that
+    // tick repaints the whole page.
+    const bool rebaselined =
+        widget_sig_page != current_page || current_page >= manifest.pages.size() ||
+        widget_sig.size() != manifest.pages[current_page].widgets.size();
     const std::array<s32, 4> anim_dirty =
         BuildRenderExtras(snapshot, sig_changed, target_w, target_h);
     map_lock.unlock();
     const bool groups_dirty = anim_dirty[2] > 0 && anim_dirty[3] > 0;
     const bool same = !sig_changed;
-    if (same && !groups_dirty) {
+    // A module font that was not ready yet (LoadFont's bounded retry) redraws a still page too.
+    const bool font_retry_due =
+        !font_ready && font_module_attempts > 0 && tick_count >= font_retry_tick;
+    if (same && !groups_dirty && !font_retry_due) {
         return;
     }
     last_ui_signature = sig;
@@ -688,12 +856,21 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
         // long as this function runs, exactly today's lifetime guarantee, unchanged.
         // dispatch_font_atlas (an owned copy of the same shared_ptr) is the separate, job-safe
         // handle DispatchRedraw uses instead.
-        dispatch_font_atlas = GetImage(manifest.font_atlas_src);
+        // Runtime 17: a paged font has no one atlas image -- its pages come from font_pages.
+        if (!(font_pages && font_metrics.page_h > 0)) {
+            dispatch_font_atlas = GetImage(manifest.font_atlas_src);
+        }
         dispatch_font_metrics = &font_metrics; // shared below (SharedFontMetrics): an owned,
                                                // immutable copy made only when it changed --
                                                // PumpNxAssets reassigns font_metrics wholesale.
         canvas.SetFont(dispatch_font_atlas.get(), &font_metrics);
+        canvas.SetFontPages(font_metrics.page_h > 0 ? font_pages.get() : nullptr);
+    } else {
+        canvas.SetFont(nullptr, nullptr);
+        canvas.SetFontPages(nullptr);
     }
+    // `canvas` keeps the raw pointers past this call: hold what they point at until the next one.
+    canvas_font_ref = dispatch_font_atlas;
     {
         // The FontMetrics* out-param is filled by NxIconFont itself while it still holds
         // nx_assets->state_mutex internally -- this file can't take that lock directly
@@ -703,6 +880,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
                                                  &dispatch_icon_metrics_copy)
                                     : nullptr;
         canvas.SetIconFont(dispatch_icon_atlas.get(), icons, dispatch_icon_pending);
+        canvas_icon_ref = dispatch_icon_atlas;
     }
     const auto& page = manifest.pages[std::min(current_page, manifest.pages.size() - 1)];
     draw_list.quads.clear();
@@ -724,11 +902,8 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     // (it could overwrite a transition's already-correct pixels).
     // EDEN_DSMOD_SYNC_REDRAW=1 remains as an escape hatch back to the old fully-synchronous path;
     // unset (or "0"/"false"/"FALSE") runs the worker.
-    static const bool sync_redraw = [] {
-        const char* off = std::getenv("EDEN_DSMOD_SYNC_REDRAW");
-        return off != nullptr && std::strcmp(off, "0") != 0 && std::strcmp(off, "false") != 0 &&
-               std::strcmp(off, "FALSE") != 0;
-    }();
+    static const bool sync_redraw =
+        VideoCore::DSMod::DsmodEnvFlag("EDEN_DSMOD_SYNC_REDRAW", false);
     // This tick's ordinary canvas-path render goes to the redraw worker instead of running
     // synchronously here, unless the kill switch forces the old behaviour or this page is excluded
     // by design -- only the debug page stays fully synchronous. GPU_COMPOSITE (`dl != nullptr`)
@@ -764,6 +939,16 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
             dirty_area += static_cast<s64>(r[2]) * r[3];
         }
     }
+    // A dirty marker-only candidate map (RenderExtras::maps) usually costs the worker only its
+    // marker's boxes, so its rect does not count toward the cutover. LA's map alone is 59.98% of
+    // the canvas: with it counted, any second dirty widget turned a marker move into a page draw.
+    // When the worker cannot narrow it, the map rect is one more clipped pass -- no more pixels
+    // than the page draw it would otherwise have been.
+    if (dl == nullptr && will_dispatch && MarkerRedrawEnabled() &&
+        std::ranges::any_of(render_extras.maps,
+                            [](const RenderMapCandidate& m) { return m.dirty; })) {
+        dirty_area = RectsArea(render_extras.other_clips);
+    }
     const bool area_cutover = dl == nullptr && canvas_area > 0 &&
                               dirty_area * 100 > canvas_area * kPartialAreaCutoverPercent;
     // Only the dirty rect needs pixels when nothing else forces a full redraw and the canvas still
@@ -772,9 +957,9 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
     // moved) with a small clip instead of a full redraw -- requiring `same` here (as the group-box-
     // only mechanism alone used to) would make anim_dirty's new per-widget contribution literally
     // unreachable, since WidgetDependencyHash reads nothing UiSignature doesn't already hash a
-    // superset of: whenever `same` is true, every one of my per-widget hashes is provably unchanged
+    // superset of: whenever `same` is true, every per-widget hash is provably unchanged
     // too (the scan doesn't even run then -- see sig_changed/widgets_may_be_dirty above), so `same`
-    // and "my new rect is non-empty" can never both hold at once. The group-box case (same == true,
+    // and "a new rect is non-empty" can never both hold at once. The group-box case (same == true,
     // a group animating on wall-clock time, sig untouched) still works exactly as before: it is the
     // only source anim_dirty can have on such a tick, so this condition reduces to the original
     // one. While snapshot.drag.active, the full-page path is taken unconditionally
@@ -809,11 +994,36 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
                                       : (canvas.Width() == target_w && canvas.Height() == target_h);
     // Asynchronously built module images (asset-free packages) landed: repaint everything once.
     const bool images_landed = module_images_landed.exchange(false);
-    const bool partial =
-        !images_landed && groups_dirty && !area_cutover && canvas_same_size &&
+    // The target canvas still holds this page's last frame in this mode (the partial redraw's
+    // precondition).
+    const bool continuity =
+        !images_landed && canvas_same_size &&
         (will_dispatch ? dispatch_page == current_page
                        : (canvas_page == current_page && canvas_hud == (dl != nullptr))) &&
         !snapshot.drag.active;
+    render_extras.glide_owed = false; // BuildRenderExtras has added the maps for it
+    // What the page draws from beyond the per-widget dependency hashes (UncoveredSignature):
+    // `hard` (the drag ghost and drop highlight, scrollbar gates) is painted outside any widget's
+    // rect, so a change repaints the whole page even when some widget is dirty too; `soft` (view
+    // transforms, clock-driven map content) only keeps the no-dirty-widget skip below from
+    // applying.
+    const auto [uncovered_hard, uncovered_soft] = UncoveredSignature(snapshot);
+    const bool hard_changed = !uncovered_valid || uncovered_hard != last_uncovered_hard;
+    const bool soft_changed = !uncovered_valid || uncovered_soft != last_uncovered_soft;
+    last_uncovered_hard = uncovered_hard;
+    last_uncovered_soft = uncovered_soft;
+    uncovered_valid = true;
+    if (!groups_dirty && continuity && !full_owed && !rebaselined && !hard_changed &&
+        !soft_changed) {
+        // The signature moved, but nothing any widget draws from did, and none of the inputs the
+        // widget hashes do not cover: the frame on screen is already this state's. This used to
+        // fall through to a page draw (an LA overworld walk did ~4 of them a second, 15-23 ms
+        // each on the Thor, for position-derived values of hidden widgets). A page draw is still
+        // what a new page, an invalidation, a resize, a lost canvas or an uncovered change get;
+        // a follow glide gets its maps redrawn (glide_owed).
+        return;
+    }
+    const bool partial = continuity && groups_dirty && !area_cutover && !hard_changed;
     render_extras.clip = partial ? anim_dirty : std::array<s32, 4>{};
     if (!partial || dl != nullptr) {
         render_extras.clips.clear(); // one pass: the whole canvas, or the GPU path's one box
@@ -842,6 +1052,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
         // excluded by the target_w/h == 0 early-return far above).
         RedrawJob job;
         job.generation = redraw_dispatch_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+        job.authority = redraw_authority_generation.load(std::memory_order_relaxed);
         {
             // The page never changes until a reload (which drops it): one shared copy of the page
             // on screen, made when the page changes rather than once per job.
@@ -862,6 +1073,9 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
         }
         job.snapshot = snapshot; // a copy: `snapshot` is a const ref this function does not own
         job.extras = render_extras;
+        if (dl != nullptr) {
+            job.extras.maps.clear(); // the GPU path is never narrowed
+        }
         job.has_extras = groups_dirty || !render_extras.groups.empty();
         job.partial = partial;
         // `dl != nullptr` is a pure function of page identity (`gpu_composite_mode`,
@@ -877,6 +1091,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
         job.gpu_composite = dl != nullptr;
         job.views = GetViewState();
         job.font_atlas = dispatch_font_atlas;
+        job.font_pages = font_metrics.Valid() && font_metrics.page_h > 0 ? font_pages : nullptr;
         job.font_metrics_copy = SharedFontMetrics(shared_font_metrics, *dispatch_font_metrics);
         job.icon_atlas = dispatch_icon_atlas;
         job.icon_metrics_copy = SharedFontMetrics(shared_icon_metrics, dispatch_icon_metrics_copy);
@@ -885,6 +1100,14 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
         job.target_h = target_h;
         job.page_index = current_page; // captured now -- see RedrawJob's own field comment
         DispatchRedraw(std::move(job));
+        // A group's one settle frame is now in a dispatched job (published even if superseded,
+        // runtime 13): stop adding its box, or a settled group would redraw its box every tick.
+        for (const auto& rg : render_extras.groups) {
+            if (auto g = group_anims.find(rg.key);
+                g != group_anims.end() && !rg.moving && g->second.settle_pending) {
+                g->second.settle_pending = false;
+            }
+        }
         dispatch_page = current_page;
         dispatch_w = target_w;
         dispatch_h = target_h;
@@ -914,9 +1137,10 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
         // as stale by RunRedrawJob's own check below and does not publish its now-superseded pixels
         // afterward. This holds for any manifest shape.
         redraw_dispatch_generation.fetch_add(1, std::memory_order_relaxed);
+        redraw_authority_generation.fetch_add(1, std::memory_order_relaxed);
         ApplyViewCorrections();
         if (animating) {
-            ui_signature_valid = false; // a view glide is in flight: redraw next tick regardless
+            render_extras.glide_owed = true; // a view glide is in flight: its maps redraw next tick
         }
         if (dl != nullptr && dl->active) {
             PublishGpuComposite(draw_list, canvas);
@@ -958,7 +1182,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
             if (g->second.settle_pending) {
                 g->second.settle_pending = false;
                 const std::string line =
-                    fmt::format("DSMod anim group '{}' {} after {} frame(s): {} redraw avg {:.2f} "
+                    std::format("DSMod anim group '{}' {} after {} frame(s): {} redraw avg {:.2f} "
                                 "ms max {:.2f} ms "
                                 "(box {}x{})",
                                 rg.key, g->second.open ? "shown" : "hidden", g->second.frames,
@@ -966,7 +1190,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
                                 g->second.frame_ms / std::max<u32>(1, g->second.frames),
                                 g->second.frame_max_ms, rg.box[2], rg.box[3]);
                 LOG_INFO(Core, "{}", line);
-                if (const char* const p = std::getenv("EDEN_DSMOD_CMD")) {
+                if (const char* const p = Common::DSMod::DevEnvironment("EDEN_DSMOD_CMD")) {
                     std::ofstream f(std::string(p) + ".out", std::ios::app);
                     if (f) {
                         f << line << '\n';
@@ -976,7 +1200,7 @@ void ModRuntime::PublishUi(const StateSnapshot& snapshot) {
             if (dl == nullptr) {
                 const float e = ApplyEasing(Easing::Linear, g->second.pos);
                 DumpAnimFrame(canvas.Pixels(), canvas.Width(), canvas.Height(),
-                              fmt::format("group_{}_f{:02}_p{:03}", rg.key, g->second.frames,
+                              std::format("group_{}_f{:02}_p{:03}", rg.key, g->second.frames,
                                           static_cast<int>(e * 1000.0f)));
             }
         }
@@ -1005,7 +1229,7 @@ bool ModRuntime::RenderPageTo(const Page& page, const StateSnapshot& snapshot, A
         // body. This call site (the debug page aside, __debug returns above) also serves the
         // synchronous carve-out (page transitions, GPU_COMPOSITE), which can run concurrently with
         // the redraw worker's own RenderPage call, so this needs to be real, not a formality.
-        &map_state_mutex);
+        &map_state_mutex, &image_fallback_state);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1045,9 +1269,8 @@ void ModRuntime::PublishPartial(VideoCore::DSMod::AuxRouting& aux, const Canvas&
         aux.PublishUiPartial(from.Width(), from.Height(), from.Pixels(), extras.clip);
         return;
     }
-    for (const auto& rect : extras.clips) {
-        aux.PublishUiPartial(from.Width(), from.Height(), from.Pixels(), rect);
-    }
+    // One publish for all of the rects: the renderer must not take a frame between two of them.
+    aux.PublishUiPartialRects(from.Width(), from.Height(), from.Pixels(), extras.clips);
 }
 
 void ModRuntime::EnsureRedrawWorker() {
@@ -1102,6 +1325,41 @@ void ModRuntime::DispatchRedraw(RedrawJob&& job) {
                 MergeDirtyRects(job.extras.clips, static_cast<s32>(job.target_w),
                                 static_cast<s32>(job.target_h));
             }
+            // The marker-only bookkeeping (RenderExtras::maps): the merged job's candidates are
+            // the new job's (same page, same list), dirty when either job's was; everything else
+            // either job repaints is in other_clips. A candidate only the old job has (not
+            // expected) repaints its whole rect.
+            if (!job.extras.maps.empty()) {
+                auto& other = job.extras.other_clips;
+                if (old.extras.maps.empty()) {
+                    if (old.extras.clips.empty()) {
+                        other.push_back(old_clip);
+                    } else {
+                        other.insert(other.end(), old.extras.clips.begin(),
+                                     old.extras.clips.end());
+                    }
+                } else {
+                    other.insert(other.end(), old.extras.other_clips.begin(),
+                                 old.extras.other_clips.end());
+                    for (const auto& om : old.extras.maps) {
+                        if (!om.dirty) {
+                            continue;
+                        }
+                        const auto it = std::ranges::find_if(
+                            job.extras.maps,
+                            [&om](const RenderMapCandidate& m) { return m.index == om.index; });
+                        if (it != job.extras.maps.end()) {
+                            it->dirty = true;
+                        } else {
+                            other.push_back(om.rect);
+                        }
+                    }
+                }
+                MergeDirtyRects(other, static_cast<s32>(job.target_w),
+                                static_cast<s32>(job.target_h));
+                // Every dirty candidate's rect is in `clips` already: both jobs' clips are merged
+                // above (a partial canvas-path job always carries its clips).
+            }
         }
     }
     if (redraw_pending_job && !spare_snapshot) {
@@ -1128,11 +1386,8 @@ void ModRuntime::RedrawWorkerMain(std::stop_token stop) {
     // tree's real precedent for the priority call itself, not those two threads. An escape hatch,
     // EDEN_DSMOD_REDRAW_NORMAL_PRIORITY=1, leaves the worker at the default OS priority so the two
     // configurations can be A/B measured without a rebuild.
-    static const bool keep_normal_priority = [] {
-        const char* v = std::getenv("EDEN_DSMOD_REDRAW_NORMAL_PRIORITY");
-        return v != nullptr && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
-               std::strcmp(v, "FALSE") != 0;
-    }();
+    static const bool keep_normal_priority =
+        VideoCore::DSMod::DsmodEnvFlag("EDEN_DSMOD_REDRAW_NORMAL_PRIORITY", false);
     Common::SetCurrentThreadName("DSModRedraw");
     if (!keep_normal_priority) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
@@ -1154,15 +1409,207 @@ void ModRuntime::RedrawWorkerMain(std::stop_token stop) {
     }
 }
 
+namespace {
+/// What the redraw worker last painted for one marker-only candidate Map widget
+/// (RenderExtras::maps): the dependency hash it was drawn from and the record of that draw.
+/// `valid`: worker_canvas holds that whole draw (the view, and the marker at marker_box).
+struct DrawnMapState {
+    size_t index{};
+    bool valid{};
+    u64 view_hash{};
+    MapDrawRecord rec;
+};
+/// The redraw worker's DrawnMapStates. One per worker thread, i.e. per runtime; reset when the
+/// job's page or canvas size is not the one they describe.
+struct WorkerMapMemo {
+    std::shared_ptr<const Page> page;
+    u32 w{}, h{};
+    std::vector<DrawnMapState> maps;
+    DrawnMapState* Find(size_t index) {
+        for (auto& m : maps) {
+            if (m.index == index) {
+                return &m;
+            }
+        }
+        return nullptr;
+    }
+};
+thread_local WorkerMapMemo worker_map_memo;
+
+/// The same view (area, rect, centre, scale, extent -- bit for bit), and with `content` the same
+/// pictures.
+bool SameMapView(const MapDrawRecord& a, const MapDrawRecord& b, bool content = true) {
+    const auto same = [](float x, float y) { return std::memcmp(&x, &y, sizeof(float)) == 0; };
+    return a.area == b.area && a.rect == b.rect && same(a.cx, b.cx) && same(a.cy, b.cy) &&
+           same(a.ppw, b.ppw) && same(a.min_x, b.min_x) && same(a.min_y, b.min_y) &&
+           same(a.max_x, b.max_x) && same(a.max_y, b.max_y) && same(a.rotation, b.rotation) &&
+           (!content || a.content_id == b.content_id);
+}
+
+bool RectInside(const std::array<s32, 4>& inner, const std::array<s32, 4>& outer) {
+    if (inner[2] <= 0 || inner[3] <= 0) {
+        return true;
+    }
+    return inner[0] >= outer[0] && inner[1] >= outer[1] &&
+           inner[0] + inner[2] <= outer[0] + outer[2] &&
+           inner[1] + inner[3] <= outer[1] + outer[3];
+}
+
+/// The latest record of expanded widget `index` in `records` (nullptr: none).
+const MapDrawRecord* FindRecord(const MapDrawRecords& records, size_t index) {
+    const MapDrawRecord* found = nullptr;
+    for (const auto& r : records) {
+        if (r.widget_index == index) {
+            found = &r;
+        }
+    }
+    return found;
+}
+
+/// Counters of the worker's marker-only redraw and of EDEN_DSMOD_VERIFY_REDRAW, logged every 5 s.
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+struct NarrowStats {
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+    u64 jobs{}, full_jobs{}, narrowed_maps{}, fallback_maps{}, failed_maps{};
+    u64 verified{}, mismatched{};
+};
+#endif
+} // namespace
+
 void ModRuntime::RunRedrawJob(RedrawJob& job) {
+    // Marker-only redraw of a Map widget (default on; EDEN_DSMOD_MARKER_REDRAW=0 turns it off) and
+    // its self-check (EDEN_DSMOD_VERIFY_REDRAW=1: every partial job is compared with a full redraw
+    // of the same state, mismatches logged -- a debugging aid, it doubles the worker's cost).
+    const bool marker_redraw = MarkerRedrawEnabled();
+    // Set again only by this job's own GPU-composite publish (see its use below).
+    const bool hud_synced = std::exchange(worker_hud_synced, false);
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+    static const bool verify_redraw =
+        VideoCore::DSMod::DsmodEnvFlag("EDEN_DSMOD_VERIFY_REDRAW", false);
+#else
+    static constexpr bool verify_redraw = false;
+#endif
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+    static thread_local NarrowStats nstats;
+#endif
     static thread_local RuntimeStageStats worker_stats;
-    const RuntimeStageTimer worker_timer{worker_stats, "redraw-worker"};
+    static thread_local RuntimeStageStats marker_stats;
+    static thread_local RuntimeStageStats map_stats;
+    const bool touches_map_candidates =
+        std::ranges::any_of(job.extras.maps, [](const RenderMapCandidate& m) { return m.dirty; });
+    // Timed apart: a whole-map (or page) job and a marker-only one cost an order of magnitude
+    // apart. Chosen after the narrowing decision below (the timer starts there).
+    std::optional<RuntimeStageTimer> worker_timer;
     if (worker_canvas.Width() != job.target_w || worker_canvas.Height() != job.target_h) {
         worker_canvas.Resize(job.target_w, job.target_h);
     }
     worker_canvas.SetFont(job.font_atlas.get(), job.font_metrics_copy.get());
+    worker_canvas.SetFontPages(job.font_pages.get());
     worker_canvas.SetIconFont(job.icon_atlas.get(), job.icon_metrics_copy.get(), job.icon_pending);
-    bool animating = false;
+    const ImageProvider images = [this](const std::string& src) { return GetImage(src); };
+    // The memo describes worker_canvas only for this page at this size.
+    auto& memo = worker_map_memo;
+    if (memo.page != job.page_copy || memo.w != job.target_w || memo.h != job.target_h) {
+        memo.page = job.page_copy;
+        memo.w = job.target_w;
+        memo.h = job.target_h;
+        memo.maps.clear();
+    }
+    const u64 serial_start = CurrentRenderSerial();
+    const auto refreshed = [&](const MapDrawRecord* r) {
+        return r != nullptr && r->render_serial > serial_start;
+    };
+    // --- Marker-only redraw. A dirty candidate map whose last draw is fully on worker_canvas,
+    // drawn from the same inputs apart from the live marker's position and not from the clock,
+    // is repainted only inside the marker's old and new boxes (every widget there, in order, as
+    // any clipped pass does) instead of its whole rect. Whether the view really stayed put (the
+    // follow camera moves with the marker) is only known once the map has been drawn: the draw's
+    // own record is checked afterwards, and a map whose view or marker box came out different is
+    // then repainted whole from the follow state it started from -- so the pixels are always
+    // those of an ordinary whole-map redraw. ---
+    struct Narrowed {
+        size_t index;
+        std::array<s32, 4> predicted;
+        const Widget* widget;
+    };
+    std::vector<Narrowed> narrowed;
+    MapFollowState follow_before;
+    u64 follow_epoch_before = 0;
+    bool follow_saved = false;
+    const auto save_follow = [&] {
+        if (!follow_saved) {
+            std::scoped_lock lk{view_mutex};
+            follow_before = map_follow_state;
+            follow_epoch_before = follow_state_epoch;
+            follow_saved = true;
+        }
+    };
+    if (marker_redraw && job.partial && !job.gpu_composite && job.has_extras &&
+        touches_map_candidates && job.page_copy != nullptr) {
+        std::vector<std::array<s32, 4>> clips = job.extras.other_clips;
+        const auto& pw = job.page_copy->widgets;
+        save_follow();
+        for (const auto& cand : job.extras.maps) {
+            if (!cand.dirty) {
+                continue;
+            }
+            DrawnMapState* const st = memo.Find(cand.index);
+            bool ok = cand.index < pw.size() && st != nullptr && st->valid &&
+                      st->view_hash == cand.view_hash && !st->rec.clock_dependent;
+            std::array<s32, 4> predicted{};
+            if (ok) {
+                // Where the camera will be (FrameView on a copy of the follow state): a follow
+                // map that moves with the marker is repainted whole straight away.
+                const auto v = ProbeMapView(manifest, *job.page_copy, job.snapshot, pw[cand.index],
+                                            cand.index, job.views, follow_before);
+                ok = v.has_value() && SameMapView(*v, st->rec, false);
+            }
+            if (ok) {
+                predicted =
+                    PredictMapMarkerBox(manifest, pw[cand.index], job.snapshot, st->rec, images);
+                const auto& old_box = st->rec.marker_box;
+                // Nothing to paint for the marker (none drawn before or now): an ordinary redraw.
+                ok = (predicted[2] > 0 && predicted[3] > 0) || (old_box[2] > 0 && old_box[3] > 0);
+                if (ok) {
+                    if (predicted[2] > 0 && predicted[3] > 0) {
+                        clips.push_back(predicted);
+                    }
+                    if (old_box[2] > 0 && old_box[3] > 0) {
+                        clips.push_back(old_box);
+                    }
+                    narrowed.push_back({cand.index, predicted, &pw[cand.index]});
+                }
+            }
+            if (!ok) {
+                clips.push_back(cand.rect);
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+                ++nstats.fallback_maps;
+#endif
+            }
+        }
+        if (!narrowed.empty()) {
+            MergeDirtyRects(clips, static_cast<s32>(job.target_w), static_cast<s32>(job.target_h));
+            if (clips.empty()) {
+                // Everything clipped away (a marker entirely off the canvas): repaint as dispatched.
+                narrowed.clear();
+            } else {
+                job.extras.clips = std::move(clips);
+                job.extras.clip = RectsBox(job.extras.clips);
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+                nstats.narrowed_maps += narrowed.size();
+#endif
+            }
+        }
+    }
+    worker_timer.emplace(!narrowed.empty() ? marker_stats
+                         : touches_map_candidates || !job.partial ? map_stats
+                                                                  : worker_stats,
+                         !narrowed.empty()                        ? "redraw-worker(marker)"
+                         : touches_map_candidates || !job.partial ? "redraw-worker(map/page)"
+                                                                  : "redraw-worker");
+    if (verify_redraw && job.partial && !job.gpu_composite) {
+        save_follow();
+    }
     // Published into map_draw_records_published below on success, under map_records_mutex,
     // exactly mirroring what PublishUi's own synchronous branch does with the tick-thread-owned
     // map_draw_records member.
@@ -1179,52 +1626,223 @@ void ModRuntime::RunRedrawJob(RedrawJob& job) {
     // any other widget on the page redraws. Bound values the renderer's map rasterisation reads
     // (LookupBoundInt) come from this job.
     render_snapshot = &job.snapshot;
-    // A partial job with several disjoint dirty rects: one clipped pass per rect.
-    const bool multi = job.has_extras && job.partial && job.extras.clips.size() > 1;
-    RenderExtras pass_extras;
-    if (multi) {
-        pass_extras = job.extras;
-    }
-    bool ok = true;
-    for (size_t pass = 0; pass < (multi ? job.extras.clips.size() : size_t{1}); ++pass) {
+    const auto render_passes = [&](const RenderExtras& extras, bool use_extras, bool& animating) {
+        // A partial job with several disjoint dirty rects: one clipped pass per rect.
+        const bool multi = use_extras && job.partial && extras.clips.size() > 1;
+        RenderExtras pass_extras;
         if (multi) {
-            pass_extras.clip = job.extras.clips[pass];
+            pass_extras = extras;
         }
-        bool pass_animating = false;
-        ok = RenderPage(
-                 worker_canvas, manifest, *job.page_copy, job.snapshot,
-                 [this](const std::string& src) { return GetImage(src); }, job.views,
-                 &map_follow_state,
-                 // The REAL report_visit/follow_state: this call IS the one and only render for
-                 // this job, so it must drive the real fog-of-war reveal and the real camera
-                 // glide/pan, under the same locks the synchronous call uses: map_state_mutex
-                 // (MarkVisitedAt/GeometryMask, recursive-safe) and view_mutex (follow_state_mutex,
-                 // reused, matching RenderPageTo's own choice).
-                 [this](const std::string& area, float wx, float wy) {
-                     MarkVisitedAt(area, wx, wy);
-                 },
-                 [this](const std::string& area, float wx, float wy) {
-                     return IsVisited(area, wx, wy);
-                 },
-                 // An owned, by-value AuxDrawList (RedrawJob::draw_list) for a GPU_COMPOSITE page
-                 // -- RenderPage fills it during THIS call, off `worker_canvas`, exactly like the
-                 // synchronous carve-out's `&draw_list` fills the tick-thread member off `canvas`.
-                 // Never touches `ModRuntime::draw_list` (that stays exclusively owned by the
-                 // synchronous/kill-switch path).
-                 job.gpu_composite ? &job.draw_list : nullptr, &pass_animating,
-                 [this](const std::string& ref) { return GetMsbtText(ref); },
-                 &worker_map_draw_records,
-                 multi            ? &pass_extras
-                 : job.has_extras ? &job.extras
+        bool ok = true;
+        for (size_t pass = 0; pass < (multi ? extras.clips.size() : size_t{1}); ++pass) {
+            if (multi) {
+                pass_extras.clip = extras.clips[pass];
+            }
+            bool pass_animating = false;
+            ok = RenderPage(
+                     worker_canvas, manifest, *job.page_copy, job.snapshot, images, job.views,
+                     &map_follow_state,
+                     // The REAL report_visit/follow_state: this call IS the one and only render for
+                     // this job, so it must drive the real fog-of-war reveal and the real camera
+                     // glide/pan, under the same locks the synchronous call uses: map_state_mutex
+                     // (MarkVisitedAt/GeometryMask, recursive-safe) and view_mutex
+                     // (follow_state_mutex, reused, matching RenderPageTo's own choice).
+                     [this](const std::string& area, float wx, float wy) {
+                         MarkVisitedAt(area, wx, wy);
+                     },
+                     [this](const std::string& area, float wx, float wy) {
+                         return IsVisited(area, wx, wy);
+                     },
+                     // An owned, by-value AuxDrawList (RedrawJob::draw_list) for a GPU_COMPOSITE
+                     // page -- RenderPage fills it during THIS call, off `worker_canvas`, exactly
+                     // like the synchronous carve-out's `&draw_list` fills the tick-thread member
+                     // off `canvas`. Never touches `ModRuntime::draw_list` (that stays exclusively
+                     // owned by the synchronous/kill-switch path).
+                     job.gpu_composite ? &job.draw_list : nullptr, &pass_animating,
+                     [this](const std::string& ref) { return GetMsbtText(ref); },
+                     &worker_map_draw_records,
+                     multi        ? &pass_extras
+                     : use_extras ? &extras
                                   : nullptr,
-                 &view_mutex,
-                 // Same reuse as RenderPageTo's own call -- see
-                 // UpdateHiddenMarkers's own updated comment.
-                 &map_state_mutex) &&
-             ok;
-        animating = animating || pass_animating;
+                     &view_mutex,
+                     // Same reuse as RenderPageTo's own call -- see
+                     // UpdateHiddenMarkers's own updated comment.
+                     &map_state_mutex, &image_fallback_state) &&
+                 ok;
+            animating = animating || pass_animating;
+        }
+        return ok;
+    };
+    bool animating = false;
+    bool ok = render_passes(job.extras, job.has_extras, animating);
+    // Check each marker-only map against its own record (see above).
+    std::vector<std::array<s32, 4>> repaint;
+    for (const auto& n : narrowed) {
+        const MapDrawRecord* const r = FindRecord(worker_map_draw_records, n.index);
+        const DrawnMapState* const st = memo.Find(n.index);
+        const bool good = refreshed(r) && st != nullptr && SameMapView(*r, st->rec) &&
+                          !r->clock_dependent && RectInside(r->marker_box, n.predicted);
+        if (good) {
+            continue;
+        }
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+        ++nstats.failed_maps;
+#endif
+        const auto rect = std::ranges::find_if(job.extras.maps, [&n](const RenderMapCandidate& m) {
+                              return m.index == n.index;
+                          })->rect;
+        // The whole map, and every marker box this job or the last draw may have painted (the
+        // diamond is not clipped to the widget, so it can reach outside `rect`).
+        repaint.push_back(rect);
+        repaint.push_back(n.predicted);
+        if (st != nullptr) {
+            repaint.push_back(st->rec.marker_box);
+        }
+        if (r != nullptr) {
+            repaint.push_back(r->marker_box);
+        }
+        // Back to the follow state this job started from, for this widget only (its glide
+        // step and pan correction are taken again by the repaint) -- unless another thread reset
+        // or consumed follow state meanwhile (a manifest reload, a page transition's
+        // ApplyViewCorrections): then the repaint steps on from what is there now.
+        const std::string vkey = n.widget->id.empty()
+                                     ? job.page_copy->id + "#" + std::to_string(n.index)
+                                     : n.widget->id;
+        const auto mine = [&vkey](const std::string& key) {
+            return key == vkey + "#pan" ||
+                   (key.size() > vkey.size() && key.compare(0, vkey.size(), vkey) == 0 &&
+                    key[vkey.size()] == '@');
+        };
+        std::scoped_lock lk{view_mutex};
+        if (follow_state_epoch != follow_epoch_before) {
+            continue;
+        }
+        std::erase_if(map_follow_state, [&mine](const auto& kv) { return mine(kv.first); });
+        for (const auto& [k, v] : follow_before) {
+            if (mine(k)) {
+                map_follow_state[k] = v;
+            }
+        }
+    }
+    if (!repaint.empty()) {
+        MergeDirtyRects(repaint, static_cast<s32>(job.target_w), static_cast<s32>(job.target_h));
+        RenderExtras again = job.extras;
+        again.clips = repaint;
+        again.clip = RectsBox(repaint);
+        ok = render_passes(again, true, animating) && ok;
+        job.extras.clips.insert(job.extras.clips.end(), repaint.begin(), repaint.end());
+        MergeDirtyRects(job.extras.clips, static_cast<s32>(job.target_w),
+                        static_cast<s32>(job.target_h));
+        job.extras.clip = RectsBox(job.extras.clips);
     }
     render_snapshot = nullptr;
+    // What worker_canvas now holds of each candidate map.
+    for (const auto& cand : job.extras.maps) {
+        const MapDrawRecord* const r = FindRecord(worker_map_draw_records, cand.index);
+        DrawnMapState* st = memo.Find(cand.index);
+        if (st == nullptr) {
+            st = &memo.maps.emplace_back();
+            st->index = cand.index;
+        }
+        // Painted whole this job: a page draw, its rect was dirty (and not narrowed, or repainted
+        // after a failed check), or narrowed and checked.
+        const bool whole = !job.partial || !ok ||
+                           (cand.dirty && std::ranges::none_of(narrowed, [&](const Narrowed& n) {
+                                return n.index == cand.index;
+                            })) ||
+                           std::ranges::any_of(repaint, [&](const auto& rr) {
+                               return RectInside(cand.rect, rr);
+                           });
+        const bool checked_narrow =
+            std::ranges::any_of(narrowed, [&](const Narrowed& n) { return n.index == cand.index; });
+        if (!ok) {
+            st->valid = false;
+        } else if (whole || checked_narrow) {
+            st->valid = refreshed(r);
+            if (st->valid) {
+                st->rec = *r;
+                st->view_hash = cand.view_hash;
+            }
+        } else if (refreshed(r)) {
+            // Not dirty, but some other rect overlapped it: still whole only if that pass drew it
+            // exactly as it was.
+            st->valid = st->valid && SameMapView(*r, st->rec) && r->marker_box == st->rec.marker_box;
+        }
+    }
+    if (!job.partial) {
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+        ++nstats.full_jobs;
+#endif
+    }
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+    ++nstats.jobs;
+#endif
+    // Not on the GPU-composite path: its canvas is only the HUD overlay over the map quads.
+    if (verify_redraw && job.partial && ok && !job.gpu_composite && job.page_copy != nullptr) {
+        // The same state drawn whole, from the follow state this job started from.
+        static thread_local Canvas full;
+        full.Resize(job.target_w, job.target_h);
+        full.SetFont(job.font_atlas.get(), job.font_metrics_copy.get());
+        full.SetFontPages(job.font_pages.get());
+        full.SetIconFont(job.icon_atlas.get(), job.icon_metrics_copy.get(), job.icon_pending);
+        MapFollowState follow = follow_before;
+        MapDrawRecords records;
+        render_snapshot = &job.snapshot;
+        (void)RenderPage(
+            full, manifest, *job.page_copy, job.snapshot, images, job.views, &follow,
+            [](const std::string&, float, float) {},
+            [this](const std::string& area, float wx, float wy) { return IsVisited(area, wx, wy); },
+            nullptr, nullptr, [this](const std::string& ref) { return GetMsbtText(ref); }, &records,
+            nullptr, nullptr, &map_state_mutex,
+            // Same image_fallback_state as the real pass, not null: both passes must agree on
+            // which picture a pending-decode/mid-fade widget draws, or this verification diff
+            // would flag the very continuity this state exists to provide as a mismatch.
+            &image_fallback_state);
+        render_snapshot = nullptr;
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+        ++nstats.verified;
+#endif
+        size_t diff = 0;
+        s32 bx0 = std::numeric_limits<s32>::max(), by0 = bx0, bx1 = -1, by1 = -1;
+        const auto a = worker_canvas.Pixels();
+        const auto b = full.Pixels();
+        for (size_t p = 0; p < a.size() && p < b.size(); ++p) {
+            if (a[p] != b[p]) {
+                ++diff;
+                const s32 px = static_cast<s32>(p % job.target_w);
+                const s32 py = static_cast<s32>(p / job.target_w);
+                bx0 = std::min(bx0, px);
+                by0 = std::min(by0, py);
+                bx1 = std::max(bx1, px);
+                by1 = std::max(by1, py);
+            }
+        }
+        if (diff != 0) {
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+            ++nstats.mismatched;
+#endif
+            LOG_WARNING(Core,
+                        "DSMod verify-redraw: partial job ({} narrowed map(s), {} repainted) "
+                        "differs from a full redraw in {} px within [{},{} {}x{}]",
+                        narrowed.size(), repaint.size(), diff, bx0, by0, bx1 - bx0 + 1,
+                        by1 - by0 + 1);
+        }
+    }
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
+    if (const auto now = std::chrono::steady_clock::now();
+        now - nstats.window >= std::chrono::seconds{5}) {
+        if ((RuntimeProfileEnabled() || verify_redraw) &&
+            (nstats.narrowed_maps != 0 || nstats.fallback_maps != 0 || nstats.verified != 0)) {
+            LOG_INFO(Core,
+                     "DSMod redraw worker 5s: {} jobs ({} full), map marker-only {} (checked "
+                     "failed {}), whole-map {}; verify {} partial jobs, {} mismatched",
+                     nstats.jobs, nstats.full_jobs, nstats.narrowed_maps, nstats.failed_maps,
+                     nstats.fallback_maps, nstats.verified, nstats.mismatched);
+        }
+        nstats = NarrowStats{};
+        nstats.window = now;
+    }
+#endif
     redraw_completed_generation.store(job.generation, std::memory_order_release);
     if (!ok) {
         // Matches RenderPageTo's own precedent (mod_runtime.h's map_draw_records_published
@@ -1238,7 +1856,8 @@ void ModRuntime::RunRedrawJob(RedrawJob& job) {
     // Has the tick thread taken authority
     // over the screen since this job was dispatched (a page transition started, or a synchronous
     // GPU_COMPOSITE/debug-page/sync_redraw carve-out published directly)? Both bump
-    // redraw_dispatch_generation when they do. A mismatch here means this job's render -- and its
+    // redraw_authority_generation when they do (a newer dispatch alone does not: runtime 13, see
+    // its declaration comment). A mismatch here means this job's render -- and its
     // map_draw_records -- are for a page/state the tick thread has already moved past; publishing
     // either would silently overwrite something newer (map_draw_records: wrong-page tap
     // hit-testing; the aux publish: stale pixels replacing a transition's or the synchronous
@@ -1246,7 +1865,8 @@ void ModRuntime::RunRedrawJob(RedrawJob& job) {
     // a source of any other ordering guarantee -- consistent with the relaxed fetch_add at every
     // bump site and with DispatchRedraw's own pre-existing tolerance for skipping an intermediate
     // frame.
-    const bool stale = job.generation != redraw_dispatch_generation.load(std::memory_order_relaxed);
+    const bool stale =
+        job.authority != redraw_authority_generation.load(std::memory_order_relaxed);
     if (!stale) {
         std::scoped_lock rlk{map_records_mutex};
         // Copies OUT of the persistent worker_map_draw_records accumulator (see its own
@@ -1266,6 +1886,10 @@ void ModRuntime::RunRedrawJob(RedrawJob& job) {
         dispatch_animating.store(true, std::memory_order_relaxed);
     }
     if (stale) {
+        // Do not publish superseded pixels now -- but they ARE in worker_canvas, and the job that
+        // superseded this one only repaints (and publishes) its own dirty region: remember ours
+        // so the next published job publishes it as well (UnpublishedRegions).
+        worker_unpublished.Note(job.extras, job.partial);
         return; // see the staleness check above -- do not publish superseded pixels
     }
     // The actual publish, off the tick thread -- safe because AuxRouting's publish boundary is
@@ -1278,15 +1902,81 @@ void ModRuntime::RunRedrawJob(RedrawJob& job) {
     // needs the ordinary path to retire any stale composite and show its HUD-only canvas).
     auto& aux = system.GPU().DSModAux();
     if (job.gpu_composite && job.draw_list.active) {
-        PublishGpuComposite(job.draw_list, worker_canvas);
+        worker_unpublished.Clear(); // the composite publishes the whole HUD canvas
+        // Only this job's dirty rect of the HUD changed when the job is partial and the previous
+        // job published this canvas the same way (anything else -- a stale or failed job, a
+        // canvas-path publish -- leaves hud_synced false: the whole HUD is compared).
+        const bool rect_only =
+            hud_synced && job.partial && job.extras.clip[2] > 0 && job.extras.clip[3] > 0;
+        PublishGpuComposite(job.draw_list, worker_canvas, rect_only ? &job.extras.clip : nullptr);
+        worker_hud_synced = true;
         return;
     }
     aux.ClearComposite();
-    if (job.partial) {
+    bool partial = job.partial;
+    if (partial && !worker_unpublished.Empty()) {
+        partial = worker_unpublished.Apply(job.extras, static_cast<s32>(worker_canvas.Width()),
+                                           static_cast<s32>(worker_canvas.Height()));
+    }
+    if (partial) {
         PublishPartial(aux, worker_canvas, job.extras);
     } else {
+        worker_unpublished.Clear();
         aux.PublishUi(worker_canvas.Width(), worker_canvas.Height(), worker_canvas.Pixels());
     }
+}
+
+void UnpublishedRegions::Note(const RenderExtras& extras, bool partial) {
+    if (!partial || extras.clip[2] <= 0 || extras.clip[3] <= 0) {
+        // A full redraw (or a partial job without a clip, i.e. the whole canvas).
+        full = true;
+        rects.clear();
+        return;
+    }
+    if (full) {
+        return;
+    }
+    if (extras.clips.empty()) {
+        rects.push_back(extras.clip);
+    } else {
+        rects.insert(rects.end(), extras.clips.begin(), extras.clips.end());
+    }
+    if (rects.size() > MaxRects) {
+        // Bounded: many stale jobs in a row without a publish in between is a full repaint anyway.
+        full = true;
+        rects.clear();
+    }
+}
+
+bool UnpublishedRegions::Apply(RenderExtras& extras, s32 canvas_w, s32 canvas_h) {
+    if (full) {
+        Clear();
+        return false;
+    }
+    if (rects.empty()) {
+        return true;
+    }
+    if (extras.clips.empty()) {
+        extras.clips.push_back(extras.clip);
+    }
+    extras.clips.insert(extras.clips.end(), rects.begin(), rects.end());
+    MergeDirtyRects(extras.clips, canvas_w, canvas_h);
+    s32 x0 = std::numeric_limits<s32>::max(), y0 = x0;
+    s32 x1 = std::numeric_limits<s32>::min(), y1 = x1;
+    for (const auto& r : extras.clips) {
+        if (r[2] <= 0 || r[3] <= 0) {
+            continue;
+        }
+        x0 = std::min(x0, r[0]);
+        y0 = std::min(y0, r[1]);
+        x1 = std::max(x1, r[0] + r[2]);
+        y1 = std::max(y1, r[1] + r[3]);
+    }
+    if (x1 > x0 && y1 > y0) {
+        extras.clip = {x0, y0, x1 - x0, y1 - y0};
+    }
+    Clear();
+    return true;
 }
 
 namespace {
@@ -1318,7 +2008,7 @@ std::array<s32, 4> WidgetEffectiveRect(const Widget& w, u32 canvas_w, u32 canvas
         const s32 cw = static_cast<s32>(canvas_w), ch = static_cast<s32>(canvas_h);
         if (w.type == WidgetType::Image) {
             const s32 side = std::max(64, std::min(cw, ch) / 3);
-            const s32 pad = WidgetDrawOverhang(w, side, side);
+            const s32 pad = WidgetDrawOverhang(w, side, side, &snapshot);
             return {(cw - side) / 2 - pad, (ch - side) / 2 - pad, side + 2 * pad, side + 2 * pad};
         }
         return {0, 0, cw, ch};
@@ -1360,7 +2050,7 @@ std::array<s32, 4> WidgetEffectiveRect(const Widget& w, u32 canvas_w, u32 canvas
     }
     // A spinning or trembling picture paints outside its own rect (the rotated corners, the shake
     // offset): its dirty box must cover that too, or its edge pixels go stale.
-    if (const s32 pad = WidgetDrawOverhang(w, r[2], r[3]); pad > 0) {
+    if (const s32 pad = WidgetDrawOverhang(w, r[2], r[3], &snapshot); pad > 0) {
         r = {r[0] - pad, r[1] - pad, r[2] + 2 * pad, r[3] + 2 * pad};
     }
     // Text can run past the fixed box above (a longer string than ~16 glyphs, a font taller than
@@ -1384,6 +2074,12 @@ std::array<s32, 4> WidgetEffectiveRect(const Widget& w, u32 canvas_w, u32 canvas
                 const s32 y1 = std::max(r[1] + r[3], t[1] + t[3]);
                 r = {x0, y0, x1 - x0, y1 - y0};
             }
+        }
+        // Outline ring and rising glyphs paint outside the plain text bound.
+        if (w.text_outline_px > 0 || w.text_rise != 0.0f) {
+            const s32 pad = w.text_outline_px + 1;
+            const s32 lift = static_cast<s32>(std::ceil(std::fabs(w.text_rise) * 32.0f));
+            r = {r[0] - pad, r[1] - pad - lift, r[2] + 2 * pad, r[3] + 2 * pad + lift};
         }
     }
     return r;
@@ -1488,6 +2184,40 @@ std::array<s32, 4> RepeatTemplateUnionRect(const Widget& w, const Page& page) {
     }
     return {x0, y0, x1 - x0, y1 - y0};
 }
+
+/// Whether the redraw worker may repaint a Map widget marker-only (RenderExtras::maps): a plain
+/// Map with a live marker whose rect never moves (no x_bind/y_bind, no widget group) and whose
+/// expanded index is its own (no repeat template before it on the page, so the index RenderPage
+/// keys its record and follow state by is `index`).
+bool MarkerOnlyCandidate(const Widget& w) {
+    return w.type == WidgetType::Map && w.repeat <= 0 && w.x_bind.empty() && w.y_bind.empty() &&
+           !w.anim && !w.marker_x_bind.empty() && !w.marker_y_bind.empty() && w.rect[2] > 0 &&
+           w.rect[3] > 0;
+}
+
+s64 RectsArea(const std::vector<std::array<s32, 4>>& rects) {
+    s64 a = 0;
+    for (const auto& r : rects) {
+        a += static_cast<s64>(std::max(0, r[2])) * std::max(0, r[3]);
+    }
+    return a;
+}
+
+std::array<s32, 4> RectsBox(const std::vector<std::array<s32, 4>>& rects) {
+    s32 x0 = std::numeric_limits<s32>::max(), y0 = x0;
+    s32 x1 = std::numeric_limits<s32>::min(), y1 = x1;
+    for (const auto& r : rects) {
+        if (r[2] <= 0 || r[3] <= 0) {
+            continue;
+        }
+        x0 = std::min(x0, r[0]);
+        y0 = std::min(y0, r[1]);
+        x1 = std::max(x1, r[0] + r[2]);
+        y1 = std::max(y1, r[1] + r[3]);
+    }
+    return x1 > x0 && y1 > y0 ? std::array<s32, 4>{x0, y0, x1 - x0, y1 - y0}
+                              : std::array<s32, 4>{};
+}
 } // namespace
 
 std::array<s32, 4> ModRuntime::BuildRenderExtras(const StateSnapshot& snapshot,
@@ -1495,6 +2225,22 @@ std::array<s32, 4> ModRuntime::BuildRenderExtras(const StateSnapshot& snapshot,
                                                  u32 target_h) {
     render_extras.groups.clear();
     render_extras.clips.clear();
+    render_extras.other_clips.clear();
+    for (auto& m : render_extras.maps) {
+        m.dirty = false;
+    }
+    // Rects of the marker-only candidate Map widgets (RenderExtras::maps) that are dirty: kept
+    // apart from `clips` until the end, so `other_clips` can be everything else.
+    std::vector<std::array<s32, 4>> map_rects;
+    const auto candidate = [this](size_t i) -> RenderMapCandidate* {
+        for (auto& m : render_extras.maps) {
+            if (m.index == i) {
+                return &m;
+            }
+        }
+        return nullptr;
+    };
+    bool rebased = false;
     s32 x0 = std::numeric_limits<s32>::max(), y0 = x0;
     s32 x1 = std::numeric_limits<s32>::min(), y1 = x1;
     // Every contribution is kept as its own rect too (render_extras.clips, merged below into a
@@ -1566,11 +2312,11 @@ std::array<s32, 4> ModRuntime::BuildRenderExtras(const StateSnapshot& snapshot,
     // rect, one RenderPage call, not two passes. Kill switch: EDEN_DSMOD_FORCE_FULL_REDRAW=1 skips
     // this whole block, degrading to exactly the group-box-only behaviour above -- a field problem
     // in this new path can be diagnosed by setting the env var, no rebuild required. ---
-    static const bool force_full_redraw = [] {
-        const char* v = std::getenv("EDEN_DSMOD_FORCE_FULL_REDRAW");
-        return v != nullptr && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
-               std::strcmp(v, "FALSE") != 0;
-    }();
+    static const bool force_full_redraw =
+        VideoCore::DSMod::DsmodEnvFlag("EDEN_DSMOD_FORCE_FULL_REDRAW", false);
+    if (force_full_redraw) {
+        render_extras.maps.clear();
+    }
     if (!force_full_redraw && current_page < manifest.pages.size() && target_w > 0 &&
         target_h > 0) {
         const auto& page = manifest.pages[current_page];
@@ -1627,6 +2373,13 @@ std::array<s32, 4> ModRuntime::BuildRenderExtras(const StateSnapshot& snapshot,
                                               text_font, false);
                 if (widgets[i].repeat > 0) {
                     RebuildRepeatState(i, snapshot, target_w, target_h);
+                }
+            }
+            rebased = true;
+            render_extras.maps.clear();
+            for (size_t i = 0; i < widgets.size() && widgets[i].repeat <= 0; ++i) {
+                if (MarkerOnlyCandidate(widgets[i])) {
+                    render_extras.maps.push_back({i, widgets[i].rect, 0, false});
                 }
             }
             widget_sig_page = current_page;
@@ -1694,6 +2447,18 @@ std::array<s32, 4> ModRuntime::BuildRenderExtras(const StateSnapshot& snapshot,
                                       ? RepeatTemplateRect(w, page)
                                       : WidgetEffectiveRect(w, target_w, target_h, snapshot,
                                                             manifest, text_font, false);
+                if (RenderMapCandidate* const m = candidate(i);
+                    m != nullptr && rect == widget_last_rect[i] && rect == m->rect) {
+                    // Its rect is fixed: kept apart (see map_rects), in the union all the same.
+                    m->dirty = true;
+                    widget_sig[i] = h;
+                    x0 = std::min(x0, rect[0]);
+                    y0 = std::min(y0, rect[1]);
+                    x1 = std::max(x1, rect[0] + rect[2]);
+                    y1 = std::max(y1, rect[1] + rect[3]);
+                    map_rects.push_back(rect);
+                    continue;
+                }
                 const auto& prev = widget_last_rect[i];
                 if (prev[2] > 0 && prev[3] > 0) {
                     add_rect(prev[0], prev[1], prev[2], prev[3]);
@@ -1709,20 +2474,67 @@ std::array<s32, 4> ModRuntime::BuildRenderExtras(const StateSnapshot& snapshot,
             }
         }
     }
+    if (!force_full_redraw && current_page < manifest.pages.size() && target_w > 0 &&
+        target_h > 0 && widget_sig_page == current_page) {
+        const auto& widgets = manifest.pages[current_page].widgets;
+        // A follow-view glide still in flight (RenderExtras::glide_owed): every visible Map widget
+        // is redrawn, as nothing bound changed for it.
+        if (render_extras.glide_owed) {
+            const FontMetrics* const text_font = font_metrics.Valid() ? &font_metrics : nullptr;
+            for (size_t i = 0; i < widgets.size(); ++i) {
+                const Widget& w = widgets[i];
+                if (w.type != WidgetType::Map || WidgetHidden(w, snapshot)) {
+                    continue;
+                }
+                if (RenderMapCandidate* const m = candidate(i); m != nullptr) {
+                    if (!m->dirty) {
+                        m->dirty = true;
+                        x0 = std::min(x0, m->rect[0]);
+                        y0 = std::min(y0, m->rect[1]);
+                        x1 = std::max(x1, m->rect[0] + m->rect[2]);
+                        y1 = std::max(y1, m->rect[1] + m->rect[3]);
+                        map_rects.push_back(m->rect);
+                    }
+                    continue;
+                }
+                const auto r =
+                    WidgetEffectiveRect(w, target_w, target_h, snapshot, manifest, text_font, false);
+                if (r[2] > 0 && r[3] > 0) {
+                    add_rect(r[0], r[1], r[2], r[3]);
+                }
+            }
+        }
+        // Each candidate's view hash, as of this snapshot (unchanged while nothing may be dirty).
+        if (widgets_may_be_dirty || rebased) {
+            const auto& page = manifest.pages[current_page];
+            for (auto& m : render_extras.maps) {
+                if (m.index < widgets.size()) {
+                    hash_without_marker = true;
+                    m.view_hash = WidgetDependencyHash(widgets[m.index], snapshot, page.id, m.index);
+                    hash_without_marker = false;
+                }
+            }
+        }
+    }
     if (x1 <= x0 || y1 <= y0) {
         render_extras.clips.clear();
         return {0, 0, 0, 0};
     }
+    render_extras.other_clips = render_extras.clips;
+    MergeDirtyRects(render_extras.other_clips, static_cast<s32>(target_w),
+                    static_cast<s32>(target_h));
+    render_extras.clips.insert(render_extras.clips.end(), map_rects.begin(), map_rects.end());
     MergeDirtyRects(render_extras.clips, static_cast<s32>(target_w), static_cast<s32>(target_h));
     return {x0, y0, x1 - x0, y1 - y0};
 }
 
-void ModRuntime::PublishGpuComposite(AuxDrawList& dl, Canvas& hud_canvas) {
+void ModRuntime::PublishGpuComposite(AuxDrawList& dl, Canvas& hud_canvas,
+                                     const std::array<s32, 4>* hud_dirty) {
     static thread_local RuntimeStageStats stats;
     const RuntimeStageTimer timer{stats, "map-composite"};
     // Everything from here down touches `last_map_key`/`last_map_stamp`/
     // `last_pulse_key`/`last_pulse_present`/`map_fade_weights`/`last_map_fade_epoch`/
-    // `atlas_published`/`last_hud_hash`/`last_composite_weight`/`last_map_composite_epoch` --
+    // `last_atlas_key`/`last_hud_hash`/`last_composite_weight`/`last_map_composite_epoch` --
     // plain ModRuntime members this function is the ONLY normal-path writer of, but not
     // implicitly single-threaded since the worker can call this too (see `gpu_composite_mutex`'s
     // own comment: the one real cross-thread writer is the console "reload" reset, not concurrent
@@ -1865,12 +2677,16 @@ void ModRuntime::PublishGpuComposite(AuxDrawList& dl, Canvas& hud_canvas) {
             std::erase_if(dl.quads, [](const auto& q) { return q.slot == 3; });
         }
     }
-    // Icon atlas (slot 1): a constant sheet, upload once.
-    if (!atlas_published && !dl.atlas_key.empty()) {
+    // Icon atlas (slot 1): uploaded when the sheet the map drew from is not the one there already
+    // -- another key (a second map widget's marker_src, an atlas that landed later) or the same
+    // key decoded again. A constant sheet uploads once.
+    if (!dl.atlas_key.empty()) {
         if (const std::shared_ptr<const Image> a = GetImage(dl.atlas_key);
-            a != nullptr && a->Valid()) {
+            a != nullptr && a->Valid() &&
+            (a != last_atlas_image || dl.atlas_key != last_atlas_key)) {
             aux.PublishAuxTexture(1, a->w, a->h, a->pixels);
-            atlas_published = true;
+            last_atlas_key = dl.atlas_key;
+            last_atlas_image = a;
         }
     }
     // HUD overlay (slot 2): the canvas holds only the HUD (transparent elsewhere); re-upload only
@@ -1879,15 +2695,26 @@ void ModRuntime::PublishGpuComposite(AuxDrawList& dl, Canvas& hud_canvas) {
     // Reads `hud_canvas`, not the tick-thread's own `canvas` -- see this function's own
     // declaration comment (mod_runtime.h) for why the caller picks which Canvas that is.
     {
-        // A full-content hash (every byte), ~4x faster than the per-pixel FNV it replaced.
         const std::vector<u32>& px = hud_canvas.Pixels();
-        u64 h =
-            Common::CityHash64(reinterpret_cast<const char*>(px.data()), px.size() * sizeof(u32));
-        h ^= px.size();
-        if (h != last_hud_hash) {
-            aux.PublishAuxTexture(2, hud_canvas.Width(), hud_canvas.Height(), px);
-            last_hud_hash = h;
+        if (hud_dirty != nullptr && hud_slot_canvas == &hud_canvas) {
+            // A partial redraw of the canvas slot 2 was last published from: only its dirty rect
+            // can differ, so neither the whole-canvas hash (~5 MB read) nor a whole-canvas diff
+            // under the lock the render thread takes every frame is needed.
+            aux.PublishAuxTextureRects(2, hud_canvas.Width(), hud_canvas.Height(), px,
+                                       std::span<const std::array<s32, 4>>{hud_dirty, 1});
+            last_hud_hash_valid = false; // the hash no longer describes slot 2
+        } else {
+            // A full-content hash (every byte), ~4x faster than the per-pixel FNV it replaced.
+            u64 h = Common::CityHash64(reinterpret_cast<const char*>(px.data()),
+                                       px.size() * sizeof(u32));
+            h ^= px.size();
+            if (!last_hud_hash_valid || h != last_hud_hash || hud_slot_canvas != &hud_canvas) {
+                aux.PublishAuxTexture(2, hud_canvas.Width(), hud_canvas.Height(), px);
+                last_hud_hash = h;
+                last_hud_hash_valid = true;
+            }
         }
+        hud_slot_canvas = &hud_canvas;
     }
     // Append the HUD overlay as a final full-canvas quad (slot 2), drawn last so the HUD strip
     // and area label sit on top of the map/icons/marker; transparent everywhere else.

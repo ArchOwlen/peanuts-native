@@ -1,4 +1,4 @@
-# peanuts_rt: the Eden Duo DSMod companion runtime lifted out of the emulator (dm/peanuts/rt/mods,
+# peanuts_rt: the Eden Duo DSMod companion runtime (v1.3.5.1, runtime 24) lifted out of the emulator (dm/peanuts/rt/mods,
 # original file names) behind a set of shim headers (dm/peanuts/rt/shim) and a tiny C API
 # (peanuts_rt.h). Builds as a static library for Linux hosts and arm64 Android (NDK toolchain).
 #
@@ -30,17 +30,31 @@ file(CREATE_LINK ${PNRT_DIR}/mods ${PNRT_INC_ROOT}/core/mods SYMBOLIC)
 set(PNRT_LIFTED
   mods/mod_actions.cpp
   mods/mod_assets.cpp
+  mods/mod_clock.cpp
+  mods/mod_expr.cpp
+  mods/mod_font_pages.cpp
+  mods/mod_host_values.cpp
   mods/mod_input.cpp
   mods/mod_load_plan.cpp
   mods/mod_manifest.cpp
   mods/mod_map.cpp
+  mods/mod_module.cpp
+  mods/mod_module_host.cpp
+  mods/mod_module_services.cpp
   mods/mod_msbt.cpp
+  mods/mod_nav.cpp
   mods/mod_nx_assets.cpp
   mods/mod_nx_runtime.cpp
   mods/mod_pages.cpp
+  mods/mod_persist.cpp
   mods/mod_redraw.cpp
+  mods/mod_romfs_sources.cpp
   mods/mod_runtime.cpp
+  mods/mod_settings.cpp
+  mods/mod_sources.cpp
   mods/mod_state.cpp
+  mods/mod_sysfont_source.cpp
+  mods/mod_texture_readback.cpp
   mods/mod_ui.cpp
   mods/mod_ui_canvas.cpp
   mods/mod_ui_expand.cpp
@@ -50,12 +64,14 @@ set(PNRT_LIFTED
   mods/mod_ui_text.cpp
   mods/mod_ui_transitions.cpp
   mods/mod_ui_widget_state.cpp
+  mods/mod_user_source.cpp
 )
 
 add_library(peanuts_rt STATIC
   ${PNRT_LIFTED}
   mods/pnrt_stubs.cpp
   shim/shim.cpp
+  shim/shim_r5.cpp
   shim/stb_impl.cpp
   ${PNRT_THIRD_PARTY}/bc_decoder/bc_decoder.cpp
   ${PNRT_THIRD_PARTY}/astc/video_core/textures/astc.cpp
@@ -71,7 +87,8 @@ target_compile_options(peanuts_rt PRIVATE -fvisibility=hidden -fvisibility-inlin
   -Wall -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable
   -Wno-missing-field-initializers)
 find_package(Threads REQUIRED)
-target_link_libraries(peanuts_rt PUBLIC Threads::Threads)
+# dlopen (mod_module.cpp loads a package's native module through Common::DynamicLibrary).
+target_link_libraries(peanuts_rt PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 find_package(ZLIB)
 if(ZLIB_FOUND)
   target_link_libraries(peanuts_rt PUBLIC ZLIB::ZLIB)

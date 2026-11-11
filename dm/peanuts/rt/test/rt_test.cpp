@@ -2,6 +2,13 @@
 // the rendered pages to PNG files.
 //
 //   rt_test <package dir> <out dir> [romfs dir]
+//   rt_test --module <package dir> <out dir> <title id hex> <build id hex> [page id...]
+//
+// The second form (R5) drives a package that ships a native module (dualscreen/modules/
+// <platform>/<TITLEID>.so, e.g. Fire Emblem: Three Houses): the runtime must accept the package
+// (no "update required" page), load the host platform's module through dlopen, and render the
+// default page plus every page named, with fake (all-zero) guest memory and no romfs. Writes
+// <out>/default.png and <out>/<page>.png; fails when the status line reports no module.
 //
 // Writes <out>/standby.png and <out>/gear.png (the Link's Awakening pages; "romfs:" art is blank
 // without a romfs dir), then <out>/probe.png from a tiny generated package whose page shows the
@@ -10,6 +17,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -218,7 +226,57 @@ std::string WriteProbePackage(const std::filesystem::path& out_dir) {
 
 } // namespace
 
+int RunModuleMode(int argc, char** argv) {
+    if (argc < 6) {
+        std::fprintf(stderr,
+                     "usage: rt_test --module <package dir> <out dir> <title hex> <build hex> [page...]\n");
+        return 2;
+    }
+    const std::string package_dir = argv[2];
+    const std::filesystem::path out_dir = argv[3];
+    const uint64_t title = std::strtoull(argv[4], nullptr, 16);
+    const char* build = argv[5];
+    std::filesystem::create_directories(out_dir);
+    FakeMemory mem;
+    mem.regions[MainBase] = std::vector<uint8_t>(MainSize, 0);
+    PnRtConfig cfg = MakeConfig(mem, package_dir, nullptr);
+    cfg.title_id = title;
+    cfg.build_id_hex = build;
+    cfg.panel_w = 1240;
+    cfg.panel_h = 1080;
+    const std::string data_dir = (out_dir / "data").string();
+    cfg.data_dir = data_dir.c_str();
+    PnRt* rt = pn_rt_create(&cfg);
+    if (rt == nullptr) {
+        std::fprintf(stderr, "rt_test: pn_rt_create failed for %s\n", package_dir.c_str());
+        return 1;
+    }
+    int failures = 0;
+    failures += !RenderPage(rt, nullptr, out_dir / "default.png");
+    char status[512];
+    pn_rt_status(rt, status, sizeof(status));
+    std::printf("rt_test: module status: %s\n", status);
+    if (std::strstr(status, "module=none") != nullptr || std::strstr(status, "module=error") != nullptr) {
+        std::fprintf(stderr, "rt_test: FAILED: the native module did not load\n");
+        ++failures;
+    }
+    if (std::strstr(status, "page=update_required") != nullptr ||
+        std::strstr(status, "page=idle") != nullptr) {
+        std::fprintf(stderr, "rt_test: FAILED: the package was not accepted (%s)\n", status);
+        ++failures;
+    }
+    for (int i = 6; i < argc; ++i) {
+        failures += !RenderPage(rt, argv[i], out_dir / (std::string{argv[i]} + ".png"));
+    }
+    pn_rt_destroy(rt);
+    std::printf("rt_test: %s\n", failures == 0 ? "OK" : "FAILED");
+    return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::strcmp(argv[1], "--module") == 0) {
+        return RunModuleMode(argc, argv);
+    }
     if (argc < 3) {
         std::fprintf(stderr, "usage: rt_test <package dir> <out dir> [romfs dir]\n");
         return 2;

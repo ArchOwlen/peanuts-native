@@ -18,8 +18,29 @@ struct EdenDsmodFontExtensions;
 struct EdenDsmodModuleSaveExtensions;
 struct EdenDsmodModuleWriteExtensions;
 struct EdenDsmodModuleDataExtensions;
+struct EdenDsmodModuleTextureExtensions;
 
 namespace Core::Mods {
+
+/// Runtime 16: the longest module image key ("module:..." string) the host passes to load_image
+/// (was 256 through runtime 15). Longer keys are refused before they reach the module.
+inline constexpr size_t MaxModuleImageKey = 4096;
+[[nodiscard]] inline bool ModuleImageKeyOk(std::string_view key) {
+    return key.size() <= MaxModuleImageKey;
+}
+
+/// The longest module action name the host passes to on_action.
+inline constexpr size_t MaxModuleActionName = 256;
+
+/// What a module action call came to (runtime 16: Declined makes the action Refused).
+enum class ModuleActionOutcome : u8 {
+    NotRun,   ///< no module instance or on_action, or an empty / over-long name
+    Accepted, ///< on_action returned true
+    Declined, ///< on_action returned false or threw
+};
+/// Calls `extensions->on_action(instance, name, argument)` and classifies the result.
+ModuleActionOutcome CallModuleAction(const EdenDsmodModuleExtensions* extensions, void* instance,
+                                     const std::string& name, s64 argument);
 
 // Android supplies an app-private code-cache directory before a game starts. Desktop uses the
 // regular cache directory. Installed mod assets remain in the existing load/<title>/<mod> tree.
@@ -56,6 +77,15 @@ public:
     const EdenDsmodModuleDataExtensions* DataExtensions() const {
         return data_extensions;
     }
+    // Runtime 24: absent (nullptr) for a module that reads no GPU textures. Offered to the
+    // module only when its package's manifest also declares "module": {"texture_readback": true}
+    // (TextureReadbackDeclared).
+    const EdenDsmodModuleTextureExtensions* TextureExtensions() const {
+        return texture_extensions;
+    }
+    bool TextureReadbackDeclared() const {
+        return texture_readback_declared;
+    }
     GameModule(const GameModule&) = delete;
     GameModule& operator=(const GameModule&) = delete;
 
@@ -68,6 +98,8 @@ private:
     const EdenDsmodModuleSaveExtensions* save_extensions{};
     const EdenDsmodModuleWriteExtensions* write_extensions{};
     const EdenDsmodModuleDataExtensions* data_extensions{};
+    const EdenDsmodModuleTextureExtensions* texture_extensions{};
+    bool texture_readback_declared{};
     std::filesystem::path staging_directory;
 };
 

@@ -1,16 +1,19 @@
-# peanuts_rt port notes (R1a)
+# peanuts_rt port notes (R1a .. R5)
 
-The Eden Duo DSMod companion runtime (`~/eden/src/core/mods`, branch `dsmod`, HEAD
-`c6541721fa`) lifted into a standalone static library. Layout:
+The Eden Duo DSMod companion runtime (`~/eden/src/core/mods`) lifted into a standalone static
+library. **R5 (2026-11-12): the lift is Eden Duo v1.3.5.1 (tag `v1.3.5.1`, `102f69ed3f`,
+`DualScreenRuntimeVersion = 24`)**; R1a..R2 below were against the old `dsmod` branch
+(`c6541721fa`, runtime 12) and are kept as history. Layout:
 
 ```
 dm/peanuts/rt/
   peanuts_rt.h / peanuts_rt.cpp   C API: pn_rt_create / destroy / tick / frame / touch / set_page / status
   CMakeLists.txt                  add_library(peanuts_rt STATIC), option PEANUTS_RT_TEST -> rt_test
   mods/                           lifted Eden files, ORIGINAL NAMES, byte-identical except where marked "PNRT"
+  mods/modules/dsmod_module_sdk.h the module SDK header (as in Eden's src/core/mods/modules/)
   mods/pnrt_stubs.cpp             bodies for the members whose files are not lifted (list below)
   shim/                           stand-ins for the Eden headers the lifted files include (same include paths)
-  shim/shim.cpp, shim/stb_impl.cpp
+  shim/shim.cpp, shim/stb_impl.cpp, shim/shim_r5.cpp (R5: dlopen, SHA-256, data paths, fonts)
   test/rt_test.cpp                Linux host test: real package + fake guest memory -> PNGs
 dm/peanuts/third_party/
   nlohmann/json.hpp, json_fwd.hpp (v3.12.0 single header, from Eden's CPM cache)
@@ -26,7 +29,63 @@ The lifted files include each other as `core/mods/<name>`; CMake creates
 include line changed. Upstream sync: copy the Eden file over `mods/<name>`, re-apply the PNRT
 hunks listed below (`diff -u ~/eden/src/core/mods/X mods/X` shows exactly them).
 
-## Lifted (compiled) files
+## R5: the v1.3.5.1 lift (runtime 24) and native modules
+
+Every file in Eden's `src/core/mods/` at v1.3.5.1 is in `mods/` **except** the ones that stay
+out by design: `mod_guest_bridge.cpp` (BRK guest-call bridge), `engine_il2cpp/mercury/ichigo.cpp`
+(engine probes), `mod_re_tools.cpp` + `mod_console.cpp` (dev tools, `EDEN_DSMOD_BUILD_DEV_TOOLS=0`),
+`duo_core.cmake`, `modules/README.md`. 86 files in `mods/` (+ `modules/dsmod_module_sdk.h`);
+`cmp` against the exported v1.3.5.1 tree shows exactly four edited files, all hunks
+`PNRT`-marked (table below): `mod_runtime.h`, `mod_assets.cpp`, `mod_romfs_sources.cpp`,
+`mod_module_services.cpp`. Upstream sync stays: copy the Eden file over `mods/<name>`, re-apply
+the PNRT hunks.
+
+Delta against R2 (runtime 12):
+- **replaced** (v1.3.5.1 versions of the 44 files already lifted; 15 of them were byte-identical
+  across the two trees): dsmod_module_abi.h, dsmod_module_extensions.h, mod_actions.cpp,
+  mod_assets.cpp, mod_input.cpp, mod_load_plan.{cpp,h}, mod_manifest.cpp, mod_map.cpp,
+  mod_module.h, mod_nx_runtime.cpp, mod_pages.cpp, mod_redraw.cpp, mod_runtime.{cpp,h},
+  mod_runtime_shared.h, mod_state.cpp, mod_types*.h, mod_ui*.{cpp,h}.
+- **added** (new in runtime 13..24): mod_expr.{cpp,h}, mod_settings.{cpp,h}, mod_nav.{cpp,h},
+  mod_types_nav.h, mod_host_values.{cpp,h}, mod_clock.{cpp,h}, mod_persist.{cpp,h},
+  mod_sources.{cpp,h}, mod_romfs_sources.{cpp,h}, mod_user_source.{cpp,h},
+  mod_sysfont_source.{cpp,h}, mod_font_pages.{cpp,h}, mod_font_epoch.h, mod_texture_readback.{cpp,h},
+  mod_view_default.h, mod_input_tokens.h, mod_input_drag.h, mod_input_hold.h, mod_input_swipe.h,
+  mod_map_view_rect.h, mod_bfres.h, mod_chart.h, mod_hooks.h, mod_package_io.h,
+  mod_process_guard.h, mod_yaz0.h, modules/dsmod_module_sdk.h, and the **native module host**:
+  mod_module.cpp, mod_module_host.cpp, mod_module_services.cpp.
+- **removed**: nothing from `mods/` (the module stubs in pnrt_stubs.cpp went away, see Stubs).
+- C API: unchanged signatures; `PnRtConfig` gained `data_dir`, `save_dir`, `sysfont_dir` (NULL
+  defaults); `pn_rt_status` now also prints `module=<name|none|error: ...>`.
+
+### Native modules (R5)
+
+`InitializeGameModule()` (mod_module_host.cpp, called from `ModRuntime::Initialize`) ->
+`GameModule::Load(manifest.asset_dir, title_id, running_build_id, error)` (mod_module.cpp):
+reads `dualscreen/manifest.json` (`"module"`: abi 1, `build_ids`, `libraries[<platform>]`
+{path, sha256}), picks the platform directory by compile target --
+`Platform()` = `linux-x86_64` (`__linux__ && __x86_64__`), `android-arm64-v8a`
+(`__ANDROID__ && __aarch64__`) -- requires `path == modules/<platform>/<TITLEID>.so`, checks
+SHA-256 (`SHA256()` from shim/openssl/sha.h, own implementation in shim_r5.cpp), copies the bytes
+to a private 0700 staging dir (`StageModule`: `<data_dir>/dualscreen-code/module-XXXXXX/`, set
+by `pn_rt_create` through `SetModuleCacheDirectory`; mod_module.cpp refuses to run on Android
+without one), `Common::DynamicLibrary::Open` = `dlopen(RTLD_NOW|RTLD_LOCAL)` (shim_r5.cpp),
+`GetSymbol("eden_dsmod_get_module")` -> `EdenDsmodModuleApi` checked for abi version/hash/title/
+`supports_build`, then the optional extension getters (`eden_dsmod_get_extensions`, `_font_`,
+`_save_`, `_write_`, `_data_`, `_texture_extensions`, `NegotiateExtension`). Back in
+InitializeGameModule the `EdenDsmodHostApi` table is filled: `read_memory` / `get_read_pointer` /
+`write_memory` / `is_mapped` go to `OwnerMemory()` = the shim `KProcess::GetMemory()` =
+`Core::Memory::Memory` over **PnRtMemory** (read/write/pointer_at); `read_romfs` resolves
+through `AssetSources` (romfs: = `romfs_dir`, file:, user:, module:, sysfont:); publish_* land in
+the tick snapshot; `get_i64/f64/text` answer host values, flags, views. `create(host,
+manifest-json)` then `tick()` each pn_rt_tick (`RunGameModule`), `load_image` on the module
+asset worker (`StartModuleAssetWorker`), `load_data` for `module:` byte sources, the write
+extension's `write_batch` through `RunWithGuestStopped` (the shim just runs it), the texture
+extension refused (`GPU::DSModTextureReadbackAvailable()` = false -> not advertised).
+`ShutdownGameModule` joins the workers, `destroy()`s the instance, `GameModule::~GameModule`
+dlcloses and deletes the staging dir.
+
+## Lifted (compiled) files (R1a..R2 history; superseded by the R5 list above)
 
 mod_actions.cpp (R2), mod_assets.cpp, mod_input.cpp (R2), mod_load_plan.cpp, mod_manifest.cpp, mod_map.cpp, mod_msbt.cpp, mod_pages.cpp,
 mod_nx_assets.cpp, mod_nx_runtime.cpp (R1b), mod_redraw.cpp, mod_runtime.cpp, mod_state.cpp, mod_ui.cpp, mod_ui_canvas.cpp, mod_ui_expand.cpp,
@@ -37,14 +96,16 @@ engine_formats.h, mod_module.h, dsmod_module_abi.h, dsmod_module_extensions.h, m
 dsmod branch: mod_expr.cpp, mod_settings.cpp, mod_nav.cpp, mod_host_values.{h,cpp},
 mod_view_default.h, mod_input_tokens.h (their functionality lives inside the files above).
 
-## Edited lifted files (all hunks carry a `PNRT` marker)
+## Edited lifted files (all hunks carry a `PNRT` marker; R5 state)
 
 | file | why |
 |---|---|
-| mods/mod_runtime.h | `friend struct PnRtAccess;` so peanuts_rt.cpp can switch `current_page` and read `tick_count`/page id for pn_rt_set_page / pn_rt_status (Tick itself is reached without a friend: the CoreTiming shim keeps the scheduled event and pn_rt_tick fires it). |
-| mods/mod_assets.cpp | `#if !PNRT` around `SerialVfsFile` + `OpenPrivateRomFS` (Eden loader/PatchManager/NCA chain) and `#if PNRT` replacing the romfs-opening block in `ReadAssetBytesRaw` with `romfs_root = system.RomfsRoot()` (a directory on disk handed over by the host, or nullptr). |
+| mods/mod_runtime.h | `friend struct PnRtAccess;` so peanuts_rt.cpp can switch `current_page` and read `tick_count`/page id/module state for pn_rt_set_page / pn_rt_status (Tick itself is reached without a friend: the CoreTiming shim keeps the scheduled event and pn_rt_tick fires it). |
+| mods/mod_assets.cpp | `#if !PNRT` around `SerialVfsFile` + `OpenPrivateRomFS` (Eden loader/PatchManager/NCA chain); `OpenGameRomFS()` body replaced by `root = system.RomfsRoot()`; the `sysfont:` source's archive opener replaced by `system.SysfontRoot()` (no system NAND). |
+| mods/mod_romfs_sources.cpp (R5) | `BuildBase` = `system.RomfsRoot()` ("base:" is the same extracted dir as "romfs:"), `BuildAoc` = nullptr ("aoc:" never available; the Eden bodies stay under `#else`). |
+| mods/mod_module_services.cpp (R5) | `ResolveTitleSaveDirectory` = `system.SaveRoot()` (PnRtConfig::save_dir) instead of the save-data HLE + profile manager. |
 
-Everything else in `mods/` is byte-identical to Eden.
+Everything else in `mods/` is byte-identical to Eden v1.3.5.1.
 
 ## Shims (dm/peanuts/rt/shim)
 
@@ -73,22 +134,40 @@ Everything else in `mods/` is byte-identical to Eden.
 | core/file_sys/control_metadata.h, patch_manager.h | (R1b) `NACP::GetSupportedLanguages()`; `PatchManager::GetMetadataFromBaseOrUpdate` -> no metadata (0 = all languages) |
 | common/settings.h (`language_index`) | (R1b) `Settings::Language` + `CanonicalizeEnum`; set from `PnRtConfig::language` (default American English) |
 | common/alignment.h, video_core/textures/workers.h | (R1b) `DivideUp`; `ThreadWorker` that runs astc row jobs inline (the Nx asset worker is already a thread) |
+| **R5 shims** | |
+| video_core/dsmod/aux_routing.h | now **Eden's v1.3.5.1 header verbatim** (wheel/pinch mailboxes, CompanionRect/FitCompanion/PanelToCanvas, SecondScreenOptions, companion_context_active, the GPU composite slots) plus PNRT-marked hunks only: a `UiSink` struct + `SetUiSink`, and a forward to it at the end of `PublishUi` / `PublishUiWith` / `PublishUiPartialRects` / `ClearUi` (34 added lines, `diff` shows them) |
+| video_core/dsmod/texture_readback.h, common/dsmod_dev_tools.h, common/device_power_state.h, hid_core/resources/npad/dsmod_pad_gate.h | verbatim Eden copies (pure headers) |
+| video_core/surface.h | the `PixelFormat` names texture_readback.h compares |
+| video_core/gpu.h | + `DSModTextureReadbackAvailable()` = false, `DSModRequestTextureReadback` = false (no texture cache: the module keeps its fallback) |
+| core/core.h | + `Kernel()` (KernelCore), `GetPerfStats()` (zeros), `IsPoweredOn()`/`IsMulticore()` = true, `RunWithGuestThreadsSuspended(fn)` = run fn, `GetDualScreenGuestMailboxEpoch()` = 0, `SaveRoot()`, `SysfontRoot()`; **`process` is now always non-null** (a `KProcess` whose `GetMemory()` is the PnRtMemory accessor) because the runtime's every guest access goes through `OwnerMemory()` = `OwnerProcess()->GetMemory()` |
+| core/hle/kernel/kernel.h, k_auto_object.h, k_thread.h, k_process.h | `KernelCore::RetainApplicationProcess(&epoch)` -> the one process (epoch 1), `IsApplicationProcess` = same pointer; `KScopedAutoObject<T>` = a plain pointer holder (GetPointerUnsafe/SetObject/IsNull); `KThread::GetContext()` non-const (RefuseChangedProcess assigns it); `KProcess::GetMemory()` |
+| core/perf_stats.h | `PerfStats::GetTotals()` = {0,0,0} (@perf.* never published) |
+| core/arm/debug.h | `InvalidateInstructionCacheRange` no-op, `ArmInterface` fwd |
+| core/core_timing.h | + `GetGlobalTimeNs/Us()` = steady clock since construction (@game.seconds) |
+| common/fs/path_util.h, fs_util.h | `GetEdenPath(EdenDir|CacheDir)` over one host data dir (`SetEdenDir`, from `PnRtConfig::data_dir`, default `<tmp>/peanuts_rt`); `PathToUTF8String` |
+| common/dynamic_library.h | real now: Open/Close/GetSymbol over dlopen (shim_r5.cpp) |
+| openssl/sha.h | `SHA256()` + `SHA256_DIGEST_LENGTH` over an own FIPS 180-4 implementation (shim_r5.cpp): mod_module.cpp includes `<openssl/sha.h>` unchanged |
+| common/atomic_ops.h, swap.h, scope_exit.h, uuid.h (empty) | `AtomicCompareAndSwap` (__atomic builtins), `swap32`, `SCOPE_EXIT` |
+| core/hle/service/ns/platform_service_manager.h | `SHARED_FONTS` table + `DecryptSharedFontToTTF` (reproduced: XOR key from word 0, byte-swap, drop 2 header words) |
+| hid_core/hid_types.h, hid_util.h, hid_core.h, frontend/emulated_controller.h | `NpadIdType`, `NpadButton` bits (mod_nav chords), `AnalogStickState`, `NpadIdTypeToIndex`; `EmulatedController::IsConnected()` = false and `GetEmulatedController` = nullptr (controller focus mode compiles, never engages) |
+| input_common/main.h | includes the virtual gamepad shim |
+| core/file_sys/vfs/vfs.h | + `Resize/IsWritable/IsReadable/Write/Rename` virtuals (lifted VfsFile subclasses override them), `VfsDirectory::GetFullPath()` |
+| core/file_sys/vfs/vfs_vector.h, vfs_real.h | `VectorVfsFile` (mod_nx_runtime.cpp), `RealVfsFilesystem::OpenDirectory` (the "user:" folder) |
+| core/file_sys/romfs.h | `ExtractRomFS` -> nullptr (only reached from code under `#if !PNRT`) |
+| core/file_sys/{common_funcs,nca_metadata,romfs_factory,fs_save_data_types}.h, core/hle/service/acc/profile_manager.h, filesystem/save_data_controller.h | empty |
 
 ## Stubs (mods/pnrt_stubs.cpp): members of files not lifted
 
-mod_actions.cpp and mod_input.cpp are fully lifted as of R2 -- see "Verified R2" below. What
-remains stubbed:
+R5: the **module stubs are gone** (mod_module*.cpp are lifted; `RunModuleAction`,
+`InitializeGameModule`, `LockMapStateUnlessRaster`, ... are Eden's). What remains stubbed is
+only the guest bridge and the engine probes:
 
 - **mod_guest_bridge.cpp** (also: RunAction's Call/Sequence kinds, mod_actions.cpp): `RequestCall`,
   `StartSequence` (log "unsupported on this host", no-op; RunAction still returns `Done`),
   `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences` (no-ops), `ScanPattern`
   (nullopt).
 - **engine_il2cpp/mercury/ichigo.cpp**: `FindClassSlotByName`, `DetectMethodsOffset`, `FindPlayerNode` (nullopt); `DecodeBctex`, `DecodeSosXtx`, `ParseMfnt`, `ParseSosFont` (false); `DecodeLzss`, `ExtractArchiveMember` (empty).
-- **mod_module*.cpp** (also: RunAction's Module kind, mod_actions.cpp): `RunModuleAction` (log
-  "unsupported on this host", no-op), `GameModule::~GameModule`, `InitializeGameModule` (module =
-  none), `ShutdownGameModule`, `RunGameModule`, `DrainModuleImages`, `InstallModuleAreas`,
-  `ApplyPendingMapUpdates` (no-ops), `LoadModuleData` (empty), `GetModuleImage` (nullptr),
-  `LoadModuleImageSync` (false), `LockMapStateUnlessRaster` (copied verbatim: it is generic).
+- ~~mod_module*.cpp~~ lifted as of R5 (see above).
 - **mod_nx_runtime.cpp / mod_nx_assets.cpp**: no stubs since R1b (both lifted as-is).
 - Dev tools (`mod_re_tools.cpp`, `mod_console.cpp`): compiled out by `EDEN_DSMOD_BUILD_DEV_TOOLS=0` (the shells in mod_runtime.cpp are already empty then).
 
@@ -151,7 +230,45 @@ but untested -- the LA package's map page uses `pan_zoom` on its map widget, so 
 but rt_test does not drive a second finger (optional per the R2 task). The haptic amplitude/
 duration table is PNRT's own invention, not a lift of Eden's Android-side mapping (see above).
 
-## Known gaps / R2c candidates
+## Verified R5 (host, 2026-11-12; work dir <work dir>/rt5-work)
+
+- Host build (gcc, RelWithDebInfo) clean. `rt_test <LA package> out-la <romfs>`: standby.png /
+  gear.png / probe.png and the four out-romfs2/ interaction PNGs render as in R1b/R2 (same
+  status lines: `page=standby tick=94 frames=2`, `page=gear tick=188 frames=4`, Close tap ->
+  `page=map`, equip_x 0xFF -> 0x08, one haptic pulse); visually identical (ItemBG, logo, icons,
+  bffnt font, 12 discs, rupee 123).
+- `rt_test --module fe3h/pkg out-fe3h 010055D009F78000 89048449BA238C8CF565518B83BF02D3
+  battle units academy` (the 1.0.2 catalog zip: manifest min_runtime 18, requires_module true,
+  modules/{linux-x86_64,android-arm64-v8a}/010055D009F78000.so): the package is accepted (no
+  update-required page), log `DSMod module: loaded Fire Emblem: Three Houses DSMod for title
+  010055D009F78000 build 89048449...000 (linux-x86_64)`, status
+  `module=Fire Emblem: Three Houses DSMod`; default.png = the module's standby page ("STUDYING THE
+  TACTICS." / "WAITING FOR THE GAME" in the built-in font, since the module font
+  `file:fe3h_font.txt` needs game memory), battle/units/academy.png = the tab bars (degraded:
+  built-in font, all-zero guest memory).
+- ASan (`-fsanitize=address -fno-omit-frame-pointer`, detect_leaks=1): both runs above clean,
+  exit 0, no reports.
+- arm64 (NDK 28.2.13676358, android-33): libpeanuts_rt.a builds; llvm-nm shows `pn_rt_*`,
+  `Core::Mods::GameModule::Load`, `ModRuntime::InitializeGameModule`, `SetModuleCacheDirectory`,
+  `Common::DynamicLibrary::Open`, `SHA256` as defined `T` symbols. Not run on device.
+
+## Known gaps (R5)
+
+- Controller focus mode (mod_nav.cpp) and `PadIsPushed` compile but never engage: the HID shim
+  has no connected controller. The pad gate (`DSModPadGate`) is set/reset by the runtime but
+  nothing on this host applies it to a real pad.
+- `@perf.*` never published (PerfStats totals stay 0); `@device.*` reads "no battery";
+  `@game.seconds` is the wall clock since pn_rt_create.
+- "aoc:" source always unavailable; "base:" = the same romfs dir as "romfs:"; "sysfont:" only
+  when the host passes `sysfont_dir` (a folder of the console's .bfttf files); a module's
+  `read_save_file` only when `save_dir` is passed (the game's save folder, plain files).
+- Texture readback (runtime 24) not advertised: modules keep their fallback.
+- Guest bridge (Call/Sequence actions, spies, patches, `OnGuestBreakpoint`) still stubbed
+  (NCE conditions, as before). Guest mailbox {0,0}.
+- The rt_test module run only proves load + default/tab pages with zero memory; module pages
+  that read real game state are untested here.
+
+## Known gaps / R2c candidates (history)
 
 - `Core::System::ApplicationProcess()` is nullptr: heap-region sweeps (ArrayFind/PlayerFind
   points) use the fixed fallback window; hosts can fill `System::process` later.

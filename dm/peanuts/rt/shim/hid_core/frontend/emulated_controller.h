@@ -1,31 +1,28 @@
-// PNRT shim for Eden's hid_core: PadIsPushed() (mod_state.cpp) asks player 1's emulated controller
-// for its sticks. The host does not expose the real pad yet, so GetEmulatedController() returns
-// nullptr and the caller takes its "not pushed" branch.
+// PNRT shim for Eden's hid_core/frontend/emulated_controller.h: PadIsPushed() (mod_state.cpp)
+// and the controller focus mode (mod_nav.cpp ReadNavPad / LatchNavPad) ask the emulated
+// controllers for their buttons and sticks. The host does not expose the real pad yet, so
+// HIDCore::GetEmulatedController() returns nullptr and every caller takes its "no controller"
+// branch (not pushed / no buttons).
 #pragma once
 
 #include "common/common_types.h"
+#include "hid_core/hid_types.h"
 
 namespace Core::HID {
 
-enum class NpadIdType : u32 { Player1 = 0, Player2, Player3, Player4, Player5, Player6, Player7, Player8, Other, Handheld, Invalid };
-
 class EmulatedController {
 public:
-    struct Stick {
-        s32 x{};
-        s32 y{};
-    };
     struct Sticks {
-        Stick left;
-        Stick right;
+        AnalogStickState left;
+        AnalogStickState right;
     };
-    struct Buttons {
-        u64 raw{};
-    };
+    [[nodiscard]] bool IsConnected() const {
+        return false;
+    }
     [[nodiscard]] Sticks GetSticks() const {
         return {};
     }
-    [[nodiscard]] Buttons GetNpadButtons() const {
+    [[nodiscard]] NpadButtonState GetNpadButtons() const {
         return {};
     }
 };
@@ -33,6 +30,9 @@ public:
 class HIDCore {
 public:
     [[nodiscard]] EmulatedController* GetEmulatedController(NpadIdType) {
+        return nullptr;
+    }
+    [[nodiscard]] const EmulatedController* GetEmulatedController(NpadIdType) const {
         return nullptr;
     }
 };

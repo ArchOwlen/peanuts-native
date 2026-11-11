@@ -26,6 +26,7 @@
 #include <string>
 
 #include "common/common_types.h"
+#include "common/dsmod_dev_tools.h"
 #include "common/logging.h"
 #include "core/mods/mod_types.h"
 #include "input_common/drivers/virtual_gamepad.h"
@@ -40,21 +41,28 @@ constexpr u64 ModTickHz = 60;
 // per five seconds make Android slowdown reports useful without per-frame log traffic.
 struct RuntimeStageStats {
     using Clock = std::chrono::steady_clock;
-    Clock::time_point window = Clock::now();
+    Clock::time_point window = Common::DSMod::DevToolsEnabled ? Clock::now() : Clock::time_point{};
     double total_ms{}, max_ms{};
     u64 calls{}, over_budget{};
 };
 
+/// EDEN_DSMOD_PROFILE: the periodic CPU stage summaries (on unless set to 0/false).
+inline bool RuntimeProfileEnabled() {
+    static const bool enabled = [] {
+        const char* value = Common::DSMod::DevEnvironment("EDEN_DSMOD_PROFILE");
+        return Common::DSMod::DevToolsEnabled &&
+               (!value || (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+                           std::strcmp(value, "FALSE") != 0));
+    }();
+    return enabled;
+}
+
+#if EDEN_DSMOD_BUILD_DEV_TOOLS
 class RuntimeStageTimer {
 public:
     RuntimeStageTimer(RuntimeStageStats& stats_, const char* stage_)
         : stats{stats_}, stage{stage_} {
-        static const bool enabled = [] {
-            const char* value = std::getenv("EDEN_DSMOD_PROFILE");
-            return !value || (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
-                              std::strcmp(value, "FALSE") != 0);
-        }();
-        active = enabled;
+        active = RuntimeProfileEnabled();
         if (active) {
             start = RuntimeStageStats::Clock::now();
         }
@@ -84,6 +92,29 @@ private:
     bool active{};
 };
 
+#else
+class RuntimeStageTimer {
+public:
+    RuntimeStageTimer(RuntimeStageStats&, const char*) {}
+};
+#endif
+
+/// A guest float as an integer, defined for every input: NaN -> 0, out of range -> the nearest
+/// s64 (what arm64's fcvtzs does). A plain cast is UB there, and x86 and arm64 disagree on it, so
+/// loading-screen garbage (NaN, 1e30) read differently on the desktop and the handheld.
+constexpr s64 SaturatingToS64(f64 value) {
+    if (value != value) {
+        return 0;
+    }
+    if (value >= 9223372036854775808.0) {
+        return std::numeric_limits<s64>::max();
+    }
+    if (value < -9223372036854775808.0) {
+        return std::numeric_limits<s64>::min();
+    }
+    return static_cast<s64>(value);
+}
+
 constexpr u64 MillisecondsToModTicks(u64 milliseconds) {
     return std::max<u64>(1, (milliseconds * ModTickHz + 999) / 1000);
 }
@@ -96,7 +127,7 @@ constexpr u32 MaxTextLength = 256;
 constexpr std::array<const char*, 6> HapticStrengthNames{"off",     "light", "click",
                                                          "confirm", "heavy", "reject"};
 constexpr std::array<const char*, static_cast<size_t>(HapticKind::Count)> HapticKindNames{
-    "tap", "write", "select", "drag", "drop", "marker", "refused"};
+    "tap", "write", "select", "drag", "drop", "marker", "refused", "hold", "swipe"};
 } // namespace
 
 InputCommon::VirtualGamepad::VirtualButton ParseButton(const std::string& name, bool& ok);

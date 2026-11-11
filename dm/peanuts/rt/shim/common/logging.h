@@ -15,7 +15,7 @@ namespace Common::Log {
 enum class Level : u8 { Trace, Debug, Info, Warning, Error, Critical, Count };
 
 // Only the classes the lifted files name. Unused ones cost nothing.
-enum class Class : u8 { Log, Common, Core, Core_Timing, Debug, Kernel, Service, Render, Input, Frontend, Count };
+enum class Class : u8 { Log, Common, Core, Core_Timing, Debug, Kernel, Service, Service_NS, Render, Render_Vulkan, Input, Frontend, Count };
 
 /// The single sink every LOG_* lands in: (level, "file:line func", message).
 using Sink = void (*)(int level, const char* where, const char* message);

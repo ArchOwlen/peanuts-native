@@ -1,12 +1,14 @@
-// PNRT shim for Eden's core/hle/kernel/k_process.h. System::ApplicationProcess() returns nullptr
-// in Peanuts (every lifted use null-checks first); the class exists so those call sites compile.
-// The heap region can be supplied by the host through KProcess fields instead of a page table.
+// PNRT shim for Eden's core/hle/kernel/k_process.h. Core::System owns one KProcess (the running
+// title) whose GetMemory() is the host's guest-memory accessor; the runtime retains it as its
+// "owner process" (kernel.h). The heap region can be supplied by the host through the KPageTable
+// fields instead of a real page table (0 = unknown: the runtime uses its fallback window).
 #pragma once
 
 #include <vector>
 
 #include "common/common_types.h"
 #include "core/hle/kernel/svc_types.h"
+#include "core/memory.h"
 
 namespace Kernel {
 
@@ -35,6 +37,9 @@ public:
     [[nodiscard]] u64 GetThreadId() const {
         return 0;
     }
+    [[nodiscard]] Svc::ThreadContext& GetContext() {
+        return context;
+    }
     [[nodiscard]] const Svc::ThreadContext& GetContext() const {
         return context;
     }
@@ -43,6 +48,7 @@ public:
 
 class KProcess {
 public:
+    explicit KProcess(Core::Memory::Memory* memory_ = nullptr) : memory{memory_} {}
     [[nodiscard]] KPageTable& GetPageTable() {
         return page_table;
     }
@@ -55,8 +61,12 @@ public:
     [[nodiscard]] const std::vector<KThread>& GetThreadList() const {
         return threads;
     }
+    [[nodiscard]] Core::Memory::Memory& GetMemory() const {
+        return *memory;
+    }
     KPageTable page_table{};
     std::vector<KThread> threads;
+    Core::Memory::Memory* memory;
 };
 
 } // namespace Kernel

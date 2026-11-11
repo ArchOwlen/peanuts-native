@@ -411,6 +411,19 @@ static void rt_start(void) {
     c.main_base = (uint64_t)(uintptr_t)m->base;
     c.main_size = m->size;
     c.panel_w = 1240; c.panel_h = 1080;
+    // R5: the runtime's own data (persisted flags, "user:" assets, and the staging folder a package's native module is copied to before dlopen) lives in the app's
+    // private files folder (DM_AOC_DIR = <private files>/aoc/<title>, the one private path the launcher hands the game): shared storage is mounted noexec, so a
+    // module staged there would not load. The title's save folder is DM_SAVE; the console's shared fonts come as .ttf here, not .bfttf, so "sysfont:" stays off
+    static char data_dir[768];
+    const char *aoc = getenv("DM_AOC_DIR");
+    if (aoc) {
+        const char *a = strstr(aoc, "/aoc/");
+        if (a) snprintf(data_dir, sizeof data_dir, "%.*s/peanuts-rt", (int)(a - aoc), aoc);
+    }
+    if (!data_dir[0]) snprintf(data_dir, sizeof data_dir, "%s/peanuts-rt", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp");
+    mkdir(data_dir, 0700);
+    c.data_dir = data_dir;
+    c.save_dir = getenv("DM_SAVE");
     c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer;
     c.pad.set_button = rt_pad_button; c.pad.set_stick = rt_pad_stick;
     c.ui.publish_ui = rt_ui_publish; c.ui.publish_ui_partial = rt_ui_publish_partial;

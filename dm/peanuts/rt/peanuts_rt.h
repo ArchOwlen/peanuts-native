@@ -62,6 +62,17 @@ typedef struct PnRtConfig {
     /// The game's romfs extracted to a directory ("romfs:/..." assets). Optional (NULL = none:
     /// such assets are logged as missing and their widgets left blank).
     const char* romfs_dir;
+    /// R5: a writable per-app data directory. Holds the persisted runtime flags
+    /// (<data_dir>/dualscreen/persist), the player's "user:" assets (<data_dir>/dualscreen/user)
+    /// and the private staging directory a package's native module is copied to before dlopen
+    /// (<data_dir>/dualscreen-code; on Android this must be app-private storage that allows
+    /// executable code, e.g. the code-cache dir). NULL = <system temp>/peanuts_rt.
+    const char* data_dir;
+    /// R5, optional: the title's save-data folder (a module's read_save_file). NULL = none.
+    const char* save_dir;
+    /// R5, optional: a folder with the console's shared .bfttf fonts ("sysfont:" assets).
+    /// NULL = none (such assets read as missing).
+    const char* sysfont_dir;
     /// The running title and its main module build id (hex, up to 64 chars; shorter is padded).
     uint64_t title_id;
     const char* build_id_hex;
@@ -77,6 +88,7 @@ typedef struct PnRtConfig {
     PnRtHaptics haptics; /* pulse may be NULL = no haptics */
     PnRtLogFn log;   /* NULL = stderr (and logcat on Android) */
     int log_level;   /* 0 trace .. 5 critical; messages below it are dropped (default 2 = info) */
+    /// (R5 fields data_dir / save_dir / sysfont_dir above; NULL = defaults.)
     /// System language for "msbt:" texts: 0 = default (American English), else 1 + Eden's
     /// Settings::Language index (1 Japanese, 2 EnglishAmerican, 3 French, 4 German, 5 Italian,
     /// 6 Spanish, 7 Chinese, 8 Korean, 9 Dutch, 10 Portuguese, 11 Russian, 12 Taiwanese,
@@ -107,8 +119,9 @@ void pn_rt_touch(PnRt* rt, uint32_t finger_id, uint32_t x, uint32_t y, int down)
 /// Switches to the page with this manifest id (e.g. "gear"). Returns 1 when found.
 int pn_rt_set_page(PnRt* rt, const char* page_id);
 
-/// One line: "<package name> page=<id> tick=<n> frames=<n> err=<last error or ->". Returns the
-/// length written (truncated to n-1).
+/// One line: "<package name> page=<id> tick=<n> frames=<n> module=<m> err=<last error or ->"
+/// where <m> is the native module's ABI name while its instance runs, "none" for a package
+/// without one, or "error: <why>" (R5). Returns the length written (truncated to n-1).
 size_t pn_rt_status(PnRt* rt, char* buf, size_t n);
 
 #ifdef __cplusplus

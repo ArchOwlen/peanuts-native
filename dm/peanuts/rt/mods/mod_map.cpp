@@ -26,6 +26,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include "common/stb.h"
 
 #include <cstdlib>
@@ -907,8 +908,8 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
             ActiveHoleIdentity(area->second.occluders, area->second.vignettes,
                                map_occ_dead[area_name], map_vig_dispelled[area_name]);
         const std::string border_key =
-            fmt::format("{}@{}x{}#h{}", area_name, width, height, silhouette);
-        const std::string base_family = fmt::format("mapbase:{}@{}x{}#", area_name, width, height);
+            std::format("{}@{}x{}#h{}", area_name, width, height, silhouette);
+        const std::string base_family = std::format("mapbase:{}@{}x{}#", area_name, width, height);
         const std::string active_base_family = base_family + "h" + silhouette + ".e";
         // Key off EVERY category that has a color_bind (not just one live category's state) -- a
         // second live-state category must not silently share a cache entry with the wrong state:
@@ -1051,7 +1052,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
                 // Share the outline across zone variants, replacing it only when holes change.
                 auto bl = map_border.find(border_key);
                 if (bl == map_border.end()) {
-                    const std::string bprefix = fmt::format("{}@{}x{}#", area_name, width, height);
+                    const std::string bprefix = std::format("{}@{}x{}#", area_name, width, height);
                     for (auto it = map_border.begin(); it != map_border.end();) {
                         it = it->first.starts_with(bprefix) ? map_border.erase(it) : std::next(it);
                     }
@@ -1112,7 +1113,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
         // PRE-FOG (cached per water+wall state): base + live water + intact walls, NO fog. During a
         // reveal only fade_stamp / VisitedGen change, so this image is reused and the hot fade path
         // becomes copy + MaskUnvisited -- no water alloc/raster, no water loop, no wall loop.
-        const std::string prefog_key = fmt::format("prefog:{}@{}x{}#{}.{}.e{}", area_name, width,
+        const std::string prefog_key = std::format("prefog:{}@{}x{}#{}.{}.e{}", area_name, width,
                                                    height, water_gen, wall_gen, zone_gen);
         std::shared_ptr<const Image> prefog;
         if (const auto pc = CacheFindImage(prefog_key)) {
@@ -1141,7 +1142,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
             // boxes on a generation change. The previous implementation allocated a full scratch
             // canvas and walked width*height for every water layer on every drain.
             const std::string water_key =
-                fmt::format("watermask:{}@{}x{}", area_name, width, height);
+                std::format("watermask:{}@{}x{}", area_name, width, height);
             auto water_it = map_water_pixels.find(water_key);
             if (water_it == map_water_pixels.end()) {
                 std::vector<WaterPixel> pixels;
@@ -1298,7 +1299,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
                 }
             }
             // Keep only the newest pre-fog per area+size (never collides with "map:"/"mapbase:").
-            const std::string pf_prefix = fmt::format("prefog:{}@{}x{}#", area_name, width, height);
+            const std::string pf_prefix = std::format("prefog:{}@{}x{}#", area_name, width, height);
             CacheEraseImagesIf([&](const std::string& key) {
                 return key != prefog_key && key.starts_with(pf_prefix);
             });
@@ -1381,7 +1382,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
         // explored rooms and never floats in unexplored void. The magnet raster is cached per
         // area@size; the per-composite work is one table lookup per magnet pixel.
         if (const auto ma = manifest.map_areas.find(area_name); ma != manifest.map_areas.end()) {
-            const std::string mkey = fmt::format("magnet:{}@{}x{}", area_name, width, height);
+            const std::string mkey = std::format("magnet:{}@{}x{}", area_name, width, height);
             std::shared_ptr<const Image> magnet = CacheFindImage(mkey);
             if (!magnet) {
                 Image m;
@@ -1437,7 +1438,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
         // the map at a slow blink, like the minimap's pulse for rooms with items left. Cached as
         // "pulse:<same key>" beside the composite and rebuilt with it (a pickup bumps wall_gen).
         if (endpoint != MapFadeEndpoint::Previous) {
-            const std::string pprefix = fmt::format("pulse:{}@{}x{}#", area_name, width, height);
+            const std::string pprefix = std::format("pulse:{}@{}x{}#", area_name, width, height);
             CacheEraseImagesIf([&](const std::string& key) {
                 const bool candidate = key.starts_with(pprefix);
                 const bool endpoint_key = key.ends_with(".prev") || key.ends_with(".current");
@@ -1585,7 +1586,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
                 }
             }
             const std::string overview_key =
-                fmt::format("overview:{}@{}x{}#{}", area_name, width, height, state_suffix);
+                std::format("overview:{}@{}x{}#{}", area_name, width, height, state_suffix);
             std::shared_ptr<const Image> overview = CacheFindImage(overview_key);
             if (!overview) {
                 overview = CachePutImage(overview_key,
@@ -1595,7 +1596,7 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
             CompositeMapOverview(image, *overview);
         }
         // Keep only the newest composite per area+size (never evicts the base/pre-fog).
-        const std::string prefix = fmt::format("map:{}@{}x{}#", area_name, width, height);
+        const std::string prefix = std::format("map:{}@{}x{}#", area_name, width, height);
         std::string sibling;
         if (endpoint == MapFadeEndpoint::Previous) {
             sibling = src.substr(0, src.size() - std::string_view{".prev"}.size()) + ".current";
@@ -1691,6 +1692,48 @@ std::shared_ptr<const Image> ModRuntime::GetImage(const std::string& src_in,
     return CachePutImage(src, std::move(image));
 }
 
+namespace {
+/// An area whose dynamic markers animate on the clock (frames / pulse) while shown: such a map
+/// is never a still picture (its markers move without any bound value changing).
+bool AreaMarkersAnimate(const MapArea& area, const StateSnapshot& s) {
+    for (const auto& dm : area.dynamic_markers) {
+        if (!dm.Animated()) {
+            continue;
+        }
+        if ((!dm.show.Empty() && !GateOpen(dm.show, s)) ||
+            (!dm.hide.Empty() && GateOpen(dm.hide, s))) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+} // namespace
+
+std::array<float, 2> MarkerPulseAt(const DynamicMarkerDef::Pulse& pulse, u64 ms) {
+    if (pulse.period_ms <= 0) {
+        return {1.0f, 1.0f};
+    }
+    const float t = static_cast<float>(ms % static_cast<u64>(pulse.period_ms)) /
+                    static_cast<float>(pulse.period_ms);
+    if (pulse.grow) {
+        const float s = std::min(1.0f, t / 0.75f);
+        const float a = t < 2.0f / 3.0f ? 1.0f : 1.0f - (t - 2.0f / 3.0f) * 3.0f;
+        return {pulse.alpha_hi * std::clamp(a, 0.0f, 1.0f),
+                pulse.scale_lo + (pulse.scale_hi - pulse.scale_lo) * s};
+    }
+    const float k = 0.5f - 0.5f * std::cos(t * 6.2831853f);
+    return {pulse.alpha_lo + (pulse.alpha_hi - pulse.alpha_lo) * k,
+            pulse.scale_lo + (pulse.scale_hi - pulse.scale_lo) * k};
+}
+
+size_t MarkerFrameAt(size_t frames, s32 frame_ms, u64 ms) {
+    if (frames == 0) {
+        return 0;
+    }
+    return static_cast<size_t>((ms / static_cast<u64>(std::max(1, frame_ms))) % frames);
+}
+
 bool ModRuntime::IsPictureMapWidget(const Widget& widget, const StateSnapshot& s) const {
     // A fixed-area picture map has nothing that moves by itself: its view glides, fades and marker
     // moves already change the signature (or invalidate it).
@@ -1699,7 +1742,8 @@ bool ModRuntime::IsPictureMapWidget(const Widget& widget, const StateSnapshot& s
     }
     if (widget.area_bind.empty() && widget.room_bind.empty()) {
         const auto a = manifest.map_areas.find(widget.area);
-        return a != manifest.map_areas.end() && !a->second.image.empty();
+        return a != manifest.map_areas.end() && !a->second.image.empty() &&
+               !AreaMarkersAnimate(a->second, s);
     }
     // area_bind/room_bind: the area this tick's snapshot resolves to (exactly as the Map case
     // does). It is a still picture when that area draws the game's image (image mode: no fog, no
@@ -1708,6 +1752,7 @@ bool ModRuntime::IsPictureMapWidget(const Widget& widget, const StateSnapshot& s
     // conservative continuous redraw.
     const auto a = manifest.map_areas.find(ResolveMapArea(widget, s));
     return a != manifest.map_areas.end() && !a->second.image.empty() && a->second.markers.empty() &&
+           !AreaMarkersAnimate(a->second, s) &&
            widget.marker_icon.empty() && (widget.actor_x_bind.empty() || widget.actor_icon.empty());
 }
 
@@ -1727,21 +1772,9 @@ std::string ModRuntime::ResolveMapArea(const Widget& w, const StateSnapshot& s) 
     }
     if (area.empty() && !w.area_bind.empty()) {
         if (const auto zone = s.ints.find(w.area_bind); zone != s.ints.end()) {
-            if (!w.area_season_bind.empty()) {
-                if (const auto season = s.ints.find(w.area_season_bind);
-                    season != s.ints.end() && season->second >= 0 && season->second < 4) {
-                    if (const auto mapped =
-                            manifest.zone_area.find(zone->second * 4 + season->second);
-                        mapped != manifest.zone_area.end()) {
-                        area = mapped->second;
-                    }
-                }
-            }
-            if (area.empty()) {
-                if (const auto mapped = manifest.zone_area.find(zone->second);
-                    mapped != manifest.zone_area.end()) {
-                    area = mapped->second;
-                }
+            if (const auto mapped = manifest.zone_area.find(zone->second);
+                mapped != manifest.zone_area.end()) {
+                area = mapped->second;
             }
         }
     }
@@ -1767,7 +1800,7 @@ ModRuntime::MapStamp ModRuntime::StampFor(const std::string& area) const {
 }
 
 std::string ModRuntime::StampKey(const MapStamp& s) {
-    return fmt::format("#{}.{}.{}.{}.e{}", s.vis, s.water, s.fade, s.wall, s.emmy);
+    return std::format("#{}.{}.{}.{}.e{}", s.vis, s.water, s.fade, s.wall, s.emmy);
 }
 
 void ModRuntime::UpdateHiddenMarkers(const std::string& area) {

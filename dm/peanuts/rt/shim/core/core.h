@@ -5,6 +5,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -14,8 +15,10 @@
 #include "core/core_timing.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
+#include "core/perf_stats.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "video_core/gpu.h"
@@ -38,7 +41,7 @@ namespace Core {
 
 class System {
 public:
-    System() = default;
+    System() : process{std::make_unique<Kernel::KProcess>(&memory)}, kernel{process.get()} {}
     System(const System&) = delete;
     System& operator=(const System&) = delete;
 
@@ -48,9 +51,12 @@ public:
     [[nodiscard]] const Memory::Memory& ApplicationMemory() const {
         return memory;
     }
-    /// nullptr: there is no kernel process object (every caller null-checks).
+    /// The one guest process (the running title); its GetMemory() is `memory`.
     [[nodiscard]] Kernel::KProcess* ApplicationProcess() {
         return process.get();
+    }
+    [[nodiscard]] Kernel::KernelCore& Kernel() {
+        return kernel;
     }
     [[nodiscard]] Timing::CoreTiming& CoreTiming() {
         return core_timing;
@@ -70,28 +76,59 @@ public:
     [[nodiscard]] HID::HIDCore& HIDCore() {
         return hid_core;
     }
+    [[nodiscard]] Core::PerfStats& GetPerfStats() {
+        return perf_stats;
+    }
     [[nodiscard]] u64 GetApplicationProcessProgramID() const {
         return title_id;
+    }
+    /// The guest is always "running" from the runtime's point of view once pn_rt_create returned.
+    [[nodiscard]] bool IsPoweredOn() const {
+        return true;
+    }
+    [[nodiscard]] bool IsMulticore() const {
+        return true;
+    }
+    /// Eden pauses the guest's threads around `fn` (a module's atomic write batch). The host owns
+    /// the guest here; `fn` simply runs (the writes still go through PnRtMemory.write).
+    bool RunWithGuestThreadsSuspended(const std::function<void()>& fn) {
+        fn();
+        return true;
     }
     /// {address, size} of the guest mailbox installed by a load plan; {0,0} = none.
     [[nodiscard]] std::pair<u64, u64> GetDualScreenGuestMailbox() const {
         return {0, 0};
     }
-    /// PNRT: the game's romfs as a directory on disk ("romfs:" assets), nullptr when the host
-    /// gave none.
+    [[nodiscard]] u32 GetDualScreenGuestMailboxEpoch() const {
+        return 0;
+    }
+    /// PNRT: the game's romfs as a directory on disk ("romfs:" / "base:" assets), nullptr when
+    /// the host gave none.
     [[nodiscard]] FileSys::VirtualDir RomfsRoot() const {
         return romfs_root;
     }
+    /// PNRT: the title's save-data folder (a module's read_save_file), nullptr when none.
+    [[nodiscard]] FileSys::VirtualDir SaveRoot() const {
+        return save_root;
+    }
+    /// PNRT: a folder holding the console's shared .bfttf fonts ("sysfont:"), nullptr when none.
+    [[nodiscard]] FileSys::VirtualDir SysfontRoot() const {
+        return sysfont_root;
+    }
 
     Memory::Memory memory;
+    std::unique_ptr<Kernel::KProcess> process; ///< the running title; heap region hints optional
+    Kernel::KernelCore kernel;
     Timing::CoreTiming core_timing;
     Tegra::GPU gpu;
     InputCommon::InputSubsystem input;
     Service::FileSystem::FileSystemController fs_controller;
     Loader::AppLoader app_loader;
     HID::HIDCore hid_core;
-    std::unique_ptr<Kernel::KProcess> process; ///< optional: heap region hints
+    Core::PerfStats perf_stats;
     FileSys::VirtualDir romfs_root;
+    FileSys::VirtualDir save_root;
+    FileSys::VirtualDir sysfont_root;
     u64 title_id{};
 };
 

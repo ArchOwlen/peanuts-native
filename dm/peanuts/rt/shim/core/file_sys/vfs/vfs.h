@@ -23,6 +23,23 @@ public:
     /// Reads up to `length` bytes at `offset`; returns the byte count actually read.
     virtual std::size_t Read(u8* data, std::size_t length, std::size_t offset) const = 0;
     [[nodiscard]] virtual VirtualDir GetContainingDirectory() const = 0;
+    // The write side of Eden's VfsFile, so lifted subclasses (SerialRomfsFile, VectorVfsFile)
+    // can override it; the host files here are read-only.
+    virtual bool Resize(std::size_t) {
+        return false;
+    }
+    [[nodiscard]] virtual bool IsWritable() const {
+        return false;
+    }
+    [[nodiscard]] virtual bool IsReadable() const {
+        return true;
+    }
+    virtual std::size_t Write(const u8*, std::size_t, std::size_t) {
+        return 0;
+    }
+    virtual bool Rename(std::string_view) {
+        return false;
+    }
     [[nodiscard]] std::vector<u8> ReadBytes(std::size_t size, std::size_t offset = 0) const;
     [[nodiscard]] std::vector<u8> ReadAllBytes() const;
 };
@@ -35,6 +52,10 @@ public:
     [[nodiscard]] virtual std::vector<VirtualDir> GetSubdirectories() const = 0;
     [[nodiscard]] virtual VirtualFile GetFile(std::string_view name) const = 0;
     [[nodiscard]] virtual VirtualDir GetSubdirectory(std::string_view name) const = 0;
+    /// The directory's path on disk (diagnostics only); the name for a synthetic root.
+    [[nodiscard]] virtual std::string GetFullPath() const {
+        return GetName();
+    }
     /// "a/b/c.png" relative to this directory (nullptr when missing).
     [[nodiscard]] VirtualFile GetFileRelative(std::string_view path) const;
     [[nodiscard]] VirtualDir GetDirectoryRelative(std::string_view path) const;
