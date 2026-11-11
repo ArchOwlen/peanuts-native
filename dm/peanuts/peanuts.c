@@ -34,6 +34,8 @@
 typedef struct { char name[32]; char type[8]; char module[16]; uint64_t off[MAX_ELEMS]; int n; char value[72]; } chain_t;
 typedef struct { uint64_t addr; uint64_t last; } cand_t;
 
+static void rt_tick(void);   // the companion runtime, below
+
 static chain_t g_chains[MAX_CHAINS];
 static int g_nchains;
 static char g_home[256], g_path[512], g_file_state[64] = "none";
@@ -283,16 +285,110 @@ static void refresh(void) {
 
 void peanuts_tick(void) {
     g_frames++;
+    rt_tick();   // the companion runtime, every presented frame
     if (g_frames % REFRESH_EVERY) return;
     pthread_mutex_lock(&g_mu);
     refresh();
     pthread_mutex_unlock(&g_mu);
 }
 
-// ---- the page as pixels: wired to the DSMod runtime (rt/) in R1b; until then no page ----
-void nxhost_peanuts_frame_size(int *w, int *h) { if (w) *w = 0; if (h) *h = 0; }
-int nxhost_peanuts_frame(void *out_rgba, int w, int h) { (void)out_rgba; (void)w; (void)h; return 0; }
-void nxhost_peanuts_touch(int id, float x, float y, int down) { (void)id; (void)x; (void)y; (void)down; }
+// ---- the companion runtime (rt/, the Eden Duo DSMod runtime): one package per title, found beside the pack ----
+// The pack is <game>/<title ID>-work/android-pack (dm_module_dir); companion packages are <game>/<title ID>-work/peanuts/<Package>/{package.json,dualscreen/}.
+// The game's RomFS (DM_ROMFS) is the runtime's romfs root when it is a plain folder (a .nup's inner path is not, yet).
+#include "rt/peanuts_rt.h"
+#include <android/log.h>
+#include <dirent.h>
+
+static PnRt *g_rt;
+static int g_rt_tried;
+static uint32_t *g_frame; static uint32_t g_frame_w, g_frame_h; static int g_frame_new;
+static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int rt_mem_read(void *u, uint64_t addr, void *buf, size_t len) { (void)u; return plat_mem_read(addr, buf, len) == 0; }
+static int rt_mem_write(void *u, uint64_t addr, const void *buf, size_t len) { (void)u; return plat_mem_write(addr, buf, len) == 0; }
+static uint8_t *rt_mem_pointer(void *u, uint64_t addr, size_t len) {   // guest VA == host VA: a pointer when both ends read (the guest block is contiguous between)
+    (void)u; uint8_t b;
+    if (!len || plat_mem_read(addr, &b, 1) || plat_mem_read(addr + len - 1, &b, 1)) return NULL;
+    return (uint8_t *)(uintptr_t)addr;
+}
+static void rt_log(int level, const char *where, const char *msg) {
+    __android_log_print(level >= 4 ? ANDROID_LOG_ERROR : level == 3 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "peanuts", "[rt] %s: %s", where ? where : "", msg ? msg : "");
+}
+
+// The first companion package beside the pack, and the title id from its manifest
+static int rt_find_package(char *dir, size_t n, uint64_t *title) {
+    char root[512]; snprintf(root, sizeof root, "%s/../peanuts", dm_module_dir());
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    struct dirent *e; int found = 0;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char manifest[768]; snprintf(manifest, sizeof manifest, "%s/%s/dualscreen/manifest.json", root, e->d_name);
+        FILE *f = fopen(manifest, "r");
+        if (!f) continue;
+        char head[4096] = {0}; size_t got = fread(head, 1, sizeof head - 1, f); fclose(f); (void)got;
+        const char *t = strstr(head, "\"title_id\"");
+        if (t) { t = strchr(t + 10, '"'); if (t) *title = strtoull(t + 1, NULL, 16); }
+        snprintf(dir, n, "%s/%s", root, e->d_name);
+        found = 1;
+    }
+    closedir(d);
+    return found;
+}
+
+static void rt_start(void) {
+    g_rt_tried = 1;
+    module_t *m = module_named("main");
+    if (!m) return;
+    char dir[768]; uint64_t title = 0;
+    if (!rt_find_package(dir, sizeof dir, &title)) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "no companion package beside %s", dm_module_dir()); return; }
+    const char *romfs = getenv("DM_ROMFS");
+    PnRtConfig c = {0};
+    c.package_dir = dir;
+    c.romfs_dir = romfs && !strstr(romfs, ".nup:") ? romfs : NULL;
+    c.title_id = title;
+    c.build_id_hex = m->build_id;
+    c.main_base = (uint64_t)(uintptr_t)m->base;
+    c.main_size = m->size;
+    c.panel_w = 1240; c.panel_h = 1080;
+    c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer;
+    c.log = rt_log; c.log_level = 2;
+    g_rt = pn_rt_create(&c);
+    __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s (title %016" PRIx64 ", build %s, romfs %s): %s", dir, title, m->build_id, c.romfs_dir ? c.romfs_dir : "none", g_rt ? "loaded" : "not loaded");
+}
+
+static void rt_tick(void) {
+    if (!g_rt) { if (!g_rt_tried && g_nmod > 0) rt_start(); return; }
+    pn_rt_tick(g_rt);
+    uint32_t w = 0, h = 0;
+    pn_rt_frame(g_rt, &w, &h, NULL, 0);
+    if (!w || !h) return;
+    pthread_mutex_lock(&g_frame_mu);
+    if (w != g_frame_w || h != g_frame_h) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_frame_w = w; g_frame_h = h; }
+    if (g_frame && pn_rt_frame(g_rt, &w, &h, g_frame, (size_t)w * h)) g_frame_new = 1;
+    pthread_mutex_unlock(&g_frame_mu);
+}
+
+void nxhost_peanuts_frame_size(int *w, int *h) {
+    pthread_mutex_lock(&g_frame_mu);
+    if (w) *w = (int)g_frame_w; if (h) *h = (int)g_frame_h;
+    pthread_mutex_unlock(&g_frame_mu);
+}
+
+// The newest frame as RGBA8 bytes (Android's ARGB_8888 bitmaps hold R, G, B, A in memory; the runtime's pixels are 0xAARRGGBB words)
+int nxhost_peanuts_frame(void *out_rgba, int w, int h) {
+    int got = 0;
+    pthread_mutex_lock(&g_frame_mu);
+    if (g_frame && g_frame_new && (uint32_t)w == g_frame_w && (uint32_t)h == g_frame_h) {
+        uint8_t *o = out_rgba;
+        for (size_t i = 0, n = (size_t)w * h; i < n; i++) { uint32_t p = g_frame[i]; o[4*i] = p >> 16; o[4*i+1] = p >> 8; o[4*i+2] = p; o[4*i+3] = p >> 24; }
+        g_frame_new = 0; got = 1;
+    }
+    pthread_mutex_unlock(&g_frame_mu);
+    return got;
+}
+
+void nxhost_peanuts_touch(int id, float x, float y, int down) { if (g_rt && x >= 0 && y >= 0) pn_rt_touch(g_rt, (uint32_t)id, (uint32_t)x, (uint32_t)y, down); }
 
 size_t nxhost_peanuts_snapshot(char *out, size_t n) {
     if (!out || !n) return 0;

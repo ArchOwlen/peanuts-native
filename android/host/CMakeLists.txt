@@ -46,6 +46,7 @@ list(APPEND HOST_C ${HOST}/plat/plat_android.c ${HOST}/plat/movie_avc_android.c 
 file(GLOB HOST_ANDROID_C CONFIGURE_DEPENDS ${HOST}/android/*.c)
 list(APPEND HOST_C ${HOST_ANDROID_C})
 list(APPEND HOST_C ${ROOT}/dm/peanuts/peanuts.c)   # PEANUTS: the companion's reader (PEANUTS.md)
+add_subdirectory(${ROOT}/dm/peanuts/rt ${CMAKE_CURRENT_BINARY_DIR}/peanuts_rt)   # PEANUTS: the companion runtime (C++), linked into every host below
 # dm/gfx without Metal: the NVN front (hle_nvn.c and its C helpers), nn::vi, nvdrv, the CPU texture code; android_stub.c answers for nvn_mtl.m, hle_vk.m, hle_gl.m and the other .m files
 file(GLOB GFX_C CONFIGURE_DEPENDS ${GFX}/*.c ${GFX}/nvn/*.c ${GFX}/tex/*.c ${GFX}/vk_android/*.c)   # vk_android: the NVN → Vulkan replay
 # Lossless Scaling frame generation (dm/gfx/vk_android/lsfg, ported from Eden): GPL-3.0-or-later, so a libnxhost.so built with it (the default) is GPL-3.0-or-later as a whole
@@ -92,6 +93,8 @@ function(nxhost_add tgt game)
   add_custom_target(${tgt}_seed COMMAND ${Python3_EXECUTABLE} ${ROOT}/dm/games/game.py seed ${game} ${SEED_H} BYPRODUCTS ${SEED_H} COMMENT "prewarm seed ${game}")
   add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${GAME_H} ${SEED_H})
   add_dependencies(${tgt} ${tgt}_seed)
+  target_link_libraries(${tgt} PRIVATE peanuts_rt)   # PEANUTS: the companion runtime
+  set_target_properties(${tgt} PROPERTIES LINKER_LANGUAGE CXX)   # PEANUTS: link with the C++ driver so libc++ comes in (the host is C)
   target_include_directories(${tgt} PRIVATE ${GEN}/${game} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST})
   # DM_NUP_ZSTD: compressed files of a NUP container are decompressed with zstddec (dm/host/nup_image.h)
   target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
