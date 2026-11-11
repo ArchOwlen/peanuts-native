@@ -1,6 +1,5 @@
 // PNRT: stubs for the ModRuntime members whose defining files are NOT lifted in R1
-// (mod_actions.cpp, mod_input.cpp, mod_guest_bridge.cpp, mod_module*.cpp, mod_nx_runtime.cpp,
-// mod_nx_assets.cpp, engine_*.cpp). Each is the smallest body that keeps the lifted callers
+// (mod_actions.cpp, mod_input.cpp, mod_guest_bridge.cpp, mod_module*.cpp, engine_*.cpp). Each is the smallest body that keeps the lifted callers
 // correct: "nothing happened" results (no-op, nullptr, nullopt, false, Skipped). The one
 // exception is RunAction's Page case, copied from mod_actions.cpp so that the manifest's
 // page_binds (mod_pages.cpp) can still switch pages. See PORT.md for the full list.
@@ -14,24 +13,11 @@
 #include <vector>
 
 #include "common/logging.h"
-#include "core/mods/mod_nx_assets.h"
 #include "core/mods/mod_runtime.h"
 #include "core/mods/mod_runtime_shared.h"
 
 namespace Core::Mods {
 
-namespace {
-bool EndsWithNoCase(std::string_view text, std::string_view suffix) {
-    if (text.size() < suffix.size()) {
-        return false;
-    }
-    const auto tail = text.substr(text.size() - suffix.size());
-    return std::equal(tail.begin(), tail.end(), suffix.begin(), suffix.end(),
-                      [](unsigned char a, unsigned char b) {
-                          return std::tolower(a) == std::tolower(b);
-                      });
-}
-} // namespace
 
 // --- mod_actions.cpp ---------------------------------------------------------------------------
 InputCommon::VirtualGamepad::VirtualButton ParseButton(const std::string& name, bool& ok) {
@@ -175,6 +161,9 @@ std::vector<u8> ModRuntime::LoadModuleData(const std::string&) {
 std::shared_ptr<const Image> ModRuntime::GetModuleImage(const std::string&) {
     return nullptr;
 }
+bool ModRuntime::LoadModuleImageSync(const std::string&, Image&) {
+    return false;
+}
 bool ModRuntime::LockMapStateUnlessRaster(MapStateLock& lock) const {
     // Verbatim from mod_module_host.cpp: the lock is deferred on map_state_mutex by the caller.
     constexpr auto Grace = std::chrono::microseconds{250};
@@ -190,72 +179,5 @@ bool ModRuntime::LockMapStateUnlessRaster(MapStateLock& lock) const {
         std::this_thread::yield();
     }
 }
-
-// --- mod_nx_runtime.cpp / mod_nx_assets.cpp ----------------------------------------------------
-// Nintendo container decoding (SARC/BNTX/BFFNT) and composites are not lifted in R1: every such
-// source takes the synchronous ReadAssetBytes path (NxFallback = true), which reports it as
-// "not found" once and leaves the widget blank.
-NxAssetState* MakeNxAssetState(ModRuntime*) {
-    return nullptr;
-}
-void NxAssetStateDeleter::operator()(NxAssetState*) const {}
-bool ModRuntime::IsNxAssetSource(const std::string& src) {
-    if (!src.starts_with("romfs:") && !src.starts_with("file:")) {
-        return false;
-    }
-    const size_t hash = src.find('#');
-    const std::string_view file = std::string_view{src}.substr(0, hash);
-    if (EndsWithNoCase(file, ".lzs")) {
-        return false;
-    }
-    if (hash != std::string::npos) {
-        return true;
-    }
-    return EndsWithNoCase(file, ".bntx") || EndsWithNoCase(file, ".bffnt") ||
-           EndsWithNoCase(file, ".arc") || EndsWithNoCase(file, ".sarc");
-}
-bool ModRuntime::NxFallback(const std::string&) const {
-    return true;
-}
-std::shared_ptr<const Image> ModRuntime::GetNxImage(const std::string&) {
-    return nullptr;
-}
-std::shared_ptr<const Image> ModRuntime::GetCompositeImage(const std::string& name) {
-    static bool warned = false;
-    if (!warned) {
-        warned = true;
-        LOG_WARNING(Core, "DSMod: composite images are not available in this build ('{}')", name);
-    }
-    return nullptr;
-}
-bool ModRuntime::ReadNxMember(const std::string&, std::vector<u8>&) {
-    return false;
-}
-void ModRuntime::PumpNxAssets(const StateSnapshot&) {}
-void ModRuntime::PublishNxFades(StateSnapshot&) {}
-float ModRuntime::CompositeFade(const std::string&) {
-    return 1.0f;
-}
-void ModRuntime::ResetNxAssets() {}
-bool ModRuntime::RequestNxFont() {
-    return false;
-}
-std::shared_ptr<const std::string> ModRuntime::GetMsbtText(const std::string&) {
-    return nullptr;
-}
-const FontMetrics* ModRuntime::NxIconFont(std::shared_ptr<const Image>& atlas, bool& pending,
-                                          FontMetrics*) {
-    atlas = nullptr;
-    pending = false;
-    return nullptr;
-}
-
-namespace NxAssets {
-bool DecodeBntxImage(std::span<const u8>, std::string_view, Image&, std::string& error) {
-    error = "BNTX decoding is not lifted in this build";
-    return false;
-}
-void ParseManifestExtras(const nlohmann::json&, Manifest&) {}
-} // namespace NxAssets
 
 } // namespace Core::Mods

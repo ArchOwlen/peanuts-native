@@ -68,6 +68,12 @@ typedef struct PnRtConfig {
     PnRtPad pad;     /* all fields may be NULL */
     PnRtLogFn log;   /* NULL = stderr (and logcat on Android) */
     int log_level;   /* 0 trace .. 5 critical; messages below it are dropped (default 2 = info) */
+    /// System language for "msbt:" texts: 0 = default (American English), else 1 + Eden's
+    /// Settings::Language index (1 Japanese, 2 EnglishAmerican, 3 French, 4 German, 5 Italian,
+    /// 6 Spanish, 7 Chinese, 8 Korean, 9 Dutch, 10 Portuguese, 11 Russian, 12 Taiwanese,
+    /// 13 EnglishBritish, 14 FrenchCanadian, 15 SpanishLatin, 16 ChineseSimplified,
+    /// 17 ChineseTraditional, 18 PortugueseBrazilian, 19 Polish, 20 Thai).
+    int language;
 } PnRtConfig;
 
 /// Creates a runtime for `config`. NULL when the package has no usable manifest for the title

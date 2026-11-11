@@ -17,6 +17,8 @@ dm/peanuts/third_party/
   stb/stb_image.h, stb_image_resize.h, stb_image_write.h (Eden externals/stb; Eden uses resize v1, not resize2)
   ankerl/unordered_dense.h, stl.h  (SnapshotMap in mod_types.h)
   bc_decoder/bc_decoder.{h,cpp}    (DDS BC1/BC3/BC7, used by mod_assets.cpp DecodeDds)
+  astc/video_core/textures/astc.{h,cpp}  (R1b: Eden's software ASTC decoder, byte-identical; BNTX ASTC textures)
+  astc/boost/container/static_vector.hpp (R1b: minimal stand-in for the one Boost type astc.cpp uses)
 ```
 
 The lifted files include each other as `core/mods/<name>`; CMake creates
@@ -27,12 +29,11 @@ hunks listed below (`diff -u ~/eden/src/core/mods/X mods/X` shows exactly them).
 ## Lifted (compiled) files
 
 mod_assets.cpp, mod_load_plan.cpp, mod_manifest.cpp, mod_map.cpp, mod_msbt.cpp, mod_pages.cpp,
-mod_redraw.cpp, mod_runtime.cpp, mod_state.cpp, mod_ui.cpp, mod_ui_canvas.cpp, mod_ui_expand.cpp,
+mod_nx_assets.cpp, mod_nx_runtime.cpp (R1b), mod_redraw.cpp, mod_runtime.cpp, mod_state.cpp, mod_ui.cpp, mod_ui_canvas.cpp, mod_ui_expand.cpp,
 mod_ui_image.cpp, mod_ui_map_widget.cpp, mod_ui_scroll.cpp, mod_ui_text.cpp,
 mod_ui_transitions.cpp, mod_ui_widget_state.cpp; headers mod_types*.h, mod_ui*.h, mod_msbt.h,
 map_overview.h, map_cache_identity.h, mod_runtime.h, mod_runtime_shared.h, mod_load_plan.h,
-engine_formats.h, mod_module.h, dsmod_module_abi.h, dsmod_module_extensions.h, mod_nx_assets.h
-(headers only; their .cpp are not lifted). Files named in the inventory that do not exist on the
+engine_formats.h, mod_module.h, dsmod_module_abi.h, dsmod_module_extensions.h, mod_nx_assets.h. Files named in the inventory that do not exist on the
 dsmod branch: mod_expr.cpp, mod_settings.cpp, mod_nav.cpp, mod_host_values.{h,cpp},
 mod_view_default.h, mod_input_tokens.h (their functionality lives inside the files above).
 
@@ -68,6 +69,10 @@ Everything else in `mods/` is byte-identical to Eden.
 | video_core/dsmod/aux_routing.h, video_core/gpu.h | **the UI sink**: `AuxRouting` keeps the latest frame (PublishUi / PublishUiWith / PublishUiPartial / ClearUi / TakeUi) and forwards to an optional `UiSink` of host callbacks; touch mailbox (SetTouch/GetTouch); `PublishAuxTexture`/`PublishMapFadeTextures(Tiles)`/`PublishComposite`/`ClearComposite` accepted and dropped (GPU composite path off); `TileMask`, `DiffTiles`, `UiDiffEnabled()` = false; `Quad`; haptic sink |
 | input_common/drivers/virtual_gamepad.h | `VirtualGamepad` (same VirtualButton enum) forwarding to a `PadSink` of function pointers; `InputSubsystem::GetVirtualGamepad()` |
 | hid_core/frontend/emulated_controller.h | `HIDCore::GetEmulatedController` -> nullptr (PadIsPushed() = false) |
+| core/hle/service/ns/language.h, core/hle/service/set/settings_types.h | (R1b) `ApplicationLanguage`, `LanguageCode`, `available_language_codes`, `ConvertToApplicationLanguage` as Eden; priority lists reduced to {self, AmericanEnglish, Japanese} |
+| core/file_sys/control_metadata.h, patch_manager.h | (R1b) `NACP::GetSupportedLanguages()`; `PatchManager::GetMetadataFromBaseOrUpdate` -> no metadata (0 = all languages) |
+| common/settings.h (`language_index`) | (R1b) `Settings::Language` + `CanonicalizeEnum`; set from `PnRtConfig::language` (default American English) |
+| common/alignment.h, video_core/textures/workers.h | (R1b) `DivideUp`; `ThreadWorker` that runs astc row jobs inline (the Nx asset worker is already a thread) |
 
 ## Stubs (mods/pnrt_stubs.cpp): members of files not lifted
 
@@ -75,8 +80,8 @@ Everything else in `mods/` is byte-identical to Eden.
 - **mod_input.cpp**: `DrainTaps`, `PublishMapState`, `PublishScroll`, `PublishInteraction`, `UpdateGestures`, `ReturnIdleViews`, `ApplyViewCorrections`, `ResetInteraction`, `FlushHaptic`, `DriveCmdDrag` (no-ops); `GetViewState` (returns view_state), `GlideViews` (false). Touch is therefore a no-op end to end (pn_rt_touch fills the aux mailbox; nothing consumes it).
 - **mod_guest_bridge.cpp**: `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences` (no-ops), `ScanPattern` (nullopt).
 - **engine_il2cpp/mercury/ichigo.cpp**: `FindClassSlotByName`, `DetectMethodsOffset`, `FindPlayerNode` (nullopt); `DecodeBctex`, `DecodeSosXtx`, `ParseMfnt`, `ParseSosFont` (false); `DecodeLzss`, `ExtractArchiveMember` (empty).
-- **mod_module*.cpp**: `GameModule::~GameModule`, `InitializeGameModule` (module = none), `ShutdownGameModule`, `RunGameModule`, `DrainModuleImages`, `InstallModuleAreas`, `ApplyPendingMapUpdates` (no-ops), `LoadModuleData` (empty), `GetModuleImage` (nullptr), `LockMapStateUnlessRaster` (copied verbatim: it is generic).
-- **mod_nx_runtime.cpp / mod_nx_assets.cpp**: `MakeNxAssetState` (nullptr; never dereferenced because `NxFallback` returns true so every Nintendo-container source takes the synchronous `ReadAssetBytes` path and is reported "not found" once), `NxAssetStateDeleter`, `IsNxAssetSource` (copied), `GetNxImage`/`GetCompositeImage` (nullptr), `ReadNxMember` (false), `PumpNxAssets`, `PublishNxFades`, `ResetNxAssets` (no-ops), `CompositeFade` (1.0), `RequestNxFont` (false), `GetMsbtText` (nullptr), `NxIconFont` (nullptr, pending=false), `NxAssets::DecodeBntxImage` (false), `NxAssets::ParseManifestExtras` (no-op: "composites" and the long font keys are ignored).
+- **mod_module*.cpp**: `GameModule::~GameModule`, `InitializeGameModule` (module = none), `ShutdownGameModule`, `RunGameModule`, `DrainModuleImages`, `InstallModuleAreas`, `ApplyPendingMapUpdates` (no-ops), `LoadModuleData` (empty), `GetModuleImage` (nullptr), `LoadModuleImageSync` (false), `LockMapStateUnlessRaster` (copied verbatim: it is generic).
+- **mod_nx_runtime.cpp / mod_nx_assets.cpp**: no stubs since R1b (both lifted as-is).
 - Dev tools (`mod_re_tools.cpp`, `mod_console.cpp`): compiled out by `EDEN_DSMOD_BUILD_DEV_TOOLS=0` (the shells in mod_runtime.cpp are already empty then).
 
 ## Verified (host, 2026-11-11)
@@ -93,12 +98,16 @@ Everything else in `mods/` is byte-identical to Eden.
 - arm64 Android (NDK 28.2.13676358, android-33, `-fexperimental-library` for std::jthread as in
   Eden's own Android build): libpeanuts_rt.a builds with all pn_rt_* symbols. Not run on device.
 
-## Known gaps / R1b candidates
+## Verified R1b (host, 2026-11-11, romfs = <your extracted Link's Awakening RomFS>)
 
-- No Nintendo container decoding (SARC/BNTX/BFFNT) and no composites: mod_nx_assets.cpp is
-  pure format code (no Eden dependency beyond common_types) and mod_nx_runtime.cpp needs only a
-  language setting + the VFS shim -- lift both to get LA's real art and font once a romfs dir is
-  available to the host.
+`rt_test <LA package> <out> <romfs>`: `standby.png` shows the ItemBG texture, the Link's
+Awakening logo and the bomb/rupee/heart icons (SARC -> BNTX, ASTC/BC decoded on the Nx worker);
+`gear.png` shows the jpn_main.bffnt font ("Gear", "Close", the hint line from UI.msbt), the 12
+item discs and X/Y slots (composites `cell_disc`/`slot_disc`/`tab_cap`), rupee icon + live 123.
+Without a romfs dir the behaviour is as in R1a (logged "not found", blank). arm64 lib rebuilt.
+
+## Known gaps / R1c candidates
+
 - No touch/gestures/actions beyond page switches: mod_input.cpp and mod_actions.cpp depend only
   on the aux/pad shims already written; lifting them replaces most of pnrt_stubs.cpp.
 - `Core::System::ApplicationProcess()` is nullptr: heap-region sweeps (ArrayFind/PlayerFind

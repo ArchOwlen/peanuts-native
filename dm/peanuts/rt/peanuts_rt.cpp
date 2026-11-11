@@ -13,6 +13,7 @@
 
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/mods/mod_runtime.h"
 #include "peanuts_rt.h"
@@ -110,6 +111,11 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
         Common::Log::SetSink(config->log);
     }
     Common::Log::SetMinLevel(static_cast<Common::Log::Level>(std::clamp(config->log_level, 0, 5)));
+
+    Settings::values.language_index.SetValue(
+        config->language >= 1 && config->language <= 20
+            ? static_cast<Settings::Language>(config->language - 1)
+            : Settings::Language::EnglishAmerican);
 
     auto rt = std::make_unique<PnRt>();
     rt->config = *config;

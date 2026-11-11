@@ -33,6 +33,8 @@ set(PNRT_LIFTED
   mods/mod_manifest.cpp
   mods/mod_map.cpp
   mods/mod_msbt.cpp
+  mods/mod_nx_assets.cpp
+  mods/mod_nx_runtime.cpp
   mods/mod_pages.cpp
   mods/mod_redraw.cpp
   mods/mod_runtime.cpp
@@ -54,13 +56,14 @@ add_library(peanuts_rt STATIC
   shim/shim.cpp
   shim/stb_impl.cpp
   ${PNRT_THIRD_PARTY}/bc_decoder/bc_decoder.cpp
+  ${PNRT_THIRD_PARTY}/astc/video_core/textures/astc.cpp
   peanuts_rt.cpp
 )
 target_compile_features(peanuts_rt PUBLIC cxx_std_20)
 target_include_directories(peanuts_rt
   PUBLIC ${PNRT_DIR}
   PRIVATE ${PNRT_DIR}/shim ${PNRT_INC_ROOT} ${PNRT_THIRD_PARTY} ${PNRT_THIRD_PARTY}/stb
-          ${PNRT_THIRD_PARTY}/bc_decoder)
+          ${PNRT_THIRD_PARTY}/bc_decoder ${PNRT_THIRD_PARTY}/astc)
 target_compile_definitions(peanuts_rt PRIVATE PNRT=1 EDEN_DSMOD_BUILD_DEV_TOOLS=0)
 target_compile_options(peanuts_rt PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden
   -Wall -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable

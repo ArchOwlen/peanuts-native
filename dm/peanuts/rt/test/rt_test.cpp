@@ -94,18 +94,21 @@ bool RenderPage(PnRt* rt, const char* page, const std::filesystem::path& out) {
     bool got = false;
     // The redraw worker publishes asynchronously; settle a few more frames after the first so
     // assets requested by the first render (none here, but the path is real) could land.
-    int settle = 0;
-    for (int tick = 0; tick < 240 && settle < 20; ++tick) {
+    // Stop once nothing new has been published for ~1.5 s after the first frame (romfs art and
+    // the font decode asynchronously on the asset worker and republish when they land).
+    int quiet = 0;
+    for (int tick = 0; tick < 900 && quiet < 90; ++tick) {
         pn_rt_tick(rt);
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
         uint32_t fw{}, fh{};
+        bool fresh = false;
         if (pn_rt_frame(rt, &fw, &fh, nullptr, 0)) {
             pixels.resize(static_cast<size_t>(fw) * fh);
             if (pn_rt_frame(rt, &w, &h, pixels.data(), pixels.size())) {
-                got = true;
+                got = fresh = true;
             }
         }
-        if (got) ++settle;
+        quiet = got && !fresh ? quiet + 1 : 0;
     }
     if (!got) {
         std::fprintf(stderr, "rt_test: no frame published for page %s\n", page ? page : "(first)");
