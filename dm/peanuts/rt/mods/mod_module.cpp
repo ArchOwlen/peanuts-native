@@ -225,8 +225,14 @@ std::unique_ptr<GameModule> GameModule::Load(FileSys::VirtualDir assets, u64 tit
                                      return (b.size() == 16 || b.size() == 64) &&
                                             IsHex(b, b.size());
                                  }) ||
-            !std::ranges::any_of(builds,
-                                 [&](const auto& b) { return build.starts_with(Upper(b)); })) {
+            !std::ranges::any_of(builds, [&](const auto& b) {
+                // PNRT: the host knows a build by its first 8 bytes (16 hex digits, padded to 64 with zeros), a manifest may list the whole 20-byte id: either
+                // is accepted as a prefix of the other, never below 16 digits
+                const std::string B = Upper(b);
+                std::string host = build;
+                while (host.size() > 16 && host.back() == '0') host.pop_back();
+                return build.starts_with(B) || B.starts_with(host);
+            })) {
             throw std::runtime_error("dual-screen module does not support this game build");
         }
         const auto platform = Platform();
