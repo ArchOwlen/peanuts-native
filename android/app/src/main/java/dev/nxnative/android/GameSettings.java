@@ -264,6 +264,7 @@ final class GameSettings {
         advanced.add(new Ui.Setting(a, "📝", "Extra environment", v -> env(a, g, again))
                 .value(envLines == 0 ? "None" : envLines + (envLines == 1 ? " line: " : " lines: ") + env.replace('\n', ' ')).chevron(a));
 
+        options.rows.addView(dev.peanuts.settings.CompanionSection.view(a, id, dev.peanuts.settings.CompanionSection.root(g.packDir)));   // PEANUTS: the Companion section (install/update/remove, second screen)
         Section[] all = perf ? new Section[] {picture, speed, advanced} : new Section[] {options, controls};   // Performance: what changes speed and picture; Game: the game's own options, language and controls
         View reset = recLine != null ? null : Ui.button(a, "Reset to defaults", Ui.Kind.SOFT, v -> new AlertDialog.Builder(a).setTitle("Reset to defaults · " + g.name)
                 .setMessage("The game will follow global settings. Extra environment lines are kept.")

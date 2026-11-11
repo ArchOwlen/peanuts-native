@@ -15,5 +15,6 @@
             android:exported="false"
             android:process=":pack"
             android:foregroundServiceType="dataSync" />
+        <service android:name="dev.peanuts.build.BuildService" android:exported="false" android:foregroundServiceType="dataSync" />   <!-- PEANUTS: the library's build service (import → Prepare → companion) -->
     </application>
 </manifest>

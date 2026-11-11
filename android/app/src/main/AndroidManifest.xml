@@ -23,7 +23,9 @@
         android:largeHeap="true"
         android:appCategory="game"
         android:hasFragileUserData="true">
-        <activity android:name="dev.peanuts.CatalogActivity" android:label="Peanuts Companions" android:exported="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>   <!-- PEANUTS: the companion catalog -->
+        <activity android:name="dev.peanuts.ui.LibraryActivity" android:label="Peanuts Native" android:exported="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>   <!-- PEANUTS: the library (home) -->
+        <activity android:name="dev.peanuts.ui.SetupActivity" android:label="Setup" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />   <!-- PEANUTS: first-run setup -->
+        <activity android:name="dev.peanuts.CatalogActivity" android:label="Peanuts Companions" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />   <!-- PEANUTS: the companion catalog (from the library's menu) -->
         <activity
             android:name=".MainActivity"
             android:theme="@style/Theme.Banana"

@@ -1,0 +1,98 @@
+package dev.peanuts;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+import org.json.JSONArray;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * Peanuts Native's own settings (SharedPreferences "peanuts", never upstream's "prefs"): the setup (keys, firmware, the library's folders) and what the user chose per
+ * title in its game sheet (the update file, the DLC files, the companion package). Paths are /storage paths the host can open (PathUtil's form), the keys and the
+ * firmware's fonts live in the app's files folder (DESIGN-library.md "Folders and files").
+ */
+public final class PeanutsPrefs {
+    private PeanutsPrefs() {}
+
+    static SharedPreferences of(Context c) { return c.getSharedPreferences("peanuts", Context.MODE_PRIVATE); }
+
+    // ---- Setup ----
+
+    /** files/keys/prod.keys: where SetupActivity copies the picked prod.keys (never shipped) */
+    public static File keysFile(Context c) { return new File(new File(c.getFilesDir(), "keys"), "prod.keys"); }
+    /** files/firmware/fonts: the shared fonts extracted from the user's firmware (standard.ttf, nintendo_ext.ttf) */
+    public static File fontsDir(Context c) { return new File(new File(c.getFilesDir(), "firmware"), "fonts"); }
+    /** files/icons: the titles' icons as PNG, <title ID>.png */
+    public static File iconsDir(Context c) { return new File(c.getFilesDir(), "icons"); }
+
+    public static boolean hasKeys(Context c) { return keysFile(c).isFile() && keysFile(c).length() > 0; }
+    public static boolean hasFonts(Context c) { return new File(fontsDir(c), "standard.ttf").isFile(); }
+
+    public static String firmwareDir(Context c) { return of(c).getString("firmware_dir", null); }
+    public static void firmwareDir(Context c, String p) { put(c, "firmware_dir", p); }
+    public static String gameDir(Context c) { return of(c).getString("game_dir", null); }
+    public static void gameDir(Context c, String p) { put(c, "game_dir", p); }
+    public static String updateDir(Context c) { return of(c).getString("update_dir", null); }
+    public static void updateDir(Context c, String p) { put(c, "update_dir", p); }
+    public static String dlcDir(Context c) { return of(c).getString("dlc_dir", null); }
+    public static void dlcDir(Context c, String p) { put(c, "dlc_dir", p); }
+
+    public static boolean setupDone(Context c) { return of(c).getBoolean("setup_done", false); }
+    public static void setupDone(Context c, boolean on) { of(c).edit().putBoolean("setup_done", on).apply(); }
+
+    /** The roots the library scans: the game folder first, then the update and DLC folders when set and different */
+    public static List<File> roots(Context c) {
+        List<File> out = new ArrayList<>();
+        for (String p : new String[] {gameDir(c), updateDir(c), dlcDir(c)}) {
+            if (p == null || p.isEmpty()) continue;
+            File f = new File(p);
+            if (!out.contains(f)) out.add(f);
+        }
+        return out;
+    }
+
+    // ---- Per title (the game sheet's choices) ----
+
+    private static String key(String titleId, String what) { return "t." + titleId.toUpperCase(Locale.ROOT) + "." + what; }
+
+    /** The update file the user chose for a title (null: the newest found) */
+    public static String chosenUpdate(Context c, String titleId) { return of(c).getString(key(titleId, "update"), null); }
+    public static void chosenUpdate(Context c, String titleId, String path) { put(c, key(titleId, "update"), path); }
+
+    /** The DLC files the user added by hand for a title (beside the ones the scan matched) */
+    public static List<String> chosenDlc(Context c, String titleId) {
+        List<String> out = new ArrayList<>();
+        try {
+            JSONArray a = new JSONArray(of(c).getString(key(titleId, "dlc"), "[]"));
+            for (int i = 0; i < a.length(); i++) out.add(a.getString(i));
+        } catch (org.json.JSONException e) { /* an unreadable list is an empty one */ }
+        return out;
+    }
+    public static void chosenDlc(Context c, String titleId, List<String> paths) {
+        JSONArray a = new JSONArray();
+        for (String p : paths) a.put(p);
+        of(c).edit().putString(key(titleId, "dlc"), a.toString()).apply();
+    }
+
+    /** The companion package the user wants installed for a title (null: none chosen) */
+    public static String companion(Context c, String titleId) { return of(c).getString(key(titleId, "companion"), null); }
+    public static void companion(Context c, String titleId, String packageName) { put(c, key(titleId, "companion"), packageName); }
+
+    /** "Install the companion after the build" (the sheet's checkbox; on by default when the catalog has one) */
+    public static boolean installCompanion(Context c, String titleId) { return of(c).getBoolean(key(titleId, "install_companion"), true); }
+    public static void installCompanion(Context c, String titleId, boolean on) { of(c).edit().putBoolean(key(titleId, "install_companion"), on).apply(); }
+
+    /** The companion's second-screen mode for a title ("physical" or "off"; agent C's settings section writes it, the Presentation reads it later) */
+    public static String companionScreen(Context c, String titleId) { return of(c).getString(key(titleId, "screen"), "physical"); }
+    public static void companionScreen(Context c, String titleId, String mode) { put(c, key(titleId, "screen"), mode); }
+
+    private static void put(Context c, String k, String v) {
+        SharedPreferences.Editor e = of(c).edit();
+        if (v == null || v.isEmpty()) e.remove(k); else e.putString(k, v);
+        e.apply();
+    }
+}
