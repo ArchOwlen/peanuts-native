@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
                 printf("  sec %d: off %#llx size %#llx fs %d hash %d crypt %d data_off %#llx ctr ", s, (unsigned long long)S->off, (unsigned long long)S->size, S->fs_type, S->hash_type, S->crypt_type, (unsigned long long)S->data_off);
                 for (int k = 0; k < 8; k++) printf("%02x", S->ctr[k]); printf("\n");
                 const uint8_t *fh = n.hdr + 0x400 + 0x200 * s;
+                if (S->compressed) { uint64_t to, ts; uint32_t cnt; memcpy(&to, fh + 0x178, 8); memcpy(&ts, fh + 0x180, 8); memcpy(&cnt, fh + 0x190, 4); printf("    compressed: table @%#llx+%#llx (from data_off), %u entries\n", (unsigned long long)to, (unsigned long long)ts, cnt); }
                 for (int row = 0; row < 0x200; row += 0x20) { printf("    %03x:", row); for (int k = 0; k < 0x20; k++) printf("%s%02x", k % 8 ? "" : " ", fh[row + k]); printf("\n"); }
             }
             nx_nca_close(&n);
@@ -107,11 +108,11 @@ int main(int argc, char **argv) {
         uint64_t hoff, hsize, doff, dsize; uint32_t lg; memcpy(&hoff, lv + 0x18 * 4, 8); memcpy(&hsize, lv + 0x18 * 4 + 8, 8); memcpy(&doff, lv + 0x18 * 5, 8); memcpy(&dsize, lv + 0x18 * 5 + 8, 8); memcpy(&lg, lv + 0x18 * 5 + 16, 4);
         uint32_t bs = 1u << lg;
         printf("level 5 (hashes) @%#llx+%#llx, level 6 (data) @%#llx+%#llx, block %u\n", (unsigned long long)hoff, (unsigned long long)hsize, (unsigned long long)doff, (unsigned long long)dsize, bs);
-        uint8_t *hashes = malloc((size_t)hsize), *buf = malloc(bs); if (!hashes || !buf || nx_sec_read(&n, s, hoff, hashes, (size_t)hsize)) return die("hashes");
+        uint8_t *hashes = malloc((size_t)hsize), *buf = malloc(bs); if (!hashes || !buf || nx_sec_read_raw(&n, s, hoff, hashes, (size_t)hsize)) return die("hashes");   // raw: the hashes cover the (compressed) data level
         uint64_t blocks = (dsize + bs - 1) / bs, bad = 0; t0 = now();
         for (uint64_t i = 0; i < blocks; i++) {
             size_t k = (size_t)(dsize - i * bs < bs ? dsize - i * bs : bs); memset(buf, 0, bs);
-            if (nx_sec_read(&n, s, doff + i * bs, buf, k)) return die("read");
+            if (nx_sec_read_raw(&n, s, doff + i * bs, buf, k)) return die("read");
             uint8_t h[32]; nx_sha256(buf, bs, h);   // a short last block is hashed zero-padded to the block size
             if (memcmp(h, hashes + 32 * i, 32)) { if (bad < 5) printf("  block %llu (@%#llx) does not match\n", (unsigned long long)i, (unsigned long long)(doff + i * bs)); bad++; }
             if (!(i & 4095)) { fprintf(stderr, "\r  [%6.1fs] %llu / %llu blocks", now() - t0, (unsigned long long)i, (unsigned long long)blocks); fflush(stderr); }

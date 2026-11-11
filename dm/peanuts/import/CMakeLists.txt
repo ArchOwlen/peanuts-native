@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(NXIMPORT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/nx_crypto.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/nx_lz4.c
     ${CMAKE_CURRENT_SOURCE_DIR}/nx_nca.c
     ${CMAKE_CURRENT_SOURCE_DIR}/nx_icon.c
     ${CMAKE_CURRENT_SOURCE_DIR}/nximport.c)
@@ -20,6 +21,9 @@ else()
   add_executable(nximport_cli ${CMAKE_CURRENT_SOURCE_DIR}/nximport_cli.c ${NXIMPORT_SOURCES})   # the sources themselves: its ncainfo command uses the internals
   target_include_directories(nximport_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(nximport_cli PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation)
+  add_executable(comp_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/comp_test.c ${NXIMPORT_SOURCES})   # the compression layer against the reference LZ4 (tests/comp_check.py)
+  target_include_directories(comp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_options(comp_test PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation)
 endif()
 target_include_directories(nximport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(nximport PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -fvisibility=hidden)

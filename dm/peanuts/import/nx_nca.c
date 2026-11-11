@@ -1,5 +1,6 @@
-// libnximport: keys, containers, NCA sections (CTR and BKTR), PFS0/RomFS trees, CNMT titles (nx_internal.h).
-// Formats as documented publicly (switchbrew NCA/NSP/XCI/CNMT pages); hactool (ISC, SciresM) was consulted for the CTR/BKTR counter conventions.
+// libnximport: keys, containers, NCA sections (CTR and BKTR, compressed), PFS0/RomFS trees, CNMT titles (nx_internal.h).
+// Formats as documented publicly (switchbrew NCA/NSP/XCI/CNMT pages); hactool (ISC, SciresM) was consulted for the CTR/BKTR counter conventions,
+// Atmosphère's fssystem (as vendored by yuzu/Eden: fssystem_nca_header.h, fssystem_compressed_storage.h, fssystem_nca_file_system_driver.cpp) for the compression layer.
 #define _FILE_OFFSET_BITS 64
 #define _GNU_SOURCE
 #include "nximport.h"
@@ -274,7 +275,7 @@ static int bktr_read(NxNca *n, int s, uint64_t off, uint8_t *buf, size_t len) {
         if (!r || off >= r->end) { nx_err("%s: offset %llu is outside the patch's relocation table", n->id, (unsigned long long)off); return -1; }
         size_t k = len; if (off + k > r->end) k = (size_t)(r->end - off);
         uint64_t phys = r->phys + (off - r->virt);
-        if (!r->patch) { if (!S->base) { nx_err("%s: patch section %d has no base", n->id, s); return -1; } if (nx_sec_read(S->base, S->base_sec, phys, buf, k)) return -1; }
+        if (!r->patch) { if (!S->base) { nx_err("%s: patch section %d has no base", n->id, s); return -1; } if (nx_sec_read_raw(S->base, S->base_sec, phys, buf, k)) return -1; }   // the base's raw bytes: its compression (if any) is below the patch's
         else {
             if (!n->key_ok) { nx_err("%s: %s", n->id, n->key_why); return -1; }
             size_t done = 0;
@@ -292,14 +293,110 @@ static int bktr_read(NxNca *n, int s, uint64_t off, uint8_t *buf, size_t len) {
     return 0;
 }
 
-int nx_sec_read(NxNca *n, int s, uint64_t off, void *buf, size_t len) {
+int nx_sec_read_raw(NxNca *n, int s, uint64_t off, void *buf, size_t len) {
     if (s < 0 || s > 3 || !n->sec[s].present) { nx_err("%s: no section %d", n->id, s); return -1; }
     if (n->sec[s].crypt_type == 4) return bktr_read(n, s, off, buf, len);
     return sec_read_plain(n, s, off, buf, len);
 }
 
+// ---------------------------------------------------------------- compression
+// NcaFsHeader.CompressionInfo @0x178: table offset (8), table size (8), BucketTree header (0x10: "BKTR", version 1, entry count). The layer sits above the
+// hash layer (Atmosphère's CreateStorageByRawStorage: hash, then compression), so the table offset and the entries' physical offsets count from the data
+// level (S->data_off: the IVFC data level or the PFS0), and the decompressed bytes are the RomFS/PFS0 itself. The table is a bucket tree of 16 KiB nodes:
+// the root node (index, count = entry sets, offset = the virtual end), then the entry sets (index, count, offset = the set's virtual end, entries 0x18 each:
+// virtual offset, physical offset, type (0 none, 1 zeros, 3 LZ4), physical size).
+static int cmp_comp(const void *a, const void *b) { const NxCompEntry *x = a, *y = b; return x->virt < y->virt ? -1 : x->virt > y->virt; }
+
+static int comp_load(NxNca *n, int s) {
+    NxSection *S = &n->sec[s]; const uint8_t *ci = n->hdr + 0x400 + 0x200 * s + 0x178; uint8_t *tb = NULL; NxComp *c = NULL;
+    uint64_t toff = u64(ci), tsize = u64(ci + 8); uint32_t cnt = u32(ci + 0x18);
+    if (memcmp(ci + 0x10, "BKTR", 4) || u32(ci + 0x14) != 1) NX_FAIL("%s: section %d: bad compression table header", n->id, s);
+    const uint32_t per = (0x4000 - 0x10) / 0x18, sets = cnt ? (cnt + per - 1) / per : 0;
+    if (!cnt || sets > (0x4000 - 0x10) / 8) NX_FAIL("%s: section %d: %u compression entries (not supported)", n->id, s, cnt);   // more than 1.39 M entries would need L2 nodes
+    uint64_t need = (uint64_t)0x4000 * (1 + sets);
+    if (tsize < need || tsize > (256u << 20) || toff > UINT64_MAX - tsize) NX_FAIL("%s: section %d: compression table out of bounds", n->id, s);
+    if (!(tb = malloc((size_t)need)) || !(c = calloc(1, sizeof *c))) NX_FAIL("out of memory");
+    if (nx_sec_read_raw(n, s, S->data_off + toff, tb, (size_t)need)) goto fail;
+    if (u32(tb + 4) != sets) NX_FAIL("%s: section %d: compression table root has %u entry sets, expected %u", n->id, s, u32(tb + 4), sets);
+    c->total = u64(tb + 8); c->table_off = toff; c->cached = UINT32_MAX;
+    if (!(c->e = malloc(sizeof *c->e * cnt))) NX_FAIL("out of memory");
+    for (uint32_t i = 0; i < sets; i++) {
+        const uint8_t *bk = tb + 0x4000 * (i + 1); uint32_t ne = u32(bk + 4); uint64_t vend = u64(bk + 8);
+        if (ne != (i + 1 < sets ? per : cnt - per * i)) NX_FAIL("%s: section %d: bad compression entry set %u", n->id, s, i);
+        for (uint32_t j = 0; j < ne; j++) {
+            const uint8_t *e = bk + 0x10 + 0x18 * j; NxCompEntry *x = &c->e[c->n++];
+            x->virt = u64(e); x->phys = u64(e + 8); x->type = e[0x10]; x->psize = u32(e + 0x14); x->end = j + 1 < ne ? u64(e + 0x18) : vend;
+        }
+    }
+    qsort(c->e, c->n, sizeof *c->e, cmp_comp);
+    for (uint32_t i = 0; i < c->n; i++) {
+        NxCompEntry *x = &c->e[i];
+        x->end = i + 1 < c->n ? c->e[i + 1].virt : c->total;
+        uint64_t vs = x->end - x->virt;
+        // an uncompressed ("none") entry is read in place, any size, its physical size unused (Atmosphère ignores it: the Echoes of Wisdom base has one of
+        // 766 MiB with physical size -1); a zeros entry has no bytes; an LZ4 block is decompressed whole, so it is bounded
+        int bad = x->end <= x->virt || (i == 0 && x->virt);
+        if (x->type == 0) bad |= x->phys > toff || vs > toff - x->phys;
+        else if (x->type == 3) bad |= vs > (64u << 20) || x->phys > toff || x->psize > toff - x->phys;
+        else if (x->type != 1) bad = 1;
+        if (bad) NX_FAIL("%s: section %d: bad compression entry %u (virtual %#llx..%#llx, physical %#llx+%#x, type %d)", n->id, s, i, (unsigned long long)x->virt, (unsigned long long)x->end, (unsigned long long)x->phys, x->psize, x->type);
+    }
+    if (getenv("NX_DEBUG")) fprintf(stderr, "nximport: %s section %d: %u compression entries, table @%#llx+%#llx, %llu bytes decompressed\n", n->id, s, c->n, (unsigned long long)toff, (unsigned long long)tsize, (unsigned long long)c->total);
+    free(tb); S->comp = c; return 0;
+fail:
+    free(tb); if (c) { free(c->e); free(c); } return -1;
+}
+
+static void comp_free(NxComp *c) { if (!c) return; free(c->e); free(c->out); free(c->in); free(c); }
+
+static const NxCompEntry *find_comp(const NxComp *c, uint64_t v) {
+    uint32_t lo = 0, hi = c->n;
+    while (lo < hi) { uint32_t m = (lo + hi) / 2; if (c->e[m].virt <= v) lo = m + 1; else hi = m; }
+    return lo ? &c->e[lo - 1] : NULL;
+}
+
+static int comp_read(NxNca *n, int s, uint64_t voff, uint8_t *buf, size_t len) {   // voff: from the data level's start
+    NxSection *S = &n->sec[s]; NxComp *c = S->comp;
+    if (voff + len > c->total) { nx_err("%s: read past the decompressed section %d (%llu + %zu > %llu)", n->id, s, (unsigned long long)voff, len, (unsigned long long)c->total); return -1; }
+    while (len) {
+        const NxCompEntry *e = find_comp(c, voff); if (!e || voff >= e->end) { nx_err("%s: offset %llu is outside the compression table", n->id, (unsigned long long)voff); return -1; }
+        size_t k = len, vs = (size_t)(e->end - e->virt); if (voff + k > e->end) k = (size_t)(e->end - voff);
+        if (e->type == 1) memset(buf, 0, k);
+        else if (e->type == 0) { if (nx_sec_read_raw(n, s, S->data_off + e->phys + (voff - e->virt), buf, k)) return -1; }   // stored: in place
+        else {   // LZ4: the whole block, kept for the next read
+            uint32_t idx = (uint32_t)(e - c->e);
+            if (c->cached != idx) {
+                c->cached = UINT32_MAX;
+                if (c->outcap < vs) { uint8_t *o = realloc(c->out, vs); if (!o) { nx_err("out of memory"); return -1; } c->out = o; c->outcap = vs; }
+                if (c->incap < e->psize) { uint8_t *i = realloc(c->in, e->psize); if (!i) { nx_err("out of memory"); return -1; } c->in = i; c->incap = e->psize; }
+                if (nx_sec_read_raw(n, s, S->data_off + e->phys, c->in, e->psize)) return -1;
+                long got = nx_lz4_decompress(c->in, e->psize, c->out, vs);
+                if (got != (long)vs) { nx_err("%s: section %d: LZ4 block at %llu does not decompress to %zu bytes", n->id, s, (unsigned long long)e->phys, vs); return -1; }
+                c->cached = idx;
+            }
+            memcpy(buf, c->out + (voff - e->virt), k);
+        }
+        buf += k; voff += k; len -= k;
+    }
+    return 0;
+}
+
+int nx_sec_read(NxNca *n, int s, uint64_t off, void *buf, size_t len) {
+    if (s < 0 || s > 3 || !n->sec[s].present) { nx_err("%s: no section %d", n->id, s); return -1; }
+    NxSection *S = &n->sec[s];
+    if (!S->compressed) return nx_sec_read_raw(n, s, off, buf, len);
+    if (!S->comp && comp_load(n, s)) return -1;
+    if (off < S->data_off) {   // the hash layers: raw
+        size_t k = len; if (off + k > S->data_off) k = (size_t)(S->data_off - off);
+        if (nx_sec_read_raw(n, s, off, buf, k)) return -1;
+        buf = (uint8_t *)buf + k; off += k; len -= k;
+    }
+    return len ? comp_read(n, s, off - S->data_off, buf, len) : 0;
+}
+
 int nx_bktr_maps_to_base(const NxNca *n, int s, uint64_t off, uint64_t size, uint64_t *base_off) {
     const NxSection *S = &n->sec[s]; if (S->crypt_type != 4 || !S->bktr || !size) return 0;
+    if (S->compressed || S->base->sec[S->base_sec].compressed) return 0;   // the relocations map compressed bytes, not the files' (which the reader decompresses)
     const NxReloc *r = find_reloc(S->bktr, off); if (!r || r->patch) return 0;
     uint64_t p0 = r->phys + (off - r->virt), end = off + size, cur = off;
     while (cur < end) {
@@ -350,14 +447,17 @@ int nx_nca_open(NxNca *n, const NxContainer *c, const NxEntry *e) {
         for (int j = 0; j < 8; j++) S->ctr[j] = fh[0x140 + 7 - j];
         static const uint8_t zero48[0x58];
         if (memcmp(fh + 0x148, zero48, 0x30)) { nx_err("%s: section %d is sparse (not supported)", n->id, i); return -1; }
-        if (memcmp(fh + 0x178, zero48, 0x28)) { nx_err("%s: section %d is compressed (not supported)", n->id, i); return -1; }
+        if (memcmp(fh + 0x178, zero48, 0x28)) {   // CompressionInfo: the table is read on the first read of the section (comp_load)
+            if (memcmp(fh + 0x188, "BKTR", 4) || u32(fh + 0x18C) != 1) { nx_err("%s: section %d: bad compression table header", n->id, i); return -1; }
+            S->compressed = 1;
+        }
         if (S->fs_type == NX_FS_PFS0) S->data_off = u64(fh + 0x40);               // PFS0 superblock (at +8): master hash 0x20, block size, 2, hash table offset/size, pfs0_offset @+0x38
         else if (S->fs_type == NX_FS_ROMFS) S->data_off = u64(fh + 0x8 + 0x10 + 0x18 * 5);   // IVFC level 6 (the data) logical offset
     }
     return 0;
 }
 
-void nx_nca_close(NxNca *n) { for (int i = 0; i < 4; i++) if (n->sec[i].bktr) { free(n->sec[i].bktr->r); free(n->sec[i].bktr->s); free(n->sec[i].bktr); n->sec[i].bktr = NULL; } }
+void nx_nca_close(NxNca *n) { for (int i = 0; i < 4; i++) { if (n->sec[i].bktr) { free(n->sec[i].bktr->r); free(n->sec[i].bktr->s); free(n->sec[i].bktr); n->sec[i].bktr = NULL; } comp_free(n->sec[i].comp); n->sec[i].comp = NULL; } }
 
 int nx_nca_find_section(const NxNca *n, int fs_type) { for (int i = 0; i < 4; i++) if (n->sec[i].present && n->sec[i].fs_type == fs_type) return i; return -1; }
 

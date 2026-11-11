@@ -9,7 +9,18 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/import ${
 ```
 
 That is all the native side needs: the target is `nximport` → `libnximport.so` (arm64, 16 KB page aligned, links only `log`), picked up by the
-APK like the other shared libraries in the module.
+APK like the other shared libraries in the module. The source list lives in this folder's CMakeLists.txt (`NXIMPORT_SOURCES`): a new file there
+(nx_lz4.c, the compressed sections' LZ4 block decoder, 2026-11-12) needs no change upstream.
+
+## Compressed NCA sections (nx_nca.c, nx_lz4.c)
+
+Newer titles (Echoes of Wisdom) compress their RomFS: the fs header's CompressionInfo @0x178 (table offset, size, a BucketTree header) names a table
+of entries {virtual offset, physical offset, type 0 none / 1 zeros / 3 LZ4, physical size} over the IVFC data level, the layout of Atmosphère's
+CompressedStorage as vendored by Eden (`src/core/file_sys/fssystem/fssystem_compressed_storage.h`, `fssystem_nca_file_system_driver.cpp`:
+the compression layer sits above the hash layer; a patch's base is read raw, below the patch's own table). `nx_sec_read` decompresses
+transparently (the hash layers before `data_off` stay raw, `nx_sec_read_raw` reads everything raw); the trees and the .nup writer need nothing.
+Tests: `comp_test` (host build) dumps LZ4 blocks + the importer's bytes, `tests/comp_check.py` compares them with python's `lz4.block`;
+`nximport_cli ivfc` checks a data level against its IVFC hashes (raw, so it holds for compressed sections too).
 
 ## Java side (agent B/C own the Java; this is the class the JNI binds to)
 
