@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #define MAX_CHAINS 64
@@ -442,7 +443,10 @@ static void rt_start(void) {
     c.package_dir = dir;
     c.romfs_dir = base_romfs[0] ? base_romfs : NULL;
     c.title_id = title;
-    c.build_id_hex = m->build_id;
+    // The whole NSO build id when the launcher hands it (PN_BUILD_ID, dev.peanuts.build.GameEnv: 64 hex digits; the host's own is the first 8 bytes): a package's native
+    // module may list whole ids and refuse a prefix. Taken only when it begins with the host's
+    const char *full = getenv("PN_BUILD_ID");
+    c.build_id_hex = full && strlen(full) >= strlen(m->build_id) && !strncasecmp(full, m->build_id, strlen(m->build_id)) ? full : m->build_id;
     c.main_base = (uint64_t)(uintptr_t)m->base;
     c.main_size = m->size;
     c.panel_w = 1240; c.panel_h = 1080;

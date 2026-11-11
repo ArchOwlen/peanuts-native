@@ -133,6 +133,7 @@ public final class BuildService extends Service {
             }
             if (cancelled) throw new IOException("Build cancelled.");
             GameEnv.ensureFonts(this, r.titleId);
+            GameEnv.ensureBuildId(this, r.titleId, dump);
             try {
                 stepCompanion(r, pack);
             } catch (IOException e) {

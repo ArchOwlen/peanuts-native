@@ -34,6 +34,25 @@ public final class GameEnv {
         }
     }
 
+    /**
+     * PN_BUILD_ID=<main's whole NSO build id, 64 hex digits> for the companion runtime: the host knows a build by its first 8 bytes, a package's native module may list the
+     * whole id (Echoes of Wisdom's) and refuses a prefix. From upstream's DumpLayout.find (the launcher's own version check), for the dump as it is now; set anew each time
+     */
+    public static void ensureBuildId(Context c, String titleId, File dump) {
+        if (titleId == null || dump == null) return;
+        try {
+            Object found = Upstream.call(Upstream.k("DumpLayout"), null, "find", new Class<?>[] {File.class, boolean.class}, dump, true);
+            Object ids = Upstream.get(found, "buildIds");
+            Object main = ids instanceof java.util.Map ? ((java.util.Map<?, ?>) ids).get("main") : null;
+            if (main == null || main.toString().length() < 16) return;
+            String env = Upstream.gameEnv(c, titleId);
+            String out = RuntimeShaders.withLine(env, "PN_BUILD_ID=" + main.toString().toUpperCase(java.util.Locale.ROOT));
+            if (!out.equals(env == null ? "" : env)) Upstream.gameEnv(c, titleId, out);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            Log.w(TAG, "env " + titleId + " build id: " + e);
+        }
+    }
+
     /** text with KEY=value added when no line sets KEY */
     static String withDefault(String text, String key, String value) {
         List<String> out = new ArrayList<>();
