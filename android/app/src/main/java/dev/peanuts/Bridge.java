@@ -1,5 +1,6 @@
 package dev.peanuts;
 
+import java.nio.ByteBuffer;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -9,6 +10,12 @@ public final class Bridge {
 
     /** The newest snapshot as "key=value" lines (peanuts.h); empty before the host runs or without Peanuts in it. */
     public static native String snapshot();
+    /** The companion page's size as w << 16 | h, 0 while there is no page. */
+    public static native int frameSize();
+    /** The newest page frame (RGBA8) into a direct buffer of at least w*h*4 bytes: true when a new one was written. */
+    public static native boolean frame(ByteBuffer out, int w, int h);
+    /** A touch on the page, in page pixels. */
+    public static native void touch(int id, float x, float y, boolean down);
 
     public static Map<String, String> values() {
         Map<String, String> m = new LinkedHashMap<>();
@@ -20,4 +27,7 @@ public final class Bridge {
         }
         return m;
     }
+
+    public static int pageWidth() { try { return frameSize() >>> 16; } catch (UnsatisfiedLinkError e) { return 0; } }
+    public static int pageHeight() { try { return frameSize() & 0xffff; } catch (UnsatisfiedLinkError e) { return 0; } }
 }

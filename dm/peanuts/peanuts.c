@@ -289,6 +289,11 @@ void peanuts_tick(void) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// ---- the page as pixels: wired to the DSMod runtime (rt/) in R1b; until then no page ----
+void nxhost_peanuts_frame_size(int *w, int *h) { if (w) *w = 0; if (h) *h = 0; }
+int nxhost_peanuts_frame(void *out_rgba, int w, int h) { (void)out_rgba; (void)w; (void)h; return 0; }
+void nxhost_peanuts_touch(int id, float x, float y, int down) { (void)id; (void)x; (void)y; (void)down; }
+
 size_t nxhost_peanuts_snapshot(char *out, size_t n) {
     if (!out || !n) return 0;
     pthread_mutex_lock(&g_mu);
