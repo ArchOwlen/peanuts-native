@@ -37,6 +37,8 @@ typedef struct { uint64_t addr; uint64_t last; } cand_t;
 #include "rt/peanuts_rt.h"
 static void rt_tick(void);   // the companion runtime, below
 static PnRt *g_rt;
+static void rt_ui_publish(void *u, uint32_t w, uint32_t h, const uint32_t *px);
+static void rt_ui_publish_partial(void *u, uint32_t w, uint32_t h, const uint32_t *px, const int32_t r[4]);
 
 static chain_t g_chains[MAX_CHAINS];
 static int g_nchains;
@@ -411,6 +413,7 @@ static void rt_start(void) {
     c.panel_w = 1240; c.panel_h = 1080;
     c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer;
     c.pad.set_button = rt_pad_button; c.pad.set_stick = rt_pad_stick;
+    c.ui.publish_ui = rt_ui_publish; c.ui.publish_ui_partial = rt_ui_publish_partial;
     c.log = rt_log; c.log_level = 2;
     g_rt = pn_rt_create(&c);
     __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s (title %016" PRIx64 ", build %s, romfs %s): %s", dir, title, m->build_id, c.romfs_dir ? c.romfs_dir : "none", g_rt ? "loaded" : "not loaded");
@@ -421,27 +424,31 @@ static pthread_mutex_t g_tick_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_tick_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_tick_signalled, g_tick_done;
 
-static void rt_tick_once(void) {
-    pn_rt_tick(g_rt);
-    uint32_t w = 0, h = 0;
-    pn_rt_frame(g_rt, &w, &h, NULL, 0);
-    if (!w || !h) return;
+// The runtime's publishes arrive here (its redraw thread), whole or as the changed rectangle; the rows are swizzled to the bytes Android's ARGB_8888 bitmaps hold (R, G, B, A)
+// into the page buffer, so the page's poll copies as is and a moving marker costs its rectangle, not the whole page
+static inline uint32_t swz(uint32_t p) { return (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16); }
+static void rt_ui_rect(uint32_t w, uint32_t h, const uint32_t *px, int x0, int y0, int rw, int rh) {
     pthread_mutex_lock(&g_frame_mu);
-    if (w != g_frame_w || h != g_frame_h) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_frame_w = w; g_frame_h = h; }
-    if (g_frame && pn_rt_frame(g_rt, &w, &h, g_frame, (size_t)w * h)) {
-        // Swizzle once here, on publish, to the bytes Android's ARGB_8888 bitmaps hold (R, G, B, A): the page's poll then copies as is
-        for (size_t i = 0, n = (size_t)w * h; i < n; i++) { uint32_t p = g_frame[i]; g_frame[i] = (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16); }
+    if (w != g_frame_w || h != g_frame_h) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_frame_w = w; g_frame_h = h; x0 = 0; y0 = 0; rw = (int)w; rh = (int)h; }
+    if (g_frame) {
+        if (x0 < 0) { rw += x0; x0 = 0; } if (y0 < 0) { rh += y0; y0 = 0; }
+        if (x0 + rw > (int)w) rw = (int)w - x0; if (y0 + rh > (int)h) rh = (int)h - y0;
+        for (int y = y0; y < y0 + rh; y++) for (int x = x0; x < x0 + rw; x++) g_frame[(size_t)y * w + x] = swz(px[(size_t)y * w + x]);
         g_frame_new = 1;
     }
     pthread_mutex_unlock(&g_frame_mu);
 }
+static void rt_ui_publish(void *u, uint32_t w, uint32_t h, const uint32_t *px) { (void)u; rt_ui_rect(w, h, px, 0, 0, (int)w, (int)h); }
+static void rt_ui_publish_partial(void *u, uint32_t w, uint32_t h, const uint32_t *px, const int32_t r[4]) { (void)u; rt_ui_rect(w, h, px, r[0], r[1], r[2], r[3]); }
+
+static void rt_tick_once(void) { pn_rt_tick(g_rt); }   // the frames come through the sink above
 
 static void *rt_thread(void *arg) {
     (void)arg;
     pthread_setname_np(pthread_self(), "peanuts-tick");
     for (;;) {
         pthread_mutex_lock(&g_tick_mu);
-        while (g_tick_done == g_tick_signalled) {   // at most one tick per presented frame; a stalled present (the game paused) still ticks at 20 Hz for the page's own animations
+        while (g_tick_signalled - g_tick_done < 2) {   // one tick per two presented frames (30 Hz at 60 fps: enough for a second screen, half the sampling and redraw cost); a stalled present (the game paused) still ticks at 20 Hz for the page's own animations
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 50000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
             if (pthread_cond_timedwait(&g_tick_cv, &g_tick_mu, &ts)) break;
         }
