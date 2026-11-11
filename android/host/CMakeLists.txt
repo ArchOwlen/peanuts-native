@@ -45,6 +45,7 @@ list(APPEND HOST_C ${HOST}/plat/plat_android.c ${HOST}/plat/movie_avc_android.c 
 # Audio (AAudio, in hle_audio.c), AAC and H.264 (AMediaCodec), input, motion, rumble and the JNI bindings: dm/host/android
 file(GLOB HOST_ANDROID_C CONFIGURE_DEPENDS ${HOST}/android/*.c)
 list(APPEND HOST_C ${HOST_ANDROID_C})
+list(APPEND HOST_C ${ROOT}/dm/peanuts/peanuts.c)   # PEANUTS: the companion's reader (PEANUTS.md)
 # dm/gfx without Metal: the NVN front (hle_nvn.c and its C helpers), nn::vi, nvdrv, the CPU texture code; android_stub.c answers for nvn_mtl.m, hle_vk.m, hle_gl.m and the other .m files
 file(GLOB GFX_C CONFIGURE_DEPENDS ${GFX}/*.c ${GFX}/nvn/*.c ${GFX}/tex/*.c ${GFX}/vk_android/*.c)   # vk_android: the NVN → Vulkan replay
 # Lossless Scaling frame generation (dm/gfx/vk_android/lsfg, ported from Eden): GPL-3.0-or-later, so a libnxhost.so built with it (the default) is GPL-3.0-or-later as a whole

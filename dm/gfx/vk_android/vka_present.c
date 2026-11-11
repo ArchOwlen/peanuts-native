@@ -27,6 +27,7 @@
 #include <time.h>
 
 __attribute__((weak)) void dm_guest_frame_tick(void) {}
+__attribute__((weak)) void peanuts_tick(void);   // PEANUTS: absent in a build without dm/peanuts
 
 // ---------- The window ----------
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
@@ -885,7 +886,7 @@ static void *present_main(void *arg) {
         for (int g = 0; g < ng; g++) { pq_item gi = it; gi.src = gen[g]; gi.has_crop = 0; gi.ticket = 0; gi.fence = 0; gi.hold = hold; vka_fps_note(present_one(&gi), 1); }
         it.hold = ng ? hold : game_period;
         int shown = present_one(&it);
-        if (shown) dm_guest_frame_tick();
+        if (shown) { dm_guest_frame_tick(); if (peanuts_tick) peanuts_tick(); }   // PEANUTS: the companion's per-frame tick (dm/peanuts)
         if (!shown || !V.display_timing) pres_note(it.ticket, shown ? now_ns() / 1e9 : -1);
         vka_fps_note(shown, 0);
         pthread_mutex_lock(&g_pmu);

@@ -10,7 +10,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../host ${CMAKE_CURRENT_BINARY_DIR}/host)
 string(REPLACE "," ";" games "${NX_GAMES}")
 foreach(g ${games})
-  add_library(nxlaunch_${g} SHARED nxlaunch.c)
+  add_library(nxlaunch_${g} SHARED nxlaunch.c ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/peanuts_jni.c)   # PEANUTS: the companion page's JNI
   target_include_directories(nxlaunch_${g} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/host/android ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/gfx/vk_android)   # the host's launcher interface
   target_compile_options(nxlaunch_${g} PRIVATE -O2 -g -Wall -Wextra -Wno-unused-parameter)
   target_link_options(nxlaunch_${g} PRIVATE -Wl,--no-undefined)
