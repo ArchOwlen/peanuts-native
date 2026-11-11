@@ -10,7 +10,7 @@ git rev-parse -q --verify "$target^{commit}" >/dev/null || { echo "no such ref: 
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean; commit first"; exit 1; }
 
 echo "rebasing $branch onto $target ($(git rev-parse --short "$target"))"
-git rebase -q "$target" || { echo "rebase stopped: resolve, 'git rebase --continue', then re-run"; exit 1; }
+git rebase -q --rebase-merges "$target" || { echo "rebase stopped: resolve, 'git rebase --continue', then re-run"; exit 1; }   # keeps merge commits: other branches base on them
 
 # Every upstream file the overlay touches must still carry a PEANUTS marker, or a hook was lost in the rebase.
 fail=0
