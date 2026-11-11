@@ -428,7 +428,11 @@ static void rt_tick_once(void) {
     if (!w || !h) return;
     pthread_mutex_lock(&g_frame_mu);
     if (w != g_frame_w || h != g_frame_h) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_frame_w = w; g_frame_h = h; }
-    if (g_frame && pn_rt_frame(g_rt, &w, &h, g_frame, (size_t)w * h)) g_frame_new = 1;
+    if (g_frame && pn_rt_frame(g_rt, &w, &h, g_frame, (size_t)w * h)) {
+        // Swizzle once here, on publish, to the bytes Android's ARGB_8888 bitmaps hold (R, G, B, A): the page's poll then copies as is
+        for (size_t i = 0, n = (size_t)w * h; i < n; i++) { uint32_t p = g_frame[i]; g_frame[i] = (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16); }
+        g_frame_new = 1;
+    }
     pthread_mutex_unlock(&g_frame_mu);
 }
 
@@ -472,8 +476,7 @@ int nxhost_peanuts_frame(void *out_rgba, int w, int h) {
     int got = 0;
     pthread_mutex_lock(&g_frame_mu);
     if (g_frame && g_frame_new && (uint32_t)w == g_frame_w && (uint32_t)h == g_frame_h) {
-        uint8_t *o = out_rgba;
-        for (size_t i = 0, n = (size_t)w * h; i < n; i++) { uint32_t p = g_frame[i]; o[4*i] = p >> 16; o[4*i+1] = p >> 8; o[4*i+2] = p; o[4*i+3] = p >> 24; }
+        memcpy(out_rgba, g_frame, (size_t)w * h * 4);   // already R, G, B, A bytes (swizzled on publish)
         g_frame_new = 0; got = 1;
     }
     pthread_mutex_unlock(&g_frame_mu);
