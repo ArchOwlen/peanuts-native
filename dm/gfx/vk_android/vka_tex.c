@@ -2367,7 +2367,7 @@ static void bindless_init(void) {
     // 4096 was one pool's worth; a game whose command buffers bind more than one sampler pool gets each later pool its own base above the first (hle_nvn.c dpool_add), so the
     // table has to hold every pool's span, not just one. 16384 matches the sampler registration arrays' own size (mtl_reg_samp, vka_tex.c: "id >= 4096 * 4"), still capped by
     // the device's own reported limit through HEAD(MIN(...)) below (Fire Emblem: Three Houses: a 3,856-entry scene pool plus a 4,096-entry UI pool overflowed the old 4096 cap at ID 4352)
-    g_nsamp_slots = MIN(4096u * 4, HEAD(MIN(p12.maxDescriptorSetUpdateAfterBindSamplers, p12.maxPerStageDescriptorUpdateAfterBindSamplers)));
+    g_nsamp_slots = MIN((uint32_t)VKA_ENV("DM_VK_SAMP_SLOTS", 4096 * 4), HEAD(MIN(p12.maxDescriptorSetUpdateAfterBindSamplers, p12.maxPerStageDescriptorUpdateAfterBindSamplers)));   // (DM_VK_SAMP_SLOTS=4096: the one-pool table, for comparison)
     g_nimg_slots = MIN(1u << 16, HEAD(MIN(p12.maxDescriptorSetUpdateAfterBindStorageImages, p12.maxPerStageDescriptorUpdateAfterBindStorageImages)));
 #undef HEAD
 #undef MIN
