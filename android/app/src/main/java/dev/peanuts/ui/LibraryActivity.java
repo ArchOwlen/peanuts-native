@@ -144,6 +144,7 @@ public final class LibraryActivity extends Activity {
 
     /** Starts a Ready game as adb does: am start -n <package>/dev.nxnative.android.MainActivity --es game <dump or .nup> [--es pack <pack>] --ez run true */
     private void launch(LibraryScanner.Title t) {
+        dev.peanuts.build.GameEnv.ensureFonts(this, t.titleId);
         Intent i = new Intent().setClassName(getPackageName(), MAIN).putExtra("game", t.launch.getPath()).putExtra("run", true);
         if (t.packDir != null) i.putExtra("pack", t.packDir.getPath());
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);

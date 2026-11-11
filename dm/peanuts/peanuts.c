@@ -368,25 +368,53 @@ static void rt_log(int level, const char *where, const char *msg) {
     __android_log_print(level >= 4 ? ANDROID_LOG_ERROR : level == 3 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "peanuts", "[rt] %s: %s", where ? where : "", msg ? msg : "");
 }
 
-// The first companion package beside the pack, and the title id from its manifest
-static int rt_find_package(char *dir, size_t n, uint64_t *title) {
-    char root[512]; snprintf(root, sizeof root, "%s/../peanuts", dm_module_dir());
-    DIR *d = opendir(root);
-    if (!d) return 0;
-    struct dirent *e; int found = 0;
-    while (!found && (e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char manifest[768]; snprintf(manifest, sizeof manifest, "%s/%s/dualscreen/manifest.json", root, e->d_name);
-        FILE *f = fopen(manifest, "r");
-        if (!f) continue;
-        char head[4096] = {0}; size_t got = fread(head, 1, sizeof head - 1, f); fclose(f); (void)got;
-        const char *t = strstr(head, "\"title_id\"");
-        if (t) { t = strchr(t + 10, '"'); if (t) *title = strtoull(t + 1, NULL, 16); }
-        snprintf(dir, n, "%s/%s", root, e->d_name);
-        found = 1;
+// The running title, from the pack folder's name: the app's packs/<title ID>, or <title ID>-work/android-pack beside the dump. 0 when neither
+static uint64_t rt_running_title(void) {
+    const char *p = dm_module_dir(); if (!p) return 0;
+    char buf[768]; snprintf(buf, sizeof buf, "%s", p);
+    for (int up = 0; up < 2; up++) {
+        size_t l = strlen(buf); while (l && buf[l - 1] == '/') buf[--l] = 0;
+        char *slash = strrchr(buf, '/'); const char *base = slash ? slash + 1 : buf;
+        if (strlen(base) >= 16) { char *end; uint64_t t = strtoull(base, &end, 16); if (end - base == 16 && (*end == 0 || *end == '-')) return t; }
+        if (!slash) break;
+        *slash = 0;
     }
-    closedir(d);
-    return found;
+    return 0;
+}
+// The companion package of the running title: in one of the roots a package can be installed in (beside the pack: <pack>/../peanuts, which is the app's packs/peanuts for a pack
+// the app owns; and <title ID>-work/peanuts beside the dump, from DM_ROMFS's path), the one whose manifest names the title. Earlier builds took the first package in the first
+// root, so another title's companion loaded (Three Houses' for Echoes of Wisdom)
+static int rt_find_package(char *dir, size_t n, uint64_t *title) {
+    uint64_t want = rt_running_title();
+    char roots[2][512]; int nroots = 0;
+    snprintf(roots[nroots++], sizeof roots[0], "%s/../peanuts", dm_module_dir());
+    const char *romfs = getenv("DM_ROMFS");
+    if (romfs && want) {
+        const char *nup = strstr(romfs, ".nup:"); const char *slash = NULL;
+        for (const char *q = romfs; q < (nup ? nup : romfs + strlen(romfs)); q++) if (*q == '/') slash = q;
+        if (slash) snprintf(roots[nroots++], sizeof roots[0], "%.*s/%016" PRIX64 "-work/peanuts", (int)(slash - romfs), romfs, want);
+    }
+    for (int r = 0; r < nroots; r++) {
+        DIR *d = opendir(roots[r]);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char manifest[768]; snprintf(manifest, sizeof manifest, "%s/%s/dualscreen/manifest.json", roots[r], e->d_name);
+            FILE *f = fopen(manifest, "r");
+            if (!f) continue;
+            char head[4096] = {0}; size_t got = fread(head, 1, sizeof head - 1, f); fclose(f); (void)got;
+            uint64_t t = 0; const char *ts = strstr(head, "\"title_id\"");
+            if (ts) { ts = strchr(ts + 10, '"'); if (ts) t = strtoull(ts + 1, NULL, 16); }
+            if (want && t != want) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s/%s is for title %016" PRIx64 ", not %016" PRIx64 ": passed over", roots[r], e->d_name, t, want); continue; }
+            *title = t;
+            snprintf(dir, n, "%s/%s", roots[r], e->d_name);
+            closedir(d);
+            return 1;
+        }
+        closedir(d);
+    }
+    return 0;
 }
 
 static void rt_start(void) {

@@ -132,6 +132,7 @@ public final class BuildService extends Service {
                 prepareFailed = e;   // the companion is still installed (it goes beside the dump's work folder, which Prepare made): the next Build has only the pack left to do
             }
             if (cancelled) throw new IOException("Build cancelled.");
+            GameEnv.ensureFonts(this, r.titleId);
             try {
                 stepCompanion(r, pack);
             } catch (IOException e) {
@@ -240,6 +241,7 @@ public final class BuildService extends Service {
     private void stepCompanion(BuildRequest r, File pack) throws IOException {
         if (r.companionPackage == null || r.companionPackage.isEmpty()) { progress("companion", 100, "No companion chosen"); return; }
         File root = companionRoot(pack, dumpWork(r, pack));
+        Log.i(TAG, "companion " + r.companionPackage + " for " + r.titleId + " into " + root);
         progress("companion", PREPARE_END, "Looking up the companion");
         Companions.Item item = Companions.find(Companions.fetch(), r.titleId);
         if (item == null) throw new IOException("The catalog has no companion for " + name + " now; the game is ready to play without one.");
@@ -258,9 +260,11 @@ public final class BuildService extends Service {
         return new File(dp != null ? dp : new File("."), r.titleId + "-work");
     }
 
-    /** dev.peanuts.Games.Entry.companionRoot: <pack>/../peanuts */
+    /** Where the runtime looks (dm/peanuts/peanuts.c rt_find_package, dev.peanuts.Games.Entry.companionRoot): beside the pack, <pack>/../peanuts (the app's packs/peanuts for a pack
+     *  the app owns, <title ID>-work/peanuts for one beside the dump); without a pack, beside the dump */
     static File companionRoot(File pack, File work) {
-        return new File(work, "peanuts");
+        File parent = pack == null ? null : pack.getAbsoluteFile().getParentFile();
+        return new File(parent != null ? parent : work, "peanuts");
     }
 
     private void progress(String step, int percent, String detail) {
