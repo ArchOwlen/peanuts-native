@@ -39,7 +39,7 @@ public final class GameHold extends Service {
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Game running", NotificationManager.IMPORTANCE_MIN));
         Notification n = new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.ic_media_play).setContentTitle(name == null || name.isEmpty() ? "Game running" : name)
-                .setContentText("Playing").setOngoing(true).setSilent(true).build();
+                .setContentText("Playing").setOngoing(true).build();   // (the channel's importance is MIN: no sound, no peek)
         try {
             if (Build.VERSION.SDK_INT >= 29) startForeground(NOTE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
             else startForeground(NOTE, n);
