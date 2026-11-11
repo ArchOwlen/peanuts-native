@@ -21,14 +21,14 @@ import java.util.regex.Pattern;
  * The companion catalog: the Eden Duo companions' GitHub releases, whose assets are `<TITLEID>-<Name>-<version>.dsmod.zip` (older ones `<TITLEID>.dsmod.zip`); the
  * newest version per title wins. Names come from the repository's catalog.json (title id → game name). Same packages, same format as Eden Duo (PACKAGE_FORMAT.md).
  */
-final class Catalog {
-    static final String RELEASES = "https://api.github.com/repos/igawa6/eden-duo-companions/releases?per_page=100";
-    static final String NAMES = "https://raw.githubusercontent.com/igawa6/eden-duo-companions/main/catalog.json";
+public final class Catalog {
+    public static final String RELEASES = "https://api.github.com/repos/igawa6/eden-duo-companions/releases?per_page=100";
+    public static final String NAMES = "https://raw.githubusercontent.com/igawa6/eden-duo-companions/main/catalog.json";
     private static final Pattern ASSET = Pattern.compile("^([0-9A-Fa-f]{16})(?:-([A-Za-z0-9]+)-([0-9][0-9A-Za-z.\\-]*))?\\.dsmod\\.zip$");
 
-    static final class Item {
-        final String titleId, packageName, version, url, tag, gameName;
-        final long size;
+    public static final class Item {
+        public final String titleId, packageName, version, url, tag, gameName;
+        public final long size;
         Item(String titleId, String packageName, String version, String url, String tag, long size, String gameName) {
             this.titleId = titleId; this.packageName = packageName; this.version = version; this.url = url; this.tag = tag; this.size = size; this.gameName = gameName;
         }
@@ -37,7 +37,7 @@ final class Catalog {
     private Catalog() {}
 
     /** Every title with a companion, newest version first per title; network, call off the main thread */
-    static List<Item> fetch() throws IOException {
+    public static List<Item> fetch() throws IOException {
         Map<String, String> names = new HashMap<>();
         try {
             JSONArray a = new JSONArray(get(NAMES));
@@ -66,7 +66,7 @@ final class Catalog {
         return new ArrayList<>(best.values());
     }
 
-    static int compareVersions(String a, String b) {
+    public static int compareVersions(String a, String b) {
         String[] x = a.split("[.\\-]"), y = b.split("[.\\-]");
         for (int i = 0; i < Math.max(x.length, y.length); i++) {
             int p = i < x.length ? num(x[i]) : 0, q = i < y.length ? num(y[i]) : 0;
@@ -76,7 +76,7 @@ final class Catalog {
     }
     private static int num(String s) { try { return Integer.parseInt(s.replaceAll("[^0-9].*", "")); } catch (NumberFormatException e) { return 0; } }
 
-    static String get(String url) throws IOException {
+    public static String get(String url) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestProperty("User-Agent", "PeanutsNative");
         c.setRequestProperty("Accept", "application/vnd.github+json");

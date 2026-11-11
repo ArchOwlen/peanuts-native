@@ -20,21 +20,21 @@ import java.util.zip.ZipInputStream;
  * <companion root>/<package name>/ (a fresh folder; the old one is replaced only once the new one is complete) and writes installed.json with the version. The
  * host (dm/peanuts/peanuts.c) finds the package there at the next game start.
  */
-final class Installer {
-    interface Progress { void on(String what, long done, long total); }
+public final class Installer {
+    public interface Progress { void on(String what, long done, long total); }
 
     private Installer() {}
 
-    static File installedDir(File root, String packageName) { return new File(root, packageName); }
+    public static File installedDir(File root, String packageName) { return new File(root, packageName); }
 
     /** The installed version of a package in root, or null */
-    static String installedVersion(File root, String packageName) {
+    public static String installedVersion(File root, String packageName) {
         File f = new File(installedDir(root, packageName), "installed.json");
         if (!f.isFile()) return new File(installedDir(root, packageName), "package.json").isFile() ? "?" : null;
         try { return new JSONObject(new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8)).optString("version", "?"); } catch (Exception e) { return "?"; }
     }
 
-    static void install(Catalog.Item item, File root, File cacheDir, Progress progress) throws IOException {
+    public static void install(Catalog.Item item, File root, File cacheDir, Progress progress) throws IOException {
         File zip = new File(cacheDir, item.titleId + "-" + item.packageName + "-" + item.version + ".dsmod.zip");
         download(item.url, zip, item.size, progress);
         File fresh = new File(root, item.packageName + ".new"), done = installedDir(root, item.packageName), old = new File(root, item.packageName + ".old");
@@ -61,7 +61,7 @@ final class Installer {
         }
     }
 
-    static void remove(File root, String packageName) { delete(installedDir(root, packageName)); }
+    public static void remove(File root, String packageName) { delete(installedDir(root, packageName)); }
 
     private static void download(String url, File to, long total, Progress progress) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
