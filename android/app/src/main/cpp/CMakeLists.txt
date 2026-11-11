@@ -8,6 +8,7 @@ if(NOT NX_GAMES)
 endif()
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../host ${CMAKE_CURRENT_BINARY_DIR}/host)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/import ${CMAKE_CURRENT_BINARY_DIR}/nximport)   # PEANUTS: the importer (libnximport.so, dev.peanuts.importer.Native)
 string(REPLACE "," ";" games "${NX_GAMES}")
 foreach(g ${games})
   add_library(nxlaunch_${g} SHARED nxlaunch.c ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/peanuts_jni.c)   # PEANUTS: the companion page's JNI
