@@ -127,6 +127,7 @@ public final class BuildService extends Service {
             IOException prepareFailed = null;
             try {
                 pack = stepPrepare(r, dump);
+                if (!cancelled) pack = stepRuntimeShaders(r, dump, pack);
             } catch (IOException e) {
                 prepareFailed = e;   // the companion is still installed (it goes beside the dump's work folder, which Prepare made): the next Build has only the pack left to do
             }
@@ -205,6 +206,34 @@ public final class BuildService extends Service {
         } finally {
             prepare = null;
         }
+    }
+
+    /**
+     * (b2) the shaders the game compiles at run time ({@link RuntimeShaders}): when the finished job still misses some, the game is started once to capture them
+     * and the job is run again from its split; the pack of the second run is returned (the same folder)
+     */
+    private File stepRuntimeShaders(BuildRequest r, File dump, File pack) throws IOException {
+        File work, jobFile;
+        try {
+            work = Upstream.workOf(dump, r.titleId);
+            jobFile = Upstream.jobFileOf(work);
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "runtime shaders: " + e);
+            return pack;
+        }
+        int need = RuntimeShaders.missing(jobFile);
+        if (need <= 0 || !jobFile.isFile()) return pack;
+        Log.i(TAG, "runtime shaders: " + need + " missing from the pack of " + name + ": capturing");
+        boolean enough = new RuntimeShaders(this).capture(r.titleId, work, dump, pack, need, (pct, detail) -> progress("prepare", PREPARE_END - 5 + pct * 5 / 100, detail), () -> cancelled);
+        if (cancelled) throw new IOException("Build cancelled.");
+        if (!enough) {
+            int have = RuntimeShaders.captured(RuntimeShaders.captureDir(work));
+            if (have == 0) throw new IOException(name + " is ready, but " + need + " of its shaders are only made while it runs and none were captured: parts of its picture may stay black. Tap Build again after playing it once.");
+            Log.w(TAG, "runtime shaders: only " + have + " of " + need + " captured; re-running the job with those");
+        }
+        RuntimeShaders.rerun(work, jobFile);
+        progress("prepare", IMPORT_END, "Making the pack again with the captured shaders");
+        return stepPrepare(r, dump);
     }
 
     /** (c) the companion beside the pack: <title ID>-work/peanuts/<Name>/ */

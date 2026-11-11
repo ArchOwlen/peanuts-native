@@ -112,6 +112,16 @@ final class Upstream {
 
     static boolean jobTryAnyway(Object job) throws ReflectiveOperationException { return Boolean.TRUE.equals(call(job.getClass(), job, "tryAnyway", new Class<?>[0])); }
 
+    // ---- Prefs: the game's own env lines (its Game settings) ----
+
+    static String gameEnv(Context c, String titleId) throws ReflectiveOperationException {
+        return str(call(k("Prefs"), null, "gameEnv", new Class<?>[] {Context.class, String.class}, c, titleId));
+    }
+
+    static void gameEnv(Context c, String titleId, String text) throws ReflectiveOperationException {
+        call(k("Prefs"), null, "gameEnv", new Class<?>[] {Context.class, String.class, String.class}, c, titleId, text);
+    }
+
     /** Job.fix(): what a failed job's card offers (PrepareText.FIX_*: "retry", "anyway", "none", "update") */
     static String jobFix(Object job) throws ReflectiveOperationException { return str(call(job.getClass(), job, "fix", new Class<?>[0])); }
 
