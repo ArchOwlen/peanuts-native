@@ -342,10 +342,19 @@ static void rt_start(void) {
     if (!m) return;
     char dir[768]; uint64_t title = 0;
     if (!rt_find_package(dir, sizeof dir, &title)) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "no companion package beside %s", dm_module_dir()); return; }
+    // The runtime's romfs root: the game's base RomFS folder (an update's folder is only its overlay: a few changed files). DM_ROMFS names the running version's folder,
+    // <game>/updates/<v>/romfs or <game>/base/romfs; a .nup's inner path is not a folder (not read yet)
     const char *romfs = getenv("DM_ROMFS");
+    static char base_romfs[768];
+    if (romfs && !strstr(romfs, ".nup:")) {
+        const char *u = strstr(romfs, "/updates/");
+        struct stat st;
+        if (u) snprintf(base_romfs, sizeof base_romfs, "%.*s/base/romfs", (int)(u - romfs), romfs);
+        if (!u || stat(base_romfs, &st)) snprintf(base_romfs, sizeof base_romfs, "%s", romfs);   // a dump whose update folder holds the whole RomFS (no base/romfs)
+    }
     PnRtConfig c = {0};
     c.package_dir = dir;
-    c.romfs_dir = romfs && !strstr(romfs, ".nup:") ? romfs : NULL;
+    c.romfs_dir = base_romfs[0] ? base_romfs : NULL;
     c.title_id = title;
     c.build_id_hex = m->build_id;
     c.main_base = (uint64_t)(uintptr_t)m->base;
