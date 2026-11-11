@@ -34,7 +34,9 @@
 typedef struct { char name[32]; char type[8]; char module[16]; uint64_t off[MAX_ELEMS]; int n; char value[72]; } chain_t;
 typedef struct { uint64_t addr; uint64_t last; } cand_t;
 
+#include "rt/peanuts_rt.h"
 static void rt_tick(void);   // the companion runtime, below
+static PnRt *g_rt;
 
 static chain_t g_chains[MAX_CHAINS];
 static int g_nchains;
@@ -296,11 +298,9 @@ void peanuts_tick(void) {
 // ---- the companion runtime (rt/, the Eden Duo DSMod runtime): one package per title, found beside the pack ----
 // The pack is <game>/<title ID>-work/android-pack (dm_module_dir); companion packages are <game>/<title ID>-work/peanuts/<Package>/{package.json,dualscreen/}.
 // The game's RomFS (DM_ROMFS) is the runtime's romfs root when it is a plain folder (a .nup's inner path is not, yet).
-#include "rt/peanuts_rt.h"
 #include <android/log.h>
 #include <dirent.h>
 
-static PnRt *g_rt;
 static int g_rt_tried;
 static uint32_t *g_frame; static uint32_t g_frame_w, g_frame_h; static int g_frame_new;
 static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER;
