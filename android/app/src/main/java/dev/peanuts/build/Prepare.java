@@ -85,14 +85,19 @@ final class Prepare {
                 existing = null;   // another format or damaged: a new job replaces it
             }
         }
-        // 2. the dump
+        // 2. the dump. A version this app's profile does not list (otherBuild) is what the Home panel's "Try anyway" is for: Build does the same by itself (the sheet
+        // said the version is untested), with the job marked so its later checks are relaxed too (Job.tryAnyway: the shader tables need not match the profile's)
         Object r = Upstream.dumpCheck(dump, existing == null, anyBuild);
         String error = (String) Upstream.get(r, "error");
+        if (error != null && !anyBuild && Boolean.TRUE.equals(Upstream.get(r, "otherBuild"))) {
+            Log.i(TAG, "prepare: untested version (" + error + "): trying anyway");
+            Object again = Upstream.dumpCheck(dump, existing == null, true);
+            if (Upstream.get(again, "error") == null) { r = again; error = null; anyBuild = true; p.on(0, "Untested game version: preparing it anyway"); }
+        }
         if (error != null) {
             boolean other = Boolean.TRUE.equals(Upstream.get(r, "otherBuild"));
             String detail = Upstream.str(Upstream.get(r, "detail"));
-            throw new IOException((other ? "Untested game version: " : "Cannot prepare this dump: ") + error + (detail.isEmpty() ? "" : "\n" + detail)
-                    + (other ? "\nOpen the game in the Home screen's Add game to try it anyway." : ""));
+            throw new IOException((other ? "Untested game version: " : "Cannot prepare this dump: ") + error + (detail.isEmpty() ? "" : "\n" + detail));
         }
         String rid = Upstream.str(Upstream.get(r, "titleId"));
         if (!rid.isEmpty()) id = rid;
@@ -136,7 +141,9 @@ final class Prepare {
             Upstream.jobSave(job);
             Upstream.jobRemember(c, Upstream.jobFile(job));
         }
+        if (anyBuild && !Upstream.jobTryAnyway(job)) { Upstream.jobTryAnyway(job, true); Upstream.jobSave(job); }
         File file = Upstream.jobFile(job);
+        boolean relaxed = false;   // one restart with the checks relaxed when the job fails for something Try anyway skips
         // 4. the service, as the panel starts it
         bind();
         try {
@@ -174,9 +181,22 @@ final class Prepare {
             }
             if (state.equals("failed")) {
                 String err = o.optString("error");
+                if ("anyway".equals(o.optString("fix")) && !o.optBoolean("try_anyway") && !relaxed) {   // the panel's "Try anyway…" button, pressed for the player: once
+                    relaxed = true;
+                    Log.i(TAG, "prepare: failed with the Try anyway fix (" + err + "): going on with the checks relaxed");
+                    Object j = Upstream.jobRead(file);
+                    Upstream.jobTryAnyway(j, true);
+                    Upstream.jobSave(j);
+                    fromService = null;
+                    lastJson = null;
+                    lastChange = SystemClock.elapsedRealtime();
+                    p.on(pct(si, done, total), "Trying anyway: " + STEP_TEXT[si]);
+                    try { c.startForegroundService(Upstream.packStart(c, file)); } catch (RuntimeException e) { throw new IOException("Android did not let the packer restart: open " + appName() + " and tap Try anyway on the game's card."); }
+                    continue;
+                }
                 throw new IOException("Preparing failed at " + STEP_TEXT[si].toLowerCase(Locale.ROOT) + (err.isEmpty() ? "." : ": " + err) + "\nRetry from the game's card on the Home screen.");
             }
-            int pct = (int) Math.min(99, Math.round(si * 100.0 / STEPS.length + (total > 0 ? Math.min(1.0, done / (double) total) * 100.0 / STEPS.length : 0)));
+            int pct = pct(si, done, total);
             if (state.equals("paused")) {
                 if (reason.equals("user") || reason.equals("timeout") || reason.equals("refused") || reason.equals("apk"))
                     throw new IOException("Preparing paused (" + reasonText(reason) + "). Resume from the game's card on the Home screen.");
@@ -189,6 +209,10 @@ final class Prepare {
                 throw new IOException("The packer stopped reporting progress. Resume from the game's card on the Home screen.");
         }
         throw new IOException("Build cancelled. The job is saved: resume from the game's card on the Home screen.");
+    }
+
+    private static int pct(int si, long done, long total) {
+        return (int) Math.min(99, Math.round(si * 100.0 / STEPS.length + (total > 0 ? Math.min(1.0, done / (double) total) * 100.0 / STEPS.length : 0)));
     }
 
     private static String stepText(int si, long done, long total, String stage) {

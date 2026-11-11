@@ -123,9 +123,21 @@ public final class BuildService extends Service {
         try {
             File dump = stepImport(r);
             if (cancelled) throw new IOException("Build cancelled.");
-            File pack = stepPrepare(r, dump);
+            File pack = null;
+            IOException prepareFailed = null;
+            try {
+                pack = stepPrepare(r, dump);
+            } catch (IOException e) {
+                prepareFailed = e;   // the companion is still installed (it goes beside the dump's work folder, which Prepare made): the next Build has only the pack left to do
+            }
             if (cancelled) throw new IOException("Build cancelled.");
-            stepCompanion(r, pack);
+            try {
+                stepCompanion(r, pack);
+            } catch (IOException e) {
+                if (prepareFailed != null) throw new IOException(prepareFailed.getMessage() + "\n\nCompanion: " + e.getMessage());
+                throw e;
+            }
+            if (prepareFailed != null) throw prepareFailed;
             ok = true;
             message = name + " is ready to play.";
             progress("done", 100, message);

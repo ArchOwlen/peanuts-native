@@ -107,6 +107,14 @@ final class Upstream {
 
     static void jobSave(Object job) throws ReflectiveOperationException { call(job.getClass(), job, "save", new Class<?>[0]); }
 
+    /** Job.tryAnyway(on): the job goes on with its checks relaxed (an untested game version, shaders the profile does not list) */
+    static void jobTryAnyway(Object job, boolean on) throws ReflectiveOperationException { call(job.getClass(), job, "tryAnyway", new Class<?>[] {boolean.class}, on); }
+
+    static boolean jobTryAnyway(Object job) throws ReflectiveOperationException { return Boolean.TRUE.equals(call(job.getClass(), job, "tryAnyway", new Class<?>[0])); }
+
+    /** Job.fix(): what a failed job's card offers (PrepareText.FIX_*: "retry", "anyway", "none", "update") */
+    static String jobFix(Object job) throws ReflectiveOperationException { return str(call(job.getClass(), job, "fix", new Class<?>[0])); }
+
     static void jobRemember(Context c, File jobFile) throws ReflectiveOperationException {
         call(k("Job"), null, "remember", new Class<?>[] {Context.class, File.class}, c, jobFile);
     }
