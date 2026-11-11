@@ -31,4 +31,6 @@ The script fetches, rebases `peanuts` onto the target, then checks that every `P
 
 ## Status
 
-- 2026-11-11: fork created on v0.3.0 (65745297). Hardware gate (Readiness check on the AYN Thor, Adreno 740) not yet run. No hooks added yet.
+- 2026-11-11: fork created on v0.3.0 (65745297). Hardware gate passed on the AYN Thor (Adreno 740, system driver): Readiness "Ready, with limits", Pokémon Pokopia boots to its first interactive screen at 10 fps / 1080p.
+- 2026-11-11: P1 — the companion `Presentation` on the second display (`dev.peanuts.Companion`, two hooks in `GameActivity`) verified on the Thor: placeholder page on Screen-2 (display 4, 1080x1240) while the game runs on the main screen at an unchanged frame rate. Test app: `./gradlew apk -PnxApp=peanuts -PnxLabel="Peanuts Native" -PnxGames=0400A3A01EE4C000 -PnxPackEngine=fake` → `out/nxnative-android-peanuts.apk` (packs are made on the PC).
+- Next: P2 — `dm/peanuts` reader (companion package loader, guest pointer chains, per-frame tick from `vka_present.c`), JNI bridge to the page, taps → `nxhost_input_*`.
