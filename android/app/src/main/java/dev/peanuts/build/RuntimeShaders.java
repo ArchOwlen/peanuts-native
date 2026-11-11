@@ -140,6 +140,12 @@ final class RuntimeShaders {
 
     /** Ends the ":game" process (the game and its activity: GameActivity runs in it), as the system does when a game is swiped away */
     private void endGame() {
+        // The run's exit record (ExitWatch: <files>/last-exit.txt, "state=running" while the game runs) gets the player's own "stopped" line first, so the launcher
+        // does not tell the player that the game ended unexpectedly: this end is the build's
+        File rec = new File(c.getFilesDir(), "last-exit.txt");
+        if (rec.isFile()) {
+            try { Files.write(rec.toPath(), "state=stopped\n".getBytes(StandardCharsets.UTF_8), java.nio.file.StandardOpenOption.APPEND); } catch (IOException e) { Log.w(TAG, "capture: exit record " + e); }
+        }
         ActivityManager am = c.getSystemService(ActivityManager.class);
         List<ActivityManager.RunningAppProcessInfo> l = am == null ? null : am.getRunningAppProcesses();
         if (l != null) for (ActivityManager.RunningAppProcessInfo p : l) if (p.processName != null && p.processName.endsWith(":game")) android.os.Process.killProcess(p.pid);
