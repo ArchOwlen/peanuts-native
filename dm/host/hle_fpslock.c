@@ -54,6 +54,19 @@ static const lock_t k_locks[] = {
     // and a few frames in a hundred run late, each a flip to 30 and back (50-58 fps on the overlay); with least = most = 0 those frames show one vsync late instead and the world
     // steps once a frame as at 60. Found 2026-11-12 (LAS recomp's pace.c describes the same bytes for 1.0.1; the layout did not change)
     { "909e904af78ac1b8deefe97ab2ccdb51", "Grezzo frame controller extra vsyncs", 0x1c97188, 0x4e2, EXTRA_VSYNCS_U8, 1 },
+    // The Legend of Zelda: Echoes of Wisdom 1.1.0 (v196608): Grezzo's frame governor, rewritten since Link's Awakening (no least / most bytes: the clamp pattern is not in this
+    // main). The game manager is a static object at main+0x34bd4b0 (bss; made at main+0x33b1e4, handed to its per-frame task object {vtable main+0x3085020, manager} at
+    // main+0x3432d4); its frame task main+0x345da0 (vtable +0x78; the governor from +0x346b8c) takes this frame's cost as the larger of the CPU time since the last frame less the
+    // acquire wait (manager +0x3a8, main+0x3472d0) and the GPU time ([gfx+0xbd88] ns, gfx = [[main+0x34cadd0]+8]), and runs a two-state machine: mode +0x3b0 (0 = 60, 1 = 30),
+    // one frame at or over 1/60 s (+0x3e5, the "last frame slow" byte, or the +0x3e0 count reaching 1) enters mode 1 for a hold of 12 frames (+0x3d8), renewed while any held frame
+    // ran slow (+0x3dc, never cleared here), and the present interval request [gfx+0xbcc8] gets (int)(60 / rate + 0.5): 2 at the entry (main+0x346d38), 1 on the way back
+    // (main+0x346e00), applied by the presenter main+0x3610c4 (nvnWindowSetPresentInterval through main+0x32ca34). The byte before all that, +0x3e4, is the governor's enable: the
+    // scene code sets it 1 entering play (main+0x1685dc8) and 0 leaving (main+0x167bc0c, main+0x168a760); with it 0 the task's other branch (main+0x346d50) writes interval 1 and
+    // clears the mode and counts. So this row's two bytes are +0x3e4 enable and +0x3e5 last-frame-slow: target 60 writes 0, 0 (governor off: the game itself asks for interval 1
+    // every frame, as in menus), 30 writes 1, 1 (governor on and "slow": mode 1, interval 2, held). Re-asserted at every present because the scene code sets the enable again. On
+    // the Thor the game saw 1.3 ms of CPU and 4.4 ms of GPU yet sat at 30: a frame once over 1/60 s puts it there, and at interval 2 every frame measures over 1/60 s, so the hold
+    // renews itself for good. Found 2026-11-12 from main 9f221e1a (ptr_off 0: the field is at main + field)
+    { "9f221e1afa65ba5443e955158ab97da8", "Grezzo frame governor enable", 0, 0x34bd894, EXTRA_VSYNCS_U8, 1 },
     // Pokemon Brilliant Diamond 1.3.0: Unity's Application.targetFrameRate. Its icall registration (main+0xe34e60) resolves to main+0xdc8e70 -> +0x5fa640,
     // which stores w0 at main+0x4afc868; the getter at +0x5fa630 reads the same int32. The game sets 30 when entering the field; display pacing alone does not remove that cap.
     { "94ceae325c205c4b9d6f7235552f28fd", "Unity targetFrameRate", 0, 0x4afc868, FPS_I32, 1 },

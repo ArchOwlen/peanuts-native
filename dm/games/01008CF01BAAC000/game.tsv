@@ -33,6 +33,11 @@ app_pool	0xCD500000
 # NPDM META +0x14 is zero: virtual address memory is disabled.
 sys_resource	0x0
 
+# ---- Frame rate ----
+# The game's frame governor (hle_fpslock.c, the "Grezzo frame governor enable" row for main 9f221e1a) drops to 30 after one frame over 1/60 s and, measuring
+# wall time at interval 2, never comes back. The target turns it off (60) or holds it at 30; 0 would leave the game's own logic.
+fps_target	60
+
 # ---- Shader split ----
 # The game selects near=0 with nvnDeviceSetDepthMode; offline pipeline bases must use main0_z too.
 depth_mode	zero
