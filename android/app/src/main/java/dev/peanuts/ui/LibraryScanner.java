@@ -218,7 +218,7 @@ final class LibraryScanner {
         }
         String key = f.getPath() + "|" + f.length() + "|" + f.lastModified();
         JSONArray a = cache.get(key);
-        if (a == null && importer.available()) {
+        if (a == null && importer.available() && ImporterPort.ensureKeys(ctx)) {
             String json = importer.probe(f.getPath());
             if (json != null) {
                 try { a = new JSONArray(json); cache.put(key, a); cacheDirty = true; } catch (org.json.JSONException e) { Log.w("peanuts", "probe " + f + ": " + e); }
@@ -270,7 +270,7 @@ final class LibraryScanner {
         File out = new File(PeanutsPrefs.iconsDir(c), t.titleId + ".png");
         if (out.isFile() && out.length() > 0) return out;
         ImporterPort imp = ImporterPort.get();
-        if (!imp.available()) return null;
+        if (!imp.available() || !ImporterPort.ensureKeys(c)) return null;
         List<Source> all = new ArrayList<>();
         if (t.base != null) all.add(t.base);
         all.addAll(t.updates);

@@ -25,8 +25,19 @@ public interface ImporterPort {
     /** The importer when its class is in the APK and loads, else the stub */
     static ImporterPort get() { return Holder.PORT; }
 
+    /** Loads the user's prod.keys into the importer once per process (probe/icon/writeNup need them); false when there is no keys file or it does not load */
+    static boolean ensureKeys(android.content.Context c) {
+        if (Holder.KEYS_OK) return true;
+        java.io.File k = dev.peanuts.PeanutsPrefs.keysFile(c);
+        if (!k.isFile() || !get().available()) return false;
+        if (get().keys(k.getPath()) == 0) { Holder.KEYS_OK = true; return true; }
+        android.util.Log.w("peanuts", "keys: " + get().lastError());
+        return false;
+    }
+
     final class Holder {
         static final ImporterPort PORT = make();
+        static volatile boolean KEYS_OK;
         private Holder() {}
         private static ImporterPort make() {
             try {
