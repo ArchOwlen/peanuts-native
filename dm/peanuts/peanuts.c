@@ -276,6 +276,7 @@ static void refresh(void) {
     char *p = g_snapshot, *e = g_snapshot + sizeof g_snapshot;
     p += snprintf(p, e - p, "frames=%" PRIu64 "\nbuild=%s\nmain=%#" PRIx64 "\nchains=%s\n", g_frames, dm_main_build(), main_mod ? (uint64_t)(uintptr_t)main_mod->base : 0, g_file_state);
     for (int i = 0; i < g_nchains && p < e; i++) p += snprintf(p, e - p, "%s=%s\n", g_chains[i].name, g_chains[i].value);
+    if (g_rt) { char st[256]; pn_rt_status(g_rt, st, sizeof st); p += snprintf(p, e - p, "rt=%s\n", st); }   // also in logcat on each page change via the runtime's own log
     if (pthread_mutex_trylock(&g_scan_mu) == 0) {   // a running scan keeps its lines until it is done
         p += snprintf(p, e - p, "scan=%s\n", g_scan_state);
         for (int i = 0; i < g_scan_nlines && p < e; i++) p += snprintf(p, e - p, "cand%d=%s\n", i, g_scan_lines[i]);
