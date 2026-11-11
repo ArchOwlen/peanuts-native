@@ -486,15 +486,21 @@ static vka_img *img_create(const tex_t *t, const vka_fmt *f, uint32_t base) {
 }
 // res: a sparse residency image; *why (with res, on NULL): 1 = the sparse address space is full, 2 = refused otherwise (a dense one may be made), 3 = the format has no sparse
 // residency at this shape (a dense one may be made)
+static VkFormat class_twin(VkFormat v, int cls);
 static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int res, int *why, uint64_t *need) {
     const nvn_texdesc *d = &t->d;
-    if (d->target == NVN_TEXTURE_TARGET_BUFFER) { VRED_ONCE("texture buffers are not images yet (first: serial %llu)", (unsigned long long)t->serial); return NULL; }
+    // A buffer texture (TARGET_BUFFER) is a 2D image of NVN_TBUF_ROW-element rows over its elements: the shape the translator reads every 1D integer fetch in, (x & 0x3FFF, x >> 14)
+    // (InstEmitTexture.cs, nvn_mtl.m tbuf_as_2d; KTGL's light and decal lists, Three Houses: 1,052,640 RGBA32F elements, 65 rows). Metal views the pool memory itself; here the
+    // rows are copied from the storage as a linear texture's are (tbuf_rows_copy: at first use, then the rows the CPU wrote), the last row ending at the storage's end
+    int tbuf = d->target == NVN_TEXTURE_TARGET_BUFFER; uint32_t tbw = 0, tbh = 0, tbrow = 0;
+    if (tbuf && (f->kind >= 3 || compressed(f) || !nvn_tbuf_rows(d->width, f->bpb, 1, &tbw, &tbh, &tbrow) || tbw > V.props.limits.maxImageDimension2D || tbh > V.props.limits.maxImageDimension2D)) {
+        VRED_ONCE("buffer texture serial %llu: %u elements of format %#x have no 2D-row image (first case)", (unsigned long long)t->serial, d->width, d->format); return NULL; }
     vka_img *im = calloc(1, sizeof *im);
     im->serial = t->serial; im->mem = t->mem; im->d = *d; im->L = t->L; im->f = *f; im->refs = 1;
     im->last_frame = vka_frame();
     im->last_fence = vka_fence_last();
     int is3d = d->target == NVN_TEXTURE_TARGET_3D, is1d = d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY;
-    im->w = d->width ? d->width : 1; im->h = is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
+    im->w = tbuf ? tbw : d->width ? d->width : 1; im->h = tbuf ? tbh : is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
     uint32_t vstride = 0;
     int is_vid = dm_codec_is_video_mem(im->mem, im->L.size, &vstride);
     if (is_vid) {
@@ -508,7 +514,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     im->pool = t->pool; im->pfin = nvn_pool_fin(); im->pgen = nvn_pool_live(t->pool, NULL, NULL);   // (the count first: a pool event in between is seen at the next check)
     // 1D and 1D-array textures are one-row 2D / 2D-array images, as nvn_mtl.m makes them: the translator declares every such read as a 2D one (no Dim1D in any DKB module),
     // and Vulkan has no 2D view of a 1D image, so a 1D image read as unbound
-    im->layers = is3d ? 1 : t->L.layers ? t->L.layers : 1; im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? (uint32_t)d->samples : 1;
+    im->layers = is3d || tbuf ? 1 : t->L.layers ? t->L.layers : 1; im->levels = tbuf ? 1 : d->levels ? d->levels : 1; im->samples = d->samples > 1 ? (uint32_t)d->samples : 1;
     if (base >= im->levels || is3d) base = 0;
     im->base = base; im->levels -= base; im->w = im->w >> base ? im->w >> base : 1; im->h = im->h >> base ? im->h >> base : 1;
     im->aspect = aspect_of(f->kind);
@@ -528,6 +534,9 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     im->fl = (vkfl){0};
     if (ubwc && f->kind <= 2) { VkFormat x[VKFL_MAX]; pthread_mutex_lock(&g_vlmu); im->fl.nx = vl_formats(f->vk, im->w, im->h, (d->flags & NVN_TEXTURE_FLAGS_IMAGE) != 0, x, VL_PER_IMAGE); pthread_mutex_unlock(&g_vlmu); for (int k = 0; k < im->fl.nx; k++) im->fl.x[k] = (uint32_t)x[k]; }   // learned view formats
     if (ubwc) im->fl.alt = (uint32_t)alt; else im->fl.any = f->kind <= 2;
+    // A buffer texture's integer format takes its float twin in the list, a float one its uint twin: the translator declares a fetched texture float when it has no type answer,
+    // and KTGL takes the bits back with as_type<int> (nvn_mtl.m tbuf_view_format), so the view of the shader's class (class_twin) is there without waiting for the pair to be learned
+    if (tbuf && ubwc && f->kind <= 2) { VkFormat tw = class_twin(f->vk, f->kind ? 0 : 1); if (tw && !vkfl_has(&im->fl, (uint32_t)f->vk, (uint32_t)tw) && im->fl.nx < VKFL_MAX) im->fl.x[im->fl.nx++] = (uint32_t)tw; }
     uint32_t fls[2 + VKFL_MAX]; int nfl = ubwc ? vkfl_entries(&im->fl, (uint32_t)f->vk, fls) : 0;   // (own format first, no UNDEFINED entry)
     VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = (uint32_t)nfl, .pViewFormats = (const VkFormat *)fls};
     VkImageCreateFlags fl = nfl || im->fl.any ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -680,7 +689,7 @@ static int nvn2_sampled_content(const tex_t *t, const vka_fmt *f, unsigned pf, i
 static uint64_t g_nvn2_first[2];   // textures taken from their storage at a first sample (nvn2_sampled_content): [0] with data, [1] storage all zero (tracked from zeros)
 static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int cpuw, int sampled) {   // c: the storage's content as the GPU will see it (t->mem or gw_content's copy)
     const nvn_texdesc *d = &t->d;
-    if (!t->mem || d->samples > 1 || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_BUFFER) return ST_ZERO;
+    if (!t->mem || d->samples > 1 || f->kind >= 3) return ST_ZERO;
     // A sparse virtual pool's texture (nvn_mtl.m tex_from_storage): a sampled one holds what the CPU wrote into the physical pages mapped behind it (streamed textures), read
     // through the page table and uploaded again when its mappings or those pages change (ST_SPARSE); render targets and images are GPU content. Its address is reserved, inaccessible
     // memory where nothing is mapped (no host alias on Android), so mem_any and the other checks below must not read it
@@ -691,6 +700,7 @@ static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int 
     int want = ST_ZERO;
     if (cpuw || t->has_layout) want = ST_TRACK;
     else if (linear && t->pool) want = ST_TRACK;
+    else if (d->target == NVN_TEXTURE_TARGET_BUFFER && t->pool) want = ST_TRACK;   // a buffer texture's rows (img_create_): its elements as the CPU writes them, like a linear texture's rows
     else if (is_vid) want = ST_TRACK;
     else if (comp && !(d->flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_SPARSE)) && mem_any_mapped(c, t)) want = ST_TRACK;
     else if (nvn2_sampled_content(t, f, pf, sampled)) {
@@ -1011,17 +1021,40 @@ static void upload_fill(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // 
     if (!c && !im->vpool) c = unmapped_content(t);
     if (c) { tex_t tc = *t; tc.mem = c; upload(im, &tc, cb); free(c); g_gw_over++; } else upload(im, t, cb);
 }
+// A buffer texture's image (img_create_: 2D rows of NVN_TBUF_ROW elements, back to back in the storage as the wrapped fetch assumes): rows [r0, r1) copied from the storage through
+// scratch memory, in pieces of at most 4 MiB; the part of the last row past the storage's end is zeros (the storage holds exactly the elements, nothing past it is read).
+// *nbytes (may be NULL): the bytes copied, added. 0 = no scratch, or no command buffer after a GPU hang (vka_up_point)
+static int tbuf_rows_copy(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint32_t r0, uint32_t r1, uint64_t *nbytes) {
+    size_t pitch = (size_t)im->w * im->f.bpb, size = t->L.size; uint32_t step = pitch ? (uint32_t)((4u << 20) / pitch) : 0; if (!step) step = 1;
+    if (r1 > im->h) r1 = im->h;
+    for (uint32_t y0 = r0; y0 < r1; y0 += step) {
+        uint32_t y1 = y0 + step < r1 ? y0 + step : r1; size_t piece = pitch * (y1 - y0);
+        vka_span s; if (!vka_scratch(piece, 16, &s)) return 0;
+        for (uint32_t y = y0; y < y1; y++) {
+            size_t o = (size_t)y * pitch, n = o < size ? (size - o < pitch ? size - o : pitch) : 0;
+            if (n) memcpy(s.ptr + (size_t)(y - y0) * pitch, t->mem + o, n);
+            if (n < pitch) memset(s.ptr + (size_t)(y - y0) * pitch + n, 0, pitch - n);
+        }
+        VkBufferImageCopy c = {s.off, im->w, y1 - y0, {im->aspect, 0, 0, 1}, {0, (int32_t)y0, 0}, {im->w, y1 - y0, 1}};
+        vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        if (nbytes) *nbytes += piece;
+        if (!(cb = vka_up_point(cb))) return 0;
+    }
+    return 1;
+}
 // A linear 2D texture of one level and layer whose pages the CPU wrote between byte lo and hi of its storage: only those rows again (Donkey Kong Bananza's glyph cache,
-// 1024x8192 R8: the whole 8 MB was deswizzled and copied each time a glyph was rasterized into it). 0 = not such a texture (the caller uploads all of it)
+// 1024x8192 R8: the whole 8 MB was deswizzled and copied each time a glyph was rasterized into it). 0 = not such a texture (the caller uploads all of it).
+// A buffer texture's rows (img_create_) the same way: one row of pitch bytes each, through tbuf_rows_copy (its last row ends at the storage's end)
 static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi) {
-    const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
-    if (!(im->is_video || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
-    uint32_t bx = (im->w + f->bw - 1) / f->bw, by = (im->h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch;
+    const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f; int tbuf = d->target == NVN_TEXTURE_TARGET_BUFFER;
+    if (!(im->is_video || tbuf || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
+    uint32_t bx = (im->w + f->bw - 1) / f->bw, by = (im->h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, st = tbuf ? pitch : im->d.stride ? im->d.stride : d->stride ? d->stride : pitch;
     if (st < pitch) return 0;
     uint32_t r0 = (uint32_t)(lo / st), r1 = (uint32_t)((hi + st - 1) / st); if (r1 > by) r1 = by;
     if (r0 >= r1) r0 = 0, r1 = by;
     im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
+    if (tbuf) { tbuf_rows_copy(im, t, cb, r0, r1, &g_rows_up); return 1; }
     vka_span s; if (!vka_scratch(pitch * (r1 - r0), 16, &s)) return 1;
     for (uint32_t y = r0; y < r1; y++) memcpy(s.ptr + (size_t)(y - r0) * pitch, t->mem + (size_t)y * st, pitch);
     uint32_t y0 = r0 * f->bh, y1 = r1 * f->bh > im->h ? im->h : r1 * f->bh;
@@ -1036,7 +1069,7 @@ static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, 
 // texture again. 0 = not such a texture, or content the GPU has pending writes over (the caller uploads all of it)
 static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi, uint64_t old) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
-    if (!VKA_ENV("DM_VK_BANDS", 1) || im->vpool || im->m.z || im->is_video || vka_nan_on() || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_3D || im->depth > 1 ||
+    if (!VKA_ENV("DM_VK_BANDS", 1) || im->vpool || im->m.z || im->is_video || vka_nan_on() || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_BUFFER || im->depth > 1 ||
         (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || im->L.size < (1u << 20)) return 0;
     uint64_t seen; uint8_t *c = gw_content(t->mem, t->L.size, &seen);
     if (c) { free(c); return 0; }
@@ -1968,6 +2001,7 @@ static void upload(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // (call
     atomic_fetch_add_explicit(&g_up_ns, now_ns() - t0, memory_order_relaxed); atomic_fetch_add_explicit(&g_up_bytes, nb, memory_order_relaxed);
 }
 static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *nbytes) {
+    if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) { uint64_t nb = 0; tbuf_rows_copy(im, t, cb, 0, im->h, &nb); *nbytes = nb; return; }   // a buffer texture: its rows (img_create_)
     if (!im->vpool && upload_mt(im, t, cb, nbytes)) return;   // (a sparse pool's storage is read through its page table below, never at its address)
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
     int linear = im->is_video || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)), is3d = d->target == NVN_TEXTURE_TARGET_3D;
