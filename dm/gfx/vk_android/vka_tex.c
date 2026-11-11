@@ -493,6 +493,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     // (InstEmitTexture.cs, nvn_mtl.m tbuf_as_2d; KTGL's light and decal lists, Three Houses: 1,052,640 RGBA32F elements, 65 rows). Metal views the pool memory itself; here the
     // rows are copied from the storage as a linear texture's are (tbuf_rows_copy: at first use, then the rows the CPU wrote), the last row ending at the storage's end
     int tbuf = d->target == NVN_TEXTURE_TARGET_BUFFER; uint32_t tbw = 0, tbh = 0, tbrow = 0;
+    if (tbuf && !VKA_ENV("DM_VK_TBUF", 1)) { VRED_ONCE("texture buffers are off (DM_VK_TBUF=0; first: serial %llu)", (unsigned long long)t->serial); return NULL; }   // the comparison switch
     if (tbuf && (f->kind >= 3 || compressed(f) || !nvn_tbuf_rows(d->width, f->bpb, 1, &tbw, &tbh, &tbrow) || tbw > V.props.limits.maxImageDimension2D || tbh > V.props.limits.maxImageDimension2D)) {
         VRED_ONCE("buffer texture serial %llu: %u elements of format %#x have no 2D-row image (first case)", (unsigned long long)t->serial, d->width, d->format); return NULL; }
     vka_img *im = calloc(1, sizeof *im);
