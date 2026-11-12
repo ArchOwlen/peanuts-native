@@ -194,7 +194,7 @@ for the full checklist on what's safe to share.
 
 ## Credits and license
 
-Peanuts Native is a fork of **[Banana Native](https://git.eden-emu.dev/moceure/BananaNative)**. The combined
+Peanuts Native is a fork of **[Banana Native](https://git.eden-emu.dev/moceure/BananaNative)** by **moceure**. The combined
 project is **GPL-3.0-or-later** as a whole: Banana Native carries GPL-licensed components (frame generation ported
 from Eden/lsfg-vk, and the shader translator's task/mesh lowering ported from switch2mac/Eglantine — see Banana
 Native's own `android/NOTICE.md` for the exact breakdown), and the dual-screen companion runtime this project ports
