@@ -2,6 +2,7 @@ package dev.peanuts.ui;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
@@ -17,6 +18,9 @@ import android.graphics.drawable.RippleDrawable;
 import android.graphics.drawable.StateListDrawable;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
+import android.util.Log;
 import android.text.Layout;
 import android.text.SpannableString;
 import android.text.Spanned;
@@ -44,6 +48,7 @@ import dev.peanuts.build.BuildRequest;
 import dev.peanuts.build.GameEnv;
 
 import java.io.File;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -78,13 +83,26 @@ public final class Library {
     private static boolean catalogFetched, everScanned;
     private static final Map<String, Bitmap> icons = new HashMap<>();
     private static final Set<String> listed = new HashSet<>();   // launch paths handed to upstream's list already (Upstream.addToList), so a failing add is not retried every refresh
+    /**
+     * Owner request round 3, hide-only since critique-phase2c round 4: upstream's Game list entries this build leaves out of {@link #rows()} — never
+     * deleted, never any permission revoked — either because their volume is not mounted right now (removable storage unplugged: hidden at once), or
+     * because {@link #staleGames} got positive, repeated proof the file itself is gone (hidden only after two scans at least 60 s apart agree, and
+     * never for a SAF-picked .nup or without All files access/an app-storage path — see {@link #staleGames}'s doc). Recomputed from scratch every
+     * scan() (cleared, then repopulated), so a returned volume's or a reappeared file's games come back on the next rescan automatically. The new
+     * "Hidden: N missing games" toggle in the filter row lets the player show these again and use upstream's own "Game file gone → Remove" dialog on
+     * them, by their own choice, instead of this code ever deleting anything on its own
+     */
+    private static final Set<String> hiddenUnmounted = Collections.synchronizedSet(new HashSet<>());
+    /** gameDir → the wall-clock time {@link #staleGames} first got positive proof it was gone (critique-phase2c §A-1's "two scans at least 60 s apart"
+     *  gate); removed the moment any check stops confirming "gone", or the entry leaves upstream's list some other way */
+    private static final Map<String, Long> missingSince = new java.util.concurrent.ConcurrentHashMap<>();
     private static Build build;   // the running (or stopped) build, kept across activity recreation (the service runs on)
     private static final Handler UI = new Handler(Looper.getMainLooper());
 
     /** A build as the card shows it */
     static final class Build {
         final int id; final String titleId, name;
-        String step = "import", detail = "Starting"; int percent; boolean failed; String error = "";
+        String step = "import", detail = "Starting"; int percent; boolean failed; String error = "", code = "";
         Build(int id, String titleId, String name) { this.id = id; this.titleId = titleId; this.name = name; }
     }
 
@@ -100,6 +118,7 @@ public final class Library {
     private boolean scanning;
     private int filter = ALL;
     private String find = "";
+    private boolean showHidden;   // the "Hidden: N missing games · Show/Hide" toggle (critique-phase2c §A-3): off by default, so a hidden card needs an explicit tap to reveal
     private final Map<String, TextView> tiles = new HashMap<>();   // the tiles of the covers showing, by title ID (icons land while they show)
     private final Map<String, Boolean> companions = new HashMap<>();   // title ID → a companion is installed (read once per pass; cleared by a scan and a build's end)
     // the build card's live parts (null when it is not on screen)
@@ -121,7 +140,7 @@ public final class Library {
             b.step = step; b.percent = percent; b.detail = detail == null ? "" : detail;
             if (stepChanged || (buildStatus == null && coverChip == null) || box == null) render(); else updateBuildCard(b);
         }
-        @Override public void done(boolean ok, String message) {
+        @Override public void done(boolean ok, String message, String code) {
             Build b = build;
             if (b == null) return;
             if (ok) {
@@ -129,7 +148,7 @@ public final class Library {
                 Toast.makeText(a, b.name + " is ready to play.", Toast.LENGTH_LONG).show();
                 scan();
             } else {
-                b.failed = true; b.error = message == null ? "" : message;
+                b.failed = true; b.error = message == null ? "" : message; b.code = code == null ? "" : code;
                 render();
             }
         }
@@ -186,6 +205,7 @@ public final class Library {
             List<CompanionPort.Item> c = catalogFetched ? catalog : CompanionPort.fetch();
             // a scanned game that is ready and not in upstream's list goes into it: its card is then Banana's own
             List<Upstream.Entry> list = Upstream.games(a);
+            staleGames(list, a);
             for (LibraryScanner.Title x : t) {
                 if (x.status != LibraryScanner.Status.READY || x.launch == null || x.packDir == null || listedIn(list, x)) continue;
                 if (!listed.add(x.launch.getPath())) continue;
@@ -211,6 +231,122 @@ public final class Library {
     private static boolean listedIn(List<Upstream.Entry> list, LibraryScanner.Title t) {
         for (Upstream.Entry e : list) if (samePath(e.gameDir, t.launch.getPath())) return true;
         return false;
+    }
+
+    /**
+     * Round 4 (critique-phase2c §A-1, a blocker on round 3's version): HIDE-ONLY, never remove. Round 3 deleted the upstream list entry itself
+     * whenever {@code !File.exists()} on a mounted volume — but {@code File.exists()} is not a reliable "the file is gone" test in this app:
+     * <ul>
+     * <li>every SAF-picked .nup's {@code gameDir} is a stand-in path whose file is never created ({@code PickedNup}/{@code PickedPath}: only the
+     *     stand-in's parent folder exists), so {@code exists()} on it is false by design, always — deleting the record there meant losing the
+     *     library entry AND, had {@code PickedNup.forget} still run, the user's picked-file permission, on the very first scan after picking it;</li>
+     * <li>without All files access, {@code exists()} is false for everything outside the app's own storage, which would have wiped out the whole
+     *     library the moment the permission is off;</li>
+     * <li>a transient FUSE/MediaProvider hiccup can make {@code exists()} false for a moment even though the volume is mounted and the file is fine.</li>
+     * </ul>
+     * None of this is fixed by checking the volume is mounted — in every case above, it is. So this method now only ever **hides** a card (never
+     * touches upstream's Game list, never calls {@code Game.save} or {@code PickedNup.forget}), and only when every one of these holds:
+     * <ol>
+     * <li>the entry is <b>not</b> a {@code PickedNup} stand-in ({@code PickedNup.is}, reflection) — those are never this logic's business; upstream's
+     *     own {@code gone()}/{@code PickedNup.problem} already covers them correctly, through its own dialog;</li>
+     * <li>this app has All files access ({@code Environment.isExternalStorageManager()}) or the path is inside app storage ({@code CopyPlan.inApp}) —
+     *     mirrors upstream's own {@code readable} gate in {@code gone()}: without one of these, "cannot tell" means "not gone", never "gone";</li>
+     * <li><b>positive proof of absence</b>: the parent directory exists and {@code listFiles()} returns a non-null listing that does not contain the
+     *     file's name — not merely {@code !exists()}, which a permission problem or a provider hiccup can also produce;</li>
+     * <li>that proof held on <b>two scans at least 60 seconds apart</b> ({@code missingSince}, kept in memory, keyed by {@code gameDir}; the gate
+     *     resets the moment any check above stops confirming "gone").</li>
+     * </ol>
+     * A card hidden this way is never deleted and never loses anything: the Game list entry stays exactly as it was, and the new "Hidden: N missing
+     * games" toggle (the filter row) lets the player show it again and use upstream's own "Game file gone → Remove" dialog themselves, on their own
+     * say — satisfying the original owner ask ("let the user see and remove them") without this code ever guessing on their behalf.
+     * <p>
+     * The unmounted-volume branch is unchanged from round 3 (already correct per critique-phase2c), aside from fixing a path-prefix bug in
+     * {@link #volumeMounted}: it hides immediately (no 60-second gate — a volume being absent is itself the positive proof) and never removes.
+     */
+    private static void staleGames(List<Upstream.Entry> list, Activity act) {
+        if (act == null) return;   // nothing to ask the StorageManager/reflection with right now: leave every record exactly as it is, try again next scan
+        Set<String> hiddenNow = new HashSet<>();
+        Set<String> seenThisPass = new HashSet<>();
+        for (Upstream.Entry e : list) {
+            String gameDir = e.gameDir;
+            if (gameDir == null || gameDir.isEmpty()) continue;
+            seenThisPass.add(gameDir);
+            if (new File(gameDir).exists()) { missingSince.remove(gameDir); continue; }   // plainly there: clear any stale bookkeeping, nothing to hide
+            Boolean mounted = volumeMounted(act, gameDir);
+            if (mounted == null) continue;   // cannot tell: leave the record and its card exactly as they are, try again next scan
+            if (!mounted) { hiddenNow.add(gameDir); continue; }   // its volume is not plugged in right now: hide at once, no 60-second gate needed
+            // the volume is mounted, so !exists() is actually worth asking about -- but only with the gates above, never on !exists() alone
+            if (pickedNupStandIn(act, gameDir)) { missingSince.remove(gameDir); continue; }
+            if (!readableOutsideApp(act, gameDir)) { missingSince.remove(gameDir); continue; }
+            if (!confirmedAbsent(gameDir)) { missingSince.remove(gameDir); continue; }
+            long now = System.currentTimeMillis();
+            Long since = missingSince.putIfAbsent(gameDir, now);
+            if (since != null && now - since >= 60_000L) hiddenNow.add(gameDir);   // confirmed absent on two scans at least 60 s apart: hide, never remove
+        }
+        missingSince.keySet().retainAll(seenThisPass);   // an entry gone from upstream's list some other way (the user removed it themselves, etc.) drops its bookkeeping too
+        hiddenUnmounted.clear();
+        hiddenUnmounted.addAll(hiddenNow);
+    }
+
+    /** Whether path is on a volume Android currently lists (internal storage, or a mounted SD/USB); null when this cannot be told (no StorageManager, or
+     *  an exception reading it) — never a guess in either direction: null leaves the record exactly as it is (neither removed nor hidden) until a later
+     *  scan can tell for sure. Matches the volume's root exactly or with a path separator after it (critique-phase2c §A-1 prefix-bug fix: without the
+     *  separator, "/storage/emulated/0" would also match "/storage/emulated/01…") */
+    private static Boolean volumeMounted(Context ctx, String path) {
+        try {
+            StorageManager sm = ctx.getSystemService(StorageManager.class);
+            if (sm == null) return null;
+            String target = new File(path).getCanonicalPath();
+            for (StorageVolume v : sm.getStorageVolumes()) {
+                File dir = v.getDirectory();
+                if (dir == null) continue;
+                String root = dir.getCanonicalPath();
+                if (target.equals(root) || target.startsWith(root + File.separator)) return Boolean.TRUE;
+            }
+            return Boolean.FALSE;
+        } catch (RuntimeException | java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /** {@code PickedNup.is(Context, String)} by reflection: true for a .nup picked through the system file picker (its gameDir is a stand-in path
+     *  that is never itself created, PickedNup.java:157 — exists() on it is false always, by design, so this logic must never act on it). An
+     *  exception defaults to true: "might be a stand-in" is the safe guess, since treating one as a stand-in only ever means leaving it alone */
+    private static boolean pickedNupStandIn(Context ctx, String gameDir) {
+        try {
+            Class<?> k = Class.forName("dev.nxnative.android.PickedNup");
+            Method is = k.getDeclaredMethod("is", Context.class, String.class); is.setAccessible(true);
+            return Boolean.TRUE.equals(is.invoke(null, ctx, gameDir));
+        } catch (Throwable t) { return true; }
+    }
+
+    /** Mirrors upstream's own `readable` gate in {@code MainActivity.gone} (critique-phase2c §A-1): All files access, or the path is inside this
+     *  app's own storage ({@code CopyPlan.inApp}, reflection). Without either, upstream itself treats "cannot tell" as "not gone" — never as "gone" —
+     *  and so does this: an exception here also defaults to false, the same "not gone" reading */
+    private static boolean readableOutsideApp(Context ctx, String gameDir) {
+        try {
+            if (android.os.Environment.isExternalStorageManager()) return true;
+            Class<?> appStorage = Class.forName("dev.nxnative.android.AppStorage");
+            Method root = appStorage.getDeclaredMethod("root", Context.class); root.setAccessible(true);
+            File appRoot = (File) root.invoke(null, ctx);
+            Class<?> copyPlan = Class.forName("dev.nxnative.android.CopyPlan");
+            Method inApp = copyPlan.getDeclaredMethod("inApp", File.class, String.class); inApp.setAccessible(true);
+            return Boolean.TRUE.equals(inApp.invoke(null, appRoot, gameDir));
+        } catch (Throwable t) { return false; }
+    }
+
+    /** Positive proof the file is gone (critique-phase2c §A-1), not merely {@code !exists()}: the parent folder itself resolves and can be listed
+     *  ({@code list()} non-null — a permission problem or a transient provider hiccup gives null, not an empty array, so that case is "no proof"
+     *  too), and the file's own name is not among its entries */
+    private static boolean confirmedAbsent(String gameDir) {
+        File f = new File(gameDir);
+        File parent = f.getParentFile();
+        if (parent == null) return false;
+        String[] names = parent.list();
+        if (names == null) return false;
+        String want = f.getName();
+        for (String n : names) if (n.equals(want)) return false;
+        return true;
     }
 
     private static final Map<String, String> canon = new HashMap<>();   // path → canonical path (a render compares every listed game with every scanned one)
@@ -260,12 +396,26 @@ public final class Library {
         long used() { return entry != null ? entry.used : 0; }
     }
 
+    /** How many of the Activity's current Game entries {@link #hiddenUnmounted} covers right now, regardless of {@link #showHidden} — the filter row's
+     *  "Hidden: N missing games" count always reflects what is actually hidden this render, not {@link #hiddenUnmounted}'s raw size (which may include
+     *  gameDirs the current {@code games} list does not even have any more) */
+    private int hiddenGameCount() {
+        int n = 0;
+        for (Object g : games) {
+            Upstream.Entry e = Upstream.entryOf(g);
+            if (e != null && hiddenUnmounted.contains(e.gameDir)) n++;
+        }
+        return n;
+    }
+
     private List<Row> rows() {
         List<Row> out = new ArrayList<>();
         Set<LibraryScanner.Title> taken = new HashSet<>();
         for (Object g : games) {
             Upstream.Entry e = Upstream.entryOf(g);
             if (e == null) continue;
+            if (!showHidden && hiddenUnmounted.contains(e.gameDir)) continue;   // hidden (never removed): either its volume is not mounted right now, or
+            // it is confirmed missing but kept for the player to see and Remove themselves (critique-phase2c §A); the "Hidden: N · Show" toggle reveals it
             LibraryScanner.Title hit = null;
             for (LibraryScanner.Title t : titles) if (t.launch != null && samePath(e.gameDir, t.launch.getPath())) { hit = t; break; }
             if (hit != null) taken.add(hit);
@@ -328,6 +478,16 @@ public final class Library {
         chip(chipRow, "Ready " + ready, READY);
         chip(chipRow, "Build needed " + toBuild, BUILD);
         chip(chipRow, "Not in this app version " + noProfile, NO_PROFILE);
+        int hidden = hiddenGameCount();
+        if (hidden > 0) {
+            // critique-phase2c §A-3: lets the player see and remove a confirmed-missing (or currently unreachable) game themselves, through upstream's
+            // own "Game file gone → Remove" dialog, instead of this code ever deleting the record on its own
+            Button hideB = PUi.button(a, "Hidden: " + hidden + " missing game" + (hidden == 1 ? "" : "s") + " · " + (showHidden ? "Hide" : "Show"),
+                    PUi.Kind.QUIET, v -> { showHidden = !showHidden; render(); });
+            LinearLayout.LayoutParams hlp = PUi.wrap();
+            hlp.leftMargin = PUi.dp(a, 8);
+            chipRow.addView(hideB, hlp);
+        }
         chips.addView(chipRow, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         top.addView(chips, PUi.weight());
         Button findB = PUi.button(a, find.isEmpty() ? "Find" : "Find · " + find, PUi.Kind.QUIET, v -> findDialog());
@@ -461,8 +621,13 @@ public final class Library {
         boolean stopped = ownBuild && b.failed;
         String name = r.name();
         boolean companion = companionInstalled(r);
+        // P1 (version truth): a "Build needed" cover splits into "File gone" and "Wrong version" when the scan knows enough (r.title set); a listed-only row
+        // (r.title == null) keeps today's plain "Build needed" since LibraryScanner never looked at it
+        LibraryScanner.VersionState vs = r.title == null ? LibraryScanner.VersionState.UNKNOWN : r.title.versionState;
+        boolean fileGone = vs == LibraryScanner.VersionState.FILE_GONE, wrongVersion = vs == LibraryScanner.VersionState.UNSUPPORTED;
+        String buildWords = fileGone ? "File gone" : wrongVersion ? "Wrong version" : "Build needed";
         String state = building ? (stopped ? "Build stopped" : ownBuild ? "Building · " + b.percent + " %" : "Building · preparing")
-                : st == READY ? "Ready" : st == BUILD ? "Build needed" : "Not in this app version";
+                : st == READY ? "Ready" : st == BUILD ? buildWords : "Not in this app version";
 
         LinearLayout cell = new LinearLayout(a);
         cell.setOrientation(LinearLayout.VERTICAL);
@@ -505,7 +670,10 @@ public final class Library {
             lp.setMargins(p8, p8, p8, p8);
             cover.addView(ok, lp);
         } else if (st == BUILD) {
-            cover.addView(mark("Build", PUi.col(a, R.color.bn_banana), R.color.bn_on_banana, false, Gravity.TOP | Gravity.START));
+            String pill = fileGone ? "File gone" : wrongVersion ? "Wrong version" : "Build";
+            int fill = fileGone || wrongVersion ? R.color.bn_danger_tint : R.color.bn_banana;
+            int text = fileGone || wrongVersion ? R.color.bn_danger : R.color.bn_on_banana;
+            cover.addView(mark(pill, PUi.col(a, fill), text, false, Gravity.TOP | Gravity.START));
         } else {
             cover.addView(mark("Not in this app version", PUi.col(a, R.color.bn_danger_tint), R.color.bn_danger, false, Gravity.TOP | Gravity.START));
         }
@@ -664,12 +832,44 @@ public final class Library {
         PUi.add(c, buildPct, 6);
         PUi.Details details = PUi.details(a, b.failed ? b.error : "");
         PUi.add(c, details, 4);
-        View left = b.failed
-                ? PUi.button(a, "Retry", PUi.Kind.TONAL, v -> { if (t != null) sheet(t); })
-                : PUi.button(a, "Stop", PUi.Kind.TONAL, v -> PUi.confirmDanger(a, "Stop the build?", "The build of " + name + " stops. What is written so far stays, and the next Build picks up what it can.", "Stop", () -> BuildPipeline.cancel(a)));
-        PUi.Action play = PUi.action(a, R.drawable.ic_play, "Play", PUi.Kind.PRIMARY, null);
-        play.setEnabled(false);
-        PUi.add(c, PUi.pair(a, left, play), 14);
+        View right;
+        View left;
+        if (b.failed) {
+            // Every button here must do what its label says (critique-phase2a §A must-fix 2 — before this, "Build anyway"/"Pick the recommended
+            // update"/"Pick the file again"/"Resume" all just reopened the sheet, same as plain "Retry"). Only two actions are actually honest to offer from
+            // the card without a file picker of its own: open the sheet (unchanged — it already has the Version row, the re-pick chevrons and the relabeled
+            // Build/"Build anyway" button, so "open the sheet" is never a dead end), or really resume the job (now implemented, below)
+            Runnable openSheet = () -> { if (t != null) sheet(t); };
+            switch (b.code) {
+                case BuildListener.FILE_MISSING:
+                case BuildListener.WRONG_VERSION:
+                case BuildListener.INVALID_DUMP:
+                    left = PUi.button(a, "Open the game's sheet", PUi.Kind.TONAL, v -> openSheet.run());
+                    right = null;
+                    break;
+                case BuildListener.OUT_OF_SPACE:
+                    left = PUi.button(a, "Free up space", PUi.Kind.TONAL, v -> {
+                        try { a.startActivity(new android.content.Intent(android.provider.Settings.ACTION_INTERNAL_STORAGE_SETTINGS)); }
+                        catch (RuntimeException e) { Toast.makeText(a, "Open Settings › Storage to free some space.", Toast.LENGTH_LONG).show(); }
+                    });
+                    right = PUi.button(a, "Retry", PUi.Kind.SOFT, v -> openSheet.run());
+                    break;
+                case BuildListener.STALLED:
+                case BuildListener.CANCELLED:
+                    left = PUi.button(a, "Resume", PUi.Kind.TONAL, v -> resumeBuild(t));
+                    right = null;
+                    break;
+                default:
+                    left = PUi.button(a, "Retry", PUi.Kind.TONAL, v -> openSheet.run());
+                    right = null;
+            }
+        } else {
+            left = PUi.button(a, "Stop", PUi.Kind.TONAL, v -> PUi.confirmDanger(a, "Stop the build?", "The build of " + name + " stops. What is written so far stays, and the next Build picks up what it can.", "Stop", () -> BuildPipeline.cancel(a)));
+            PUi.Action play = PUi.action(a, R.drawable.ic_play, "Play", PUi.Kind.PRIMARY, null);
+            play.setEnabled(false);
+            right = play;
+        }
+        PUi.add(c, PUi.pair(a, left, right), 14);
         updateBuildCard(b);
         return c;
     }
@@ -684,7 +884,13 @@ public final class Library {
         PUi.status(buildStatus, stepWords(b), b.failed ? R.color.bn_danger : b.step.equals("done") ? R.color.bn_leaf : R.color.bn_accent);
         if (b.failed) {
             String first = b.error.split("\n")[0].trim();
-            buildBody.setText((first.isEmpty() ? "The build stopped." : first) + " Tap Retry to open the sheet and build again.");
+            String action = BuildListener.FILE_MISSING.equals(b.code) ? " Open the game's sheet to pick the file again."
+                    : BuildListener.WRONG_VERSION.equals(b.code) ? " Open the game's sheet: tap “Build anyway” there if you want to try it, or pick the recommended update."
+                    : BuildListener.INVALID_DUMP.equals(b.code) ? " The dump looks incomplete or wrong. Open the game's sheet to check the files, or dump the game again."
+                    : BuildListener.OUT_OF_SPACE.equals(b.code) ? " Free up some space, then Retry."
+                    : BuildListener.STALLED.equals(b.code) || BuildListener.CANCELLED.equals(b.code) ? " Tap Resume: it picks up where it stopped."
+                    : " Tap Retry to open the sheet and build again.";
+            buildBody.setText((first.isEmpty() ? "The build stopped." : first) + action);
             buildBar.setVisibility(View.GONE);
             buildPct.setVisibility(View.GONE);
         } else {
@@ -716,10 +922,10 @@ public final class Library {
         String root = PeanutsPrefs.gameDir(a);
         r.gameDir = root == null ? null : new File(root);
         r.companionPackage = s.installCompanion ? s.companionPackage : null;
-        int id = BuildPipeline.start(a, r, new BuildListener() {   // a refusal comes back through this (id 0); a started build's listener is attached below
+        int id = BuildPipeline.start(a, r, s.buildAnyway, new BuildListener() {   // a refusal comes back through this (id 0); a started build's listener is attached below
             @Override public void progress(String step, int percent, String detail) { listener.progress(step, percent, detail); }
-            @Override public void done(boolean ok, String message) {
-                if (build != null) { listener.done(ok, message); return; }
+            @Override public void done(boolean ok, String message, String code) {
+                if (build != null) { listener.done(ok, message, code); return; }
                 new AlertDialog.Builder(a).setTitle("Build").setMessage(message).setPositiveButton("OK", null).show();
             }
         });
@@ -730,9 +936,22 @@ public final class Library {
         return null;
     }
 
+    /**
+     * The failed card's "Resume" (STALLED/CANCELLED only): actually resumes the job instead of just reopening the sheet (critique-phase2a §A must-fix 2).
+     * Rebuilds the same {@link GameSheet.State} the last build used, from the title and its persisted sheet choices (no open sheet needed — the job itself
+     * was already saved by Prepare and picks up where it stopped, Prepare.java's job.json resume path), and hands it straight to {@link #startBuild}
+     */
+    private void resumeBuild(LibraryScanner.Title t) {
+        if (t == null) { Toast.makeText(a, "Open the game from Home to resume it.", Toast.LENGTH_LONG).show(); return; }
+        GameSheet.State s = GameSheet.resumeState(a, t, CompanionPort.forTitle(catalog, t.titleId));
+        String why = startBuild(s);
+        if (why != null) new AlertDialog.Builder(a).setTitle("Build").setMessage(why).setPositiveButton("OK", null).show();
+    }
+
     // ---- First run ----
 
-    /** emptyCard's shape: the badge, a heading, the three steps, then the three Setting rows on the card itself and the action row */
+    /** emptyCard's shape: the badge, a heading, the four steps (P5, UX-SPEC §2.4: Updates & DLC folded in as its own numbered row, no longer a quiet
+     *  footnote button), the four Setting rows, then the single "Show my games" action */
     private View setupCard() {
         LinearLayout c = PUi.card(a);
         c.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -749,7 +968,7 @@ public final class Library {
         PUi.add(c, t, 6, PUi.wrap());
         LinearLayout steps = PUi.row(a);
         steps.setGravity(Gravity.CENTER);
-        String[] s = {"1  Keys", "2  Game folder", "3  Show my games"};
+        String[] s = {"1  Keys", "2  Game folder", "3  Updates & DLC", "4  Firmware fonts"};
         for (int k = 0; k < s.length; k++) {
             LinearLayout.LayoutParams lp = PUi.wrap();
             if (k > 0) lp.leftMargin = PUi.dp(a, 6);
@@ -764,6 +983,11 @@ public final class Library {
                 .value(keys ? "Added: prod.keys is in the app." : "Optional. Needed for NSP and XCI files; a .nup or a dump folder plays without them.").chevron(a).view, 16);
         PUi.add(c, new PUi.Setting(a, "📁", "Game folder", v -> LibrarySettings.pickFolder(a, LibrarySettings.REQ_GAME, "Pick your game folder"))
                 .value(game != null ? game : "Required. Every NSP, XCI, .nup and dump folder inside is shown on this screen.").chevron(a).view, 0);
+        // P5 (UX-SPEC §2.4): folded in as its own numbered step, same Setting-row shape as the other three, instead of a quiet text button below the action row
+        String updateDir = PeanutsPrefs.updateDir(a), dlcDir = PeanutsPrefs.dlcDir(a);
+        String updDlcValue = updateDir == null && dlcDir == null ? "Point at your update and DLC files if they're not inside the game folder already. Skip if everything's together."
+                : (updateDir != null ? "Update: " + updateDir : "Update: not set") + (dlcDir != null ? " · DLC: " + dlcDir : "");
+        PUi.add(c, new PUi.Setting(a, "⬆️", "Updates & DLC", v -> LibrarySettings.extraFolders(a)).value(updDlcValue).chevron(a).view, 0);
         PUi.add(c, new PUi.Setting(a, "🔤", "Firmware fonts", v -> LibrarySettings.pickFolder(a, LibrarySettings.REQ_FIRMWARE, "Pick your firmware folder"))
                 .value(LibrarySettings.fontsValue(a, "Optional. Lets companions draw the system font.")).chevron(a).view, 0);
         PUi.Action show = PUi.action(a, R.drawable.ic_add, "Show my games", PUi.Kind.PRIMARY, v -> {
@@ -772,12 +996,7 @@ public final class Library {
             changed(a);
         });
         show.setEnabled(game != null);
-        LinearLayout actions = PUi.row(a);
-        actions.addView(show, PUi.weight());
-        LinearLayout.LayoutParams lp = PUi.wrap();
-        lp.leftMargin = PUi.dp(a, 10);
-        actions.addView(PUi.button(a, "Update and DLC folders…", PUi.Kind.QUIET, v -> LibrarySettings.extraFolders(a)), lp);
-        PUi.add(c, actions, 16);
+        PUi.add(c, show, 16, PUi.fill());
         return c;
     }
 }

@@ -56,10 +56,14 @@ final class Prepare {
 
     void cancel() { cancelled = true; }
 
-    /** Runs the whole step; returns the pack folder of the ready game. Throws with a user-readable message when it cannot. */
-    File run(File dump, String titleId, Progress p) throws IOException {
+    /**
+     * Runs the whole step; returns the pack folder of the ready game. Throws with a user-readable message when it cannot. consent: the player's explicit
+     * "Build anyway" on the sheet's Version row for THIS build (P1, critique-phase1 must-fix 2) — without it, a dump whose version is not one of the profile's
+     * builds stops and asks instead of being retried untested on its own (the old behaviour: see the otherBuild branch in run0)
+     */
+    File run(File dump, String titleId, boolean consent, Progress p) throws IOException {
         try {
-            return run0(dump, titleId, p);
+            return run0(dump, titleId, consent, p);
         } catch (ReflectiveOperationException e) {
             Log.w(TAG, "prepare: upstream reflection", e);
             throw new IOException("This build of the app has no on-device packer the build service knows (" + e.getMessage() + ").");
@@ -68,7 +72,7 @@ final class Prepare {
         }
     }
 
-    private File run0(File dump, String titleId, Progress p) throws IOException, ReflectiveOperationException {
+    private File run0(File dump, String titleId, boolean consent, Progress p) throws IOException, ReflectiveOperationException {
         p.on(0, "Checking " + dump.getName());
         // 1. a job already there for this dump?
         String id = titleId;
@@ -85,19 +89,30 @@ final class Prepare {
                 existing = null;   // another format or damaged: a new job replaces it
             }
         }
-        // 2. the dump. A version this app's profile does not list (otherBuild) is what the Home panel's "Try anyway" is for: Build does the same by itself (the sheet
-        // said the version is untested), with the job marked so its later checks are relaxed too (Job.tryAnyway: the shader tables need not match the profile's)
+        // 2. the dump. A version this app's profile does not list (otherBuild) used to be retried silently here ("Try anyway" done for the player without asking:
+        // critique-phase1 must-fix 2, the DQ3 HD-2D case — ~10 minutes lost on a build the sheet never warned about). Now it only goes on when the sheet's own
+        // Version row got the player's explicit "Build anyway" for this request (consent); a resumed job that was already marked tryAnyway (anyBuild from the
+        // existing job.json) still resumes as it was, since that choice was already made once
         Object r = Upstream.dumpCheck(dump, existing == null, anyBuild);
         String error = (String) Upstream.get(r, "error");
         if (error != null && !anyBuild && Boolean.TRUE.equals(Upstream.get(r, "otherBuild"))) {
-            Log.i(TAG, "prepare: untested version (" + error + "): trying anyway");
+            if (!consent) {
+                String detail = Upstream.str(Upstream.get(r, "detail"));
+                throw new BuildListener.Failure("Untested game version: " + error + (detail.isEmpty() ? "" : "\n" + detail)
+                        + "\nOpen the game's sheet and tap \"Build anyway\" if you want to try it (it may not start or may crash, and the first build scans every shader).",
+                        BuildListener.WRONG_VERSION);
+            }
+            Log.i(TAG, "prepare: untested version (" + error + "), building anyway (the player chose Build anyway)");
             Object again = Upstream.dumpCheck(dump, existing == null, true);
             if (Upstream.get(again, "error") == null) { r = again; error = null; anyBuild = true; p.on(0, "Untested game version: preparing it anyway"); }
         }
         if (error != null) {
+            // not a version mismatch (that already returned above): an incomplete/corrupt dump, no RomFS, the wrong title ID, a bad file name, … — a bad dump,
+            // not a missing one (critique-phase2a §A must-fix 4; this used to say FILE_MISSING and offer "pick the file again", which does not fix a bad dump)
             boolean other = Boolean.TRUE.equals(Upstream.get(r, "otherBuild"));
             String detail = Upstream.str(Upstream.get(r, "detail"));
-            throw new IOException((other ? "Untested game version: " : "Cannot prepare this dump: ") + error + (detail.isEmpty() ? "" : "\n" + detail));
+            throw new BuildListener.Failure((other ? "Untested game version: " : "Cannot prepare this dump: ") + error + (detail.isEmpty() ? "" : "\n" + detail),
+                    other ? BuildListener.WRONG_VERSION : BuildListener.INVALID_DUMP);
         }
         String rid = Upstream.str(Upstream.get(r, "titleId"));
         if (!rid.isEmpty()) id = rid;
@@ -114,7 +129,7 @@ final class Prepare {
                 Upstream.addGame(c, existing);
                 return Upstream.jobPack(existing);
             }
-            else if (!s.equals("done") && !s.isEmpty()) throw new IOException("This dump is already being prepared into another pack folder. Resume it from its card on the Home screen, or delete its working files first.");
+            else if (!s.equals("done") && !s.isEmpty()) throw new BuildListener.Failure("This dump is already being prepared into another pack folder. Resume it from its card on the Home screen, or delete its working files first.", BuildListener.OTHER);
         }
         // 3. a pack beside the dump that fits (PackCheck): adopted, or only the rest redone
         if (job == null) {
@@ -157,7 +172,7 @@ final class Prepare {
             c.startForegroundService(Upstream.packStart(c, file));
         } catch (RuntimeException e) {   // ForegroundServiceStartNotAllowedException (Android 12+): the app counts as background now
             Log.w(TAG, "PackService start refused: " + e);
-            throw new IOException("Android did not let the packer start in the background. The job is saved: open " + appName() + " and tap Resume on the game's card.");
+            throw new BuildListener.Failure("Android did not let the packer start in the background. The job is saved: open " + appName() + " and tap Resume on the game's card.", BuildListener.CANCELLED);
         }
         p.on(1, STEP_TEXT[0]);
         // 5. progress from job.json (and the service's messages while bound) until the job ends
@@ -169,7 +184,7 @@ final class Prepare {
             String fs = fromService;
             if (fs != null && fromServiceAt > lastChange) json = fs;
             if (json == null) {
-                if (SystemClock.elapsedRealtime() - startedAt > 30000) throw new IOException("The job file went missing: " + file);
+                if (SystemClock.elapsedRealtime() - startedAt > 30000) throw new BuildListener.Failure("The job file went missing: " + file, BuildListener.OTHER);
                 continue;
             }
             if (!json.equals(lastJson)) { lastJson = json; lastChange = SystemClock.elapsedRealtime(); }
@@ -198,24 +213,24 @@ final class Prepare {
                     lastJson = null;
                     lastChange = SystemClock.elapsedRealtime();
                     p.on(pct(si, done, total), "Trying anyway: " + STEP_TEXT[si]);
-                    try { c.startForegroundService(Upstream.packStart(c, file)); } catch (RuntimeException e) { throw new IOException("Android did not let the packer restart: open " + appName() + " and tap Try anyway on the game's card."); }
+                    try { c.startForegroundService(Upstream.packStart(c, file)); } catch (RuntimeException e) { throw new BuildListener.Failure("Android did not let the packer restart: open " + appName() + " and tap Try anyway on the game's card.", BuildListener.CANCELLED); }
                     continue;
                 }
-                throw new IOException("Preparing failed at " + STEP_TEXT[si].toLowerCase(Locale.ROOT) + (err.isEmpty() ? "." : ": " + err) + "\nRetry from the game's card on the Home screen.");
+                throw new BuildListener.Failure("Preparing failed at " + STEP_TEXT[si].toLowerCase(Locale.ROOT) + (err.isEmpty() ? "." : ": " + err) + "\nRetry from the game's card on the Home screen.", BuildListener.TOOL_STOPPED);
             }
             int pct = pct(si, done, total);
             if (state.equals("paused")) {
                 if (reason.equals("user") || reason.equals("timeout") || reason.equals("refused") || reason.equals("apk"))
-                    throw new IOException("Preparing paused (" + reasonText(reason) + "). Resume from the game's card on the Home screen.");
+                    throw new BuildListener.Failure("Preparing paused (" + reasonText(reason) + "). Resume from the game's card on the Home screen.", BuildListener.CANCELLED);
                 p.on(pct, "Paused: " + reasonText(reason) + ". " + stepText(si, done, total, stage));
                 lastChange = SystemClock.elapsedRealtime();   // a heat or battery pause is not a stall
                 continue;
             }
             p.on(pct, stepText(si, done, total, stage));
             if (SystemClock.elapsedRealtime() - lastChange > STALL_MS && !(link != null && link.alive))
-                throw new IOException("The packer stopped reporting progress. Resume from the game's card on the Home screen.");
+                throw new BuildListener.Failure("The packer stopped reporting progress. Resume from the game's card on the Home screen.", BuildListener.STALLED);
         }
-        throw new IOException("Build cancelled. The job is saved: resume from the game's card on the Home screen.");
+        throw new BuildListener.Failure("Build cancelled. The job is saved: resume from the game's card on the Home screen.", BuildListener.CANCELLED);
     }
 
     private static int pct(int si, long done, long total) {

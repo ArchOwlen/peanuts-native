@@ -10,6 +10,7 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -38,10 +39,23 @@ import java.util.regex.Pattern;
  * Status: NO_PROFILE when the APK has no profile for the title (BuildConfig.NX_PROFILES); READY when the game is a dump or .nup and upstream's list has it ready
  * (Game.ready) or a pack.tsv lies in &lt;home&gt;/&lt;title ID&gt;-work/&lt;any&gt;/ (home: the dump folder or the .nup's folder, or that folder's parent); else BUILD.
  * Names: the probe's NACP name, else the catalog's catalog.json name, else the profile's, else the title ID.
+ * <p>
+ * P1 (version truth, UX-SPEC §2.1/§3.1): a BUILD title also gets a {@link Title#versionState}, read through upstream's {@code Profile} (reflection, same pattern
+ * as {@link Upstream}) rather than a new game.tsv parser. One gap: game.tsv's own "package" line (the version the shipped shader tables were built for) is not
+ * exposed by {@code Profile} today, so {@link Title#recommendedVersion} is an approximation — the highest version in the profile's build list — not the real
+ * package line. Verified true for all 131 profiles as of the phase-2 review. A round-2 runtime guard for this was removed (critique-phase2b §A-2: it never
+ * actually ran, and even fixed would have decompressed assets/pack/tools.zip once per title on the phone for a check that only needs to run once); the
+ * check now lives in {@code peanuts/scripts/check-profiles.sh}, a build-time script, zero runtime cost. See IMPL-A.md.
  */
 final class LibraryScanner {
     static final int BASE = 0, UPDATE = 1, DLC = 2;
     enum Status { READY, BUILD, NO_PROFILE }
+    /** The sub-states a BUILD title can be in (UX-SPEC §2.1, corrected by critique-phase1 §1 must-fix 1/8): NOT_IN_APP mirrors NO_PROFILE (kept distinct so a
+     *  caller that only has a Title, not the Status too, can still tell); FILE_GONE: the base or newest update file the scanner once found no longer resolves;
+     *  UNSUPPORTED: the chosen version is not one of the profile's builds at all (today's silent "otherBuild"); SUPPORTED_OTHER: it is a listed build, just not
+     *  the one the shipped shader tables were made for (expect a slower first build: a full shader scan); RECOMMENDED: the version Build is tuned for;
+     *  UNKNOWN: no profile, or the reflective read of its builds failed (never blocks Build; the sheet just has nothing extra to say) */
+    enum VersionState { NOT_IN_APP, FILE_GONE, UNSUPPORTED, SUPPORTED_OTHER, RECOMMENDED, UNKNOWN }
     private static final Pattern HEX16 = Pattern.compile("(?<![0-9A-Fa-f])([0-9A-Fa-f]{16})(?![0-9A-Fa-f])");
     private static final Set<String> EXT = new HashSet<>(Arrays.asList(".nsp", ".xci", ".nup"));
 
@@ -64,6 +78,12 @@ final class LibraryScanner {
         Source base;
         final List<Source> updates = new ArrayList<>(), dlcs = new ArrayList<>();
         Status status = Status.BUILD;
+        VersionState versionState = VersionState.UNKNOWN;
+        /** The profile's builds (game.tsv build rows, via Profile.buildMap/display): version → display ("1.0.1"), null when game.tsv names none. Empty: no
+         *  profile, or the reflective read failed */
+        Map<Long, String> supportedBuilds = Collections.emptyMap();
+        /** The highest version in supportedBuilds (see the class doc's gap note); -1 without supportedBuilds */
+        long recommendedVersion = -1;
         /** The folder that holds (or will hold) the game and its <title ID>-work: the dump folder, the .nup's folder, or <game folder>/<name> for an NSP/XCI */
         File home;
         /** What upstream starts: the dump folder or the .nup (null before the import) */
@@ -126,6 +146,9 @@ final class LibraryScanner {
                 t.status = t.launch != null && t.packDir != null ? Status.READY : Status.BUILD;
             }
             Collections.sort(t.updates, (a, b) -> Long.compare(b.version, a.version));
+            // P1: the version state (not computed for READY: the pack already fits, and for NO_PROFILE the sheet's Profile.missing sentence is the whole story)
+            if (t.status == Status.NO_PROFILE) t.versionState = VersionState.NOT_IN_APP;
+            else if (t.status == Status.BUILD) t.versionState = versionState(t);
         }
         List<Title> out = new ArrayList<>(titles.values());
         Collections.sort(out, (a, b) -> a.name.compareToIgnoreCase(b.name));
@@ -169,6 +192,58 @@ final class LibraryScanner {
 
     private static boolean samePath(String a, String b) {
         try { return new File(a).getCanonicalPath().equals(new File(b).getCanonicalPath()); } catch (IOException e) { return a.equals(b); }
+    }
+
+    // ---- P1: version truth ----
+
+    private static final String NXP = "dev.nxnative.android.";
+
+    /** A BUILD title's version state (class doc): FILE_GONE first (nothing else matters once the file is not where it was found), then whether the newest
+     *  version found on disk is in the profile's builds at all, and if so whether it is the one the shipped shader tables were made for. This is the
+     *  library-grid pill's state only — it is about the newest version this title has anywhere, not about any one file a sheet's "Choose another…" picked
+     *  (critique-phase2a §A must-fix 1: the sheet computes its own, from {@code chosenUpdate}, in {@code GameSheet.chosenVersionState}; this one must not be
+     *  read as "the version Build will actually use") */
+    private static VersionState versionState(Title t) {
+        if (fileGone(t.base) || fileGone(t.updates.isEmpty() ? null : t.updates.get(0))) return VersionState.FILE_GONE;
+        VersionInfo vi = versionInfo(t.titleId);
+        t.supportedBuilds = vi.builds;
+        t.recommendedVersion = vi.recommended;
+        if (vi.builds.isEmpty()) return VersionState.UNKNOWN;   // no profile builds data (the reflective read failed, or game.tsv names none): never blocks Build
+        long v = t.version();
+        if (!vi.builds.containsKey(v)) return VersionState.UNSUPPORTED;
+        return v == vi.recommended ? VersionState.RECOMMENDED : VersionState.SUPPORTED_OTHER;
+    }
+
+    private static boolean fileGone(Source s) { return s != null && !s.file.exists(); }
+
+    /** The profile's builds (game.tsv build rows) for a title, via upstream's Profile (reflection, Upstream.java's own pattern): version → display, and the
+     *  highest version (the class doc's gap note: an approximation of game.tsv's "package" line, which Profile does not expose — checked at build time
+     *  instead of at runtime, see the class doc) */
+    static final class VersionInfo {
+        final Map<Long, String> builds = new LinkedHashMap<>();
+        long recommended = -1;
+    }
+
+    private static VersionInfo versionInfo(String titleId) {
+        VersionInfo info = new VersionInfo();
+        try {
+            Class<?> profileClass = Class.forName(NXP + "Profile");
+            Method of = profileClass.getDeclaredMethod("of", String.class); of.setAccessible(true);
+            Object p = of.invoke(null, titleId);
+            if (p == null) return info;
+            Method buildMap = profileClass.getDeclaredMethod("buildMap"); buildMap.setAccessible(true);
+            Method display = profileClass.getDeclaredMethod("display", long.class); display.setAccessible(true);
+            Map<?, ?> bm = (Map<?, ?>) buildMap.invoke(p);
+            for (Object k : bm.keySet()) {
+                long v = (Long) k;
+                Object d = display.invoke(p, v);
+                info.builds.put(v, d == null ? null : d.toString());
+                if (v > info.recommended) info.recommended = v;
+            }
+        } catch (Throwable t) {
+            Log.w("peanuts", "profile builds " + titleId + ": " + t);
+        }
+        return info;
     }
 
     // ---- The walk ----

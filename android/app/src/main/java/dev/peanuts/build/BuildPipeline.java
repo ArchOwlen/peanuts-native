@@ -27,20 +27,26 @@ public final class BuildPipeline {
     private BuildPipeline() {}
 
     /** Starts the build; returns its id (for {@link #attach}/{@link #cancel}), or 0 when the request is not buildable (the listener is told why) */
-    public static int start(Context ctx, BuildRequest req, BuildListener l) {
+    public static int start(Context ctx, BuildRequest req, BuildListener l) { return start(ctx, req, false, l); }
+
+    /**
+     * Same, with buildAnyway: the player's explicit "Build anyway" on the sheet's Version row (P1, critique-phase1 must-fix 2) for a dump whose version is not
+     * one of the profile's builds. Without it, a job that turns out to need that relaxation stops and asks instead of trying it on its own (Prepare.run)
+     */
+    public static int start(Context ctx, BuildRequest req, boolean buildAnyway, BuildListener l) {
         String why = check(req);
-        if (why != null) { if (l != null) MAIN.post(() -> l.done(false, why)); return 0; }
+        if (why != null) { if (l != null) MAIN.post(() -> l.done(false, why, BuildListener.OTHER)); return 0; }
         int id = NEXT.getAndIncrement();
         if (l != null) LISTENERS.put(id, l);
         running = id;
         lastStep = "import"; lastPercent = 0; lastDetail = "Starting";
         try {
-            ctx.getApplicationContext().startForegroundService(BuildService.intent(ctx, id, req));
+            ctx.getApplicationContext().startForegroundService(BuildService.intent(ctx, id, req, buildAnyway));
         } catch (RuntimeException e) {   // not in the manifest, or Android refused a foreground service from the background
             Log.w(TAG, "BuildService start: " + e);
             LISTENERS.remove(id);
             running = 0;
-            if (l != null) MAIN.post(() -> l.done(false, "Cannot start the build: " + e.getMessage()));
+            if (l != null) MAIN.post(() -> l.done(false, "Cannot start the build: " + e.getMessage(), BuildListener.OTHER));
             return 0;
         }
         return id;
@@ -77,9 +83,9 @@ public final class BuildPipeline {
         if (l != null) MAIN.post(() -> l.progress(step, percent, detail));
     }
 
-    static void finish(int id, boolean ok, String message) {
+    static void finish(int id, boolean ok, String message, String code) {
         if (id == running) running = 0;
         BuildListener l = LISTENERS.remove(id);
-        if (l != null) MAIN.post(() -> l.done(ok, message));
+        if (l != null) MAIN.post(() -> l.done(ok, message, code));
     }
 }

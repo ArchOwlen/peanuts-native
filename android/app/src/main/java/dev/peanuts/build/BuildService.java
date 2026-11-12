@@ -35,7 +35,7 @@ import java.util.Locale;
 public final class BuildService extends Service {
     public static final String ACTION_BUILD = "dev.peanuts.build.BUILD", ACTION_CANCEL = "dev.peanuts.build.CANCEL";
     static final String EXTRA_ID = "id", EXTRA_TITLE = "title_id", EXTRA_NAME = "name", EXTRA_BASE = "base", EXTRA_UPDATE = "update", EXTRA_DLCS = "dlcs", EXTRA_GAME_DIR = "game_dir",
-            EXTRA_COMPANION = "companion";
+            EXTRA_COMPANION = "companion", EXTRA_BUILD_ANYWAY = "build_anyway";
     private static final String TAG = Prepare.TAG, CHANNEL = "peanuts_build";
     private static final int NOTE = 7001;
     /** Each step's share of the bar: import 0-45, prepare 45-90, companion 90-100 */
@@ -48,10 +48,14 @@ public final class BuildService extends Service {
     private volatile boolean cancelled;
     private int id;
     private String name = "";
+    private boolean buildAnyway;   // this run's explicit consent (EXTRA_BUILD_ANYWAY), never inferred
 
-    static Intent intent(Context c, int id, BuildRequest r) {
+    static Intent intent(Context c, int id, BuildRequest r) { return intent(c, id, r, false); }
+
+    /** buildAnyway: the sheet's explicit "Build anyway" consent for a dump version the profile does not list (P1; Prepare.run never applies this on its own) */
+    static Intent intent(Context c, int id, BuildRequest r, boolean buildAnyway) {
         Intent i = new Intent(c, BuildService.class).setAction(ACTION_BUILD).putExtra(EXTRA_ID, id).putExtra(EXTRA_TITLE, r.titleId).putExtra(EXTRA_NAME, r.name)
-                .putExtra(EXTRA_GAME_DIR, r.gameDir == null ? null : r.gameDir.getPath()).putExtra(EXTRA_COMPANION, r.companionPackage);
+                .putExtra(EXTRA_GAME_DIR, r.gameDir == null ? null : r.gameDir.getPath()).putExtra(EXTRA_COMPANION, r.companionPackage).putExtra(EXTRA_BUILD_ANYWAY, buildAnyway);
         if (r.base != null) i.putExtra(EXTRA_BASE, r.base.getPath());
         if (r.update != null) i.putExtra(EXTRA_UPDATE, r.update.getPath());
         List<String> d = new ArrayList<>();
@@ -98,17 +102,18 @@ public final class BuildService extends Service {
         BuildRequest r = request(intent);
         int reqId = intent.getIntExtra(EXTRA_ID, 0);
         if (worker != null && worker.isAlive()) {
-            BuildPipeline.finish(reqId, false, name + " is being built now. Wait for it to finish.");
+            BuildPipeline.finish(reqId, false, name + " is being built now. Wait for it to finish.", BuildListener.OTHER);
             return START_NOT_STICKY;
         }
         id = reqId;
         name = r.name == null || r.name.isEmpty() ? r.titleId : r.name;
+        buildAnyway = intent.getBooleanExtra(EXTRA_BUILD_ANYWAY, false);
         cancelled = false;
         try {
             startForeground(NOTE, note(0, "Starting"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         } catch (RuntimeException e) {   // ForegroundServiceStartNotAllowedException, or the manifest lacks the service type
             Log.w(TAG, "startForeground refused: " + e);
-            BuildPipeline.finish(id, false, "Android did not let the build start in the background: open the app and tap Build again.");
+            BuildPipeline.finish(id, false, "Android did not let the build start in the background: open the app and tap Build again.", BuildListener.OTHER);
             stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -120,9 +125,10 @@ public final class BuildService extends Service {
     private void run(BuildRequest r) {
         boolean ok = false;
         String message;
+        String code = BuildListener.OTHER;
         try {
             File dump = stepImport(r);
-            if (cancelled) throw new IOException("Build cancelled.");
+            if (cancelled) throw new BuildListener.Failure("Build cancelled.", BuildListener.CANCELLED);
             File pack = null;
             IOException prepareFailed = null;
             try {
@@ -131,13 +137,13 @@ public final class BuildService extends Service {
             } catch (IOException e) {
                 prepareFailed = e;   // the companion is still installed (it goes beside the dump's work folder, which Prepare made): the next Build has only the pack left to do
             }
-            if (cancelled) throw new IOException("Build cancelled.");
+            if (cancelled) throw new BuildListener.Failure("Build cancelled.", BuildListener.CANCELLED);
             GameEnv.ensureFonts(this, r.titleId);
             GameEnv.ensureBuildId(this, r.titleId, dump);
             try {
                 stepCompanion(r, pack);
             } catch (IOException e) {
-                if (prepareFailed != null) throw new IOException(prepareFailed.getMessage() + "\n\nCompanion: " + e.getMessage());
+                if (prepareFailed != null) throw new BuildListener.Failure(prepareFailed.getMessage() + "\n\nCompanion: " + e.getMessage(), category(prepareFailed));
                 throw e;
             }
             if (prepareFailed != null) throw prepareFailed;
@@ -146,6 +152,7 @@ public final class BuildService extends Service {
             progress("done", 100, message);
         } catch (IOException e) {
             message = e.getMessage() == null ? e.toString() : e.getMessage();
+            code = category(e);
             Log.w(TAG, "build " + name + ": " + message);
         } catch (RuntimeException e) {
             message = "Build failed: " + e;
@@ -153,22 +160,40 @@ public final class BuildService extends Service {
         }
         final boolean fok = ok;
         final String fmsg = message;
+        final String fcode = code;
         main.post(() -> {
             nm.notify(NOTE + 1, done(fok, fmsg));
-            BuildPipeline.finish(id, fok, fmsg);
+            BuildPipeline.finish(id, fok, fmsg, fcode);
             worker = null;
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         });
     }
 
+    /** The failure category for the build card's one recovery action (P4): a {@link BuildListener.Failure}'s own code, else a plain-message guess at the ones
+     *  this service's own throw sites use (Prepare.java tags its own sites directly) */
+    private static String category(IOException e) {
+        if (e instanceof BuildListener.Failure) return ((BuildListener.Failure) e).code;
+        String m = e.getMessage();
+        if (m == null) return BuildListener.OTHER;
+        if (m.contains("base file is missing") || m.contains("No space left") || m.contains("ENOSPC")) return m.contains("missing") ? BuildListener.FILE_MISSING : BuildListener.OUT_OF_SPACE;
+        return BuildListener.OTHER;
+    }
+
     /** (a) the .nup from an NSP/XCI, or the base as it is */
     private File stepImport(BuildRequest r) throws IOException {
-        if (r.base == null || !r.base.exists()) throw new IOException("The game's base file is missing" + (r.base == null ? "." : ": " + r.base));
+        if (r.base == null || !r.base.exists()) throw new BuildListener.Failure("The game's base file is missing" + (r.base == null ? "." : ": " + r.base), BuildListener.FILE_MISSING);
+        if (r.update != null && !r.update.exists()) throw new BuildListener.Failure("The update file is missing: " + r.update, BuildListener.FILE_MISSING);
         if (!r.needsImport()) { progress("import", IMPORT_END, "Game file: " + r.base.getName()); return r.base; }
         if (r.gameDir == null) throw new IOException("No game folder to write the .nup into (Setup).");
-        File dir = new File(r.gameDir, r.fileName()), out = new File(dir, r.fileName() + ".nup");
+        // SpaceEstimate's pre-flight (P4/AUDIT §3.2): warn-only (critique-phase1 must-fix 7 — the multiplier is uncalibrated, so it never blocks Build; a real
+        // ENOSPC further down still fails with OUT_OF_SPACE through category()). getExternalFilesDir(null), not getFilesDir(): AppStorage puts the pack there
+        // (critique-phase2a §A-3b). Importing: the pack's basis is the merged .nup's own size (importBytes again), same as the game-folder check
         List<File> inputs = r.inputs();
+        long importNeed = SpaceEstimate.inputBytes(inputs);
+        String spaceWarn = SpaceEstimate.warning(importNeed, importNeed, true, r.gameDir, getExternalFilesDir(null));
+        if (spaceWarn != null) Log.w(TAG, "space: " + name + ": " + spaceWarn);
+        File dir = new File(r.gameDir, r.fileName()), out = new File(dir, r.fileName() + ".nup");
         long newest = 0;
         for (File f : inputs) newest = Math.max(newest, f.lastModified());
         if (out.isFile() && out.length() > 0 && out.lastModified() >= newest) { progress("import", IMPORT_END, "Imported already: " + out.getName()); return out; }
@@ -189,7 +214,7 @@ public final class BuildService extends Service {
                 int pct = total > 0 ? (int) Math.min(IMPORT_END - 1, done * (IMPORT_END - 1) / Math.max(1, total)) : 0;
                 progress("import", pct, step + (total > 0 ? String.format(Locale.getDefault(), ": %d %%", Math.min(100, done * 100 / total)) : ""));
             });
-            if (cancelled) { tmp.delete(); throw new IOException("Build cancelled."); }
+            if (cancelled) { tmp.delete(); throw new BuildListener.Failure("Build cancelled.", BuildListener.CANCELLED); }
             if (rc != 0) { tmp.delete(); throw new IOException("Import failed: " + Importer.lastError()); }
             if (!tmp.renameTo(out)) { tmp.delete(); throw new IOException("Cannot place " + out); }
         } catch (ReflectiveOperationException e) {
@@ -204,7 +229,7 @@ public final class BuildService extends Service {
         Prepare p = new Prepare(this);
         prepare = p;
         try {
-            return p.run(dump, r.titleId, (pct, detail) -> progress("prepare", IMPORT_END + pct * (PREPARE_END - IMPORT_END) / 100, detail));
+            return p.run(dump, r.titleId, buildAnyway, (pct, detail) -> progress("prepare", IMPORT_END + pct * (PREPARE_END - IMPORT_END) / 100, detail));
         } finally {
             prepare = null;
         }
