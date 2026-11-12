@@ -123,7 +123,7 @@ static const steps_row_t *k_steps_get(void) { pthread_once(&k_steps_once, k_step
 #define DM_FPS_STEPS_ROWS DM_GAME_FPS_STEPS
 #define DM_FPS_NSTEPS_ROWS DM_GAME_NFPS_STEPS
 #endif
-static const steps_row_t k_steps[] = DM_FPS_STEPS_ROWS;
+static const steps_row_t k_steps[] = DM_FPS_STEPS_ROWS;   // PEANUTS: the per-title build (the generic host reads the profile, above)
 #define NSTEPS DM_FPS_NSTEPS_ROWS
 #endif
 #define STEPS_MAX 3    // 20 fps: the most steps a frame offered (each 1/60 s)

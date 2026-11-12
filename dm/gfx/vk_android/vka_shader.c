@@ -340,7 +340,7 @@ static int one_lane_forced(uint64_t key) {
     pthread_once(&once, one_lane_env);
     for (int i = 0; i < g_one_nenv; i++) if (g_one_env[i] == key) return 1;
     if (g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY))
-        for (int i = 0; i < (int)DM_GAME_NSUBGROUP_ONE_LANE; i++) if (prof[i] == key) return 1;
+        for (int i = 0; i < (int)DM_GAME_NSUBGROUP_ONE_LANE; i++) if (prof[i] == key) return 1;   // PEANUTS: a runtime count with the generic host
     return 0;
 }
 static void single_lane(uint64_t key, int stage, uint32_t **w, size_t *nb) {

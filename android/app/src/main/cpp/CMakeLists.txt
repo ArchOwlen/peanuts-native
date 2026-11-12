@@ -3,7 +3,7 @@
 # All are linked for 16 KB pages (Android 15+ devices may use them; NDK 28 does this by default, the flag keeps it explicit)
 cmake_minimum_required(VERSION 3.22)
 project(nxlaunch C)
-if(NOT NX_GAMES AND NOT NX_GENERIC_HOST)
+if(NOT NX_GAMES AND NOT NX_GENERIC_HOST)   # PEANUTS: or the generic host (-PnxGenericHost=true)
   message(FATAL_ERROR "NX_GAMES is not set: -DNX_GAMES=<title ID>,… (build.gradle passes nxGames), or -DNX_GENERIC_HOST=ON (-PnxGenericHost=true)")
 endif()
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")

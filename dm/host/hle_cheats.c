@@ -1724,7 +1724,7 @@ static void profile_version(void) {
     const char *bid = dm_main_build();
     for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (!strcasecmp(bid, k[j].build)) snprintf(g_version, sizeof g_version, "%s", k[j].ver);
 #endif
-#endif
+#endif   // PEANUTS: closes the DM_RUNTIME_PROFILE branch
 }
 
 // The anchored sources (*.cheats.toml) in the folder, for the panel's "compile them for this build" hint
