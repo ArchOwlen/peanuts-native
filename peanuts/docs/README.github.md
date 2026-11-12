@@ -41,7 +41,7 @@ which update you have and which one a game supports, and asks before building an
 | Fire Emblem Engage | `0100A6301214E000` | 2.0.0 | Yes | 60 fps |
 | Metroid Dread | `010093801237C000` | 2.1.0 | Yes | 60 fps |
 | Super Mario Odyssey | `0100000000010000` | 1.4.1 | Yes | 60 fps |
-| Mario Kart 8 Deluxe | `0100152000022000` | 4.0.0, 4.0.1 | Yes (for 4.0.0) | 60 fps |
+| Mario Kart 8 Deluxe | `0100152000022000` | 4.0.0, 4.0.1 | Yes | 60 fps |
 | Animal Crossing: New Horizons | `01006F8002326000` | 3.0.3 | Yes | 30 fps, as on Switch |
 | Persona 5 Royal | `01005CA01580E000` | 1.0.2 | Yes | 30 fps, as on Switch |
 | Castlevania: Belmont's Curse | `0100BA4026E94000` | 1.1.0 | Yes | 60 fps |
