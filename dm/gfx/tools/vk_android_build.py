@@ -23,6 +23,9 @@
 #   for the library form, J for the program), DMSH_VK_REQUIRE_ALL=1 writes no library unless every shader built (exit 1; a key list's build too) but
 #   those the profile's manifest of this version (vk_delta.tsv, a full Mac build) has as "-": every shader the Mac's build holds. A shader the package does not hold stops
 #   the build (another game version's split) unless DMSH_VK_REQUIRE_ALL=0 (the phone's Try anyway): then it is left out and counted in one [RED] line (open_packs)
+#   DMSH_VK_WORKER=<command> and DMSH_VK_WORKERS=<N> (N > 1): the batches are translated by N worker processes of that command (split_pool.py PipePool: a program that runs
+#   Python as `python3 -c` does; the phone's nxpack_worker through /system/bin/linker64, as shader_split.py's DM_SPLIT_WORKER), not by threads of this process, whose
+#   Python half holds one GIL; the library is the same (worker_batch below)
 # Resumable: each shader's result (its modules, compressed, and its reflection) is one file <results>/<key>.r, written to a temporary name and renamed, stamped with
 #   the tools digest, the profile inputs digest, the validator's version and the key; a rerun skips every key with a valid result (a killed build resumes; a later build of the same version is a cache hit)
 #   and the library is written from the result files. Pixel shaders go first; the vertex shaders' padding reads their inputs from the pixel shaders' results.
@@ -36,7 +39,7 @@
 import ast, collections, concurrent.futures as cf, ctypes, hashlib, json, mmap, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import dmsh_chain, dmsh_abi as abi, dmsh_ampere, tool_lock, vk_android_spv as spv, vk_android_delta as delta
+import dmsh_chain, dmsh_abi as abi, dmsh_ampere, split_pool, tool_lock, vk_android_spv as spv, vk_android_delta as delta
 
 try: from compression import zstd   # Python 3.14; before it, pip install backports.zstd (shader_split.py needs it too)
 except ImportError:
@@ -350,7 +353,8 @@ if not SPIRV_VAL: sys.exit('[RED] no spirv-val (SPIRV-Tools: brew install spirv-
 VALIDATE = spirv_validator(SPIRV_VAL); VAL_ID = VALIDATE.version   # in each result's stamp: another validator builds the results again
 XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
 XLATE_LIB = XlateLib(XLATE) if is_lib(XLATE) else None
-WORKER = globals().get("VK_BUILD_WORKER")   # set when this run is one of the build's worker interpreters (DMSH_VK_PROCS, Pool below)
+WORKER = globals().get("VK_BUILD_WORKER")   # set when this run is one of the build's worker interpreters (DMSH_VK_PROCS, Pool below) or processes (DMSH_VK_WORKER, 'proc')
+if WORKER and WORKER.get('proc'): sys.stdout = open(os.devnull, 'w')   # the parent prints the build's lines once (a worker process's stderr is the parent's)
 _bad = [] if WORKER else check_translator(XLATE_LIB)   # (the parent checked the same translator)
 if _bad: sys.exit('\n'.join('[RED] translator does not match the lock file: ' + b for b in _bad))
 GAME = dmsh_chain.load_game(); INPUTS = dmsh_chain.inputs(GAME)
@@ -932,8 +936,9 @@ def fin(key, bd, job, c1, xerr):
 def stopped(): return False   # (a worker's says whether the parent wants it to stop: serve)
 
 
-def run_batch(batch, count=True):
-    """Translate a batch of shaders in one translator call, finish each (fin) and write its result file (count: they are in the progress's total)"""
+def batch_results(batch):
+    """Translate a batch of shaders in one translator call and finish each (fin): yields each shader's (key, status, error, result, pixel shader inputs or None),
+    as write_result takes them: this process writes them (run_batch), a worker process (DMSH_VK_WORKER) sends them to the parent, which writes them"""
     bd = tempfile.mkdtemp(prefix='b_', dir=w); jobs, c1s = {}, {}
     for key in batch:
         name, k = loc[key]
@@ -952,8 +957,34 @@ def run_batch(batch, count=True):
         if stopped(): break   # a worker told to stop (Pool.close): the shaders left have no result, a rerun translates them
         res = fin(key, bd, jobs[key], c1s[key], xerr)
         if res[1] == 'translation failed' and key not in xerr: continue   # neither a module nor the translator's reason: not a result (a rerun translates it again)
-        write_result(key, *res[1:], PS_INPUTS.get(key) if STAGE_OF[key] != 'vs' else None)
+        yield res + (PS_INPUTS.get(key) if STAGE_OF[key] != 'vs' else None,)
     shutil.rmtree(bd, ignore_errors=True)
+
+
+_RECS = {}   # a worker process's package records of the batch in hand (worker_batch)
+
+
+def worker_batch(batch, recs, ps_in):
+    """A worker process's job (DMSH_VK_WORKER): batch_results of a batch, given each shader's place and package record ({key: (file, record, bytes)}: the parent reads
+    the package) and, for vertex shaders, the inputs of their pixel shaders ({pixel shader: set}). → the results as a list (bytes, dicts, sets: they pickle)"""
+    for key, (name, k, data) in recs.items(): loc[key] = (name, k); _RECS[(name, k)] = data
+    if ps_in: PS_INPUTS.update(ps_in)
+    try: return list(batch_results(batch))
+    finally:
+        for name, k, _ in recs.values(): _RECS.pop((name, k), None)
+
+
+def run_batch(batch, count=True, procs=None):
+    """Translate a batch of shaders in one translator call, finish each (fin) and write its result file (count: they are in the progress's total). procs: the worker
+    processes (DMSH_VK_WORKER): one of them translates and finishes the batch (worker_batch), this thread writes the results as for its own"""
+    if procs is None: rs = batch_results(batch)
+    else:
+        recs = {k: (*loc[k], _rec(*loc[k])) for k in batch}
+        ps_in = {p: PS_INPUTS[p] for k in batch for p in PAIRS.get(k, ()) if p in PS_INPUTS} if STAGE_OF[batch[0]] == 'vs' else None
+        rs = procs.submit(worker_batch, batch, recs, ps_in).result()
+    for key, st, err, r, ps_in in rs:
+        if procs is not None and ps_in is not None: PS_INPUTS[key] = ps_in   # (a thread's finish set it in this process)
+        write_result(key, st, err, r, ps_in)
     if count: progress('translate', len(batch))
 
 
@@ -970,7 +1001,7 @@ class Stop(Exception):
 def worker_message(kind, n, text=''): return json.dumps([kind, n, text])
 
 
-if WORKER:
+if WORKER and not WORKER.get('proc'):
     from concurrent.interpreters import QueueEmpty
     _STOP = [False]
 
@@ -1024,6 +1055,16 @@ if WORKER:
         for fd in fds.values(): os.close(fd)
 
     serve()
+    raise SystemExit(0)
+
+
+# ---- worker processes (DMSH_VK_WORKER, DMSH_VK_WORKERS): split_pool.py's PipePool runs this script in each with the parent's arguments and environment, so it has made
+# the same setup as the parent up to here (its own translator and validator loaded through ctypes, no translator check: the parent made it); it then answers worker_batch
+# calls, one at a time (so one translator call at a time each), until the parent closes its pipe. The parent sends the package records and writes every result file
+if WORKER and WORKER.get('proc'):
+    w = WORKER['w']
+    def _rec(name, k): return _RECS[(name, k)]
+    PIPE_POOL_SERVE()
     raise SystemExit(0)
 
 
@@ -1244,10 +1285,21 @@ class Pool:
 
 
 POOL = []   # the worker pool, made at the first translation with batches for it (translate_keys), closed with the package (the build's finally)
+VK_WORKER, VK_WORKERS = os.environ.get('DMSH_VK_WORKER', '').strip(), max(1, int(os.environ.get('DMSH_VK_WORKERS') or '1'))
+_PROC_TRIED = []
 
 
 def pool_for(nbatches):
-    """The worker pool (made once), or None for this process's threads: DMSH_VK_PROCS 1, a single batch and no pool yet, or workers that could not start"""
+    """The worker pool (made once), or None for this process's threads: the worker processes (DMSH_VK_WORKER, DMSH_VK_WORKERS > 1), else the worker interpreters;
+    None for DMSH_VK_PROCS 1, a single batch and no pool yet, or workers that could not start"""
+    if not POOL and not _PROC_TRIED and VK_WORKER and VK_WORKERS > 1 and nbatches >= 2:
+        _PROC_TRIED.append(1)
+        import shlex
+        try:
+            POOL.append(split_pool.PipePool(shlex.split(VK_WORKER), min(VK_WORKERS, nbatches), os.path.abspath(__file__), argv=sys.argv, init_globals={'VK_BUILD_WORKER': {'proc': True, 'w': w}}))
+            print(f'shader workers: {len(POOL[0].workers)} processes ({VK_WORKER}), one translator call each at a time', flush=True)
+        except Exception as e:
+            print(f'[RED] shader worker processes (DMSH_VK_WORKER={VK_WORKER}, DMSH_VK_WORKERS={VK_WORKERS}) did not start ({type(e).__name__}: {e})', flush=True)
     if not POOL and (PROCS < 2 or nbatches < 2): return None
     if not POOL:
         try:
@@ -1258,8 +1310,9 @@ def pool_for(nbatches):
     return POOL[0]
 
 
-def close_pool():
-    if POOL and POOL[0]: POOL[0].close()
+def close_pool(cancel=False):
+    if POOL and isinstance(POOL[0], split_pool.PipePool): POOL[0].shutdown(cancel=cancel)
+    elif POOL and POOL[0]: POOL[0].close()
     POOL.clear()
 
 
@@ -1285,6 +1338,10 @@ def translate_keys(ks, count=True):
         batches = [_phase[i:i + BATCH] for i in range(0, len(_phase), BATCH)]
         if not batches: continue
         pool = pool_for(-(-len(ks) // BATCH))
+        if isinstance(pool, split_pool.PipePool):   # a thread here per worker process: it sends a batch, waits for its results and writes them
+            with cf.ThreadPoolExecutor(len(pool.workers)) as ex:
+                for _ in ex.map(lambda b: run_batch(b, count, pool), batches): pass
+            continue
         if pool: pool.run(batches, count); continue
         with cf.ThreadPoolExecutor(NJ) as ex:
             for _ in ex.map(lambda b: run_batch(b, count), batches): pass
@@ -1312,6 +1369,8 @@ try:   # the package descriptors are closed however the translation ends (the ph
         translate_keys(open_packs(_cut), False)
         results, _cut = read_all()
         if _cut: sys.exit(f'[RED] {len(_cut)} result files are still cut short after translating them again (from {result_path(_cut[0])}): the storage does not keep whole files')
+except BaseException:   # a stop or an error: the worker processes end at once
+    close_pool(cancel=True); raise
 finally:
     close_pool(); close_packs()
 shutil.rmtree(w, ignore_errors=True)

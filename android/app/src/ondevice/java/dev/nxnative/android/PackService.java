@@ -595,6 +595,10 @@ public final class PackService extends Service {
         // worker interpreters (sub-interpreters of this process, each with its own GIL: the Python half no longer runs on one core), one a big or mid core, at most 4
         // (CpuCores; android/SHADERS.md#build); the library is the same for any count. J above is then the threads of all the workers together
         PackEngine.setenv("DMSH_VK_PROCS", String.valueOf(CpuCores.shaderWorkers()));
+        // PEANUTS: worker processes instead (the split's nxpack_worker through the linker, LD_LIBRARY_PATH above; each loads libdmsh_xlate.so and SPIRV-Tools itself):
+        // the Python half around the translator ran under one GIL, ~0.4 core (vk_android_build.py DMSH_VK_WORKER, split_pool.py). DMSH_VK_WORKERS=1 in env.txt turns them off
+        PackEngine.setenv("DMSH_VK_WORKER", pyLib == null ? "" : "/system/bin/linker64 " + new File(PackNative.repo().getParentFile(), "python/bin/nxpack_worker").getPath());   // PEANUTS
+        PackEngine.setenv("DMSH_VK_WORKERS", String.valueOf(pyLib == null ? 1 : CpuCores.shaderWorkers()));   // PEANUTS
         // Tests: ondevice/env.txt, KEY=VALUE lines, overrides any of the above for the tools (e.g. DMSH_VK_XLATE_J=6 to compare the translator's threads)
         File envFile = new File(od, "env.txt");
         if (envFile.isFile()) for (String l : Files.readAllLines(envFile.toPath(), StandardCharsets.UTF_8)) {
