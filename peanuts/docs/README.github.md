@@ -209,16 +209,14 @@ is the game's own logic reacting to present latency, not something the companion
 **Will this work on my single-screen phone?** The underlying Banana Native pack will, if your phone meets Banana
 Native's own requirements. The second-screen companion needs a genuine second display.
 
-## AI Assistance
+## Contributing
 
-Much of this project's code was written with an AI coding assistant and tested by hand — this isn't hidden or
-treated as a special case; see `peanuts/docs/CONTRIBUTING.md` for the verification checklist that keeps that
-practice honest (reproduce on a real device, cite the evidence, say what wasn't checked). Banana Native's own README
-says its code was written with an AI assistant too.
+See `peanuts/docs/CONTRIBUTING.md`: how to add a supported game, fix a bug, verify on a device, and the publishing
+rules every change follows (no game data, keys or shader libraries; no private data; no tool attribution in the
+history). Run `sh peanuts/scripts/install-hooks.sh` once per clone.
 
 The dual-screen companion runtime this project ports is maintained separately, as its own project with its own
-contribution policy — this project respects that boundary and doesn't send contributions toward it; see that
-project's own documentation for what its policy actually is, rather than restating it secondhand here.
+contribution policy; nothing from this repository is sent to it.
 
 ## Reporting problems
 
@@ -248,7 +246,7 @@ from [nx2android](https://github.com/shirai91/nx2android) (MIT).
 The dual-screen companion runtime and package format are **Eden Duo**'s (igawa6/eden-duo and
 igawa6/eden-duo-companions): Peanuts Native ports Eden Duo's runtime to run as a native library inside Banana Native's
 host process, rather than inside an emulator. Eden Duo is maintained separately, with its own project and its own
-contribution policy (see "AI Assistance" above); Peanuts Native respects that boundary for the runtime it ports.
+contribution policy (see "Contributing" above).
 
 Only use games you own. Don't ask for games, keys, or dumps — here or anywhere else.
 

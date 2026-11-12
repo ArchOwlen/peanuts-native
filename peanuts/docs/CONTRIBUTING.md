@@ -206,11 +206,27 @@ If you hit this symptom on a new title, look for it before assuming the pack is 
   from source.
 - **Say what you did not check.** If you only tested on the system driver, or only reached the title screen, say so.
 
+### Publishing rules (strict, checked before every push)
+
+`peanuts/scripts/check-publish.sh` must pass before anything is pushed to GitHub or any other shared remote;
+`peanuts/scripts/install-hooks.sh` installs a `commit-msg` and a `pre-push` hook that enforce it.
+
+- **No AI attribution, ever.** The person who submits a change is its author and committer. No AI tool or vendor
+  appears as an author, a committer, a `Co-Authored-By` / `Signed-off-by` / `Assisted-by` trailer, or a "Generated
+  with …" line (Claude, Anthropic, Codex, OpenAI, ChatGPT, Copilot, Gemini, Cursor, Devin, …). A commit that has one
+  is rewritten before it is pushed.
+- **No private data in a committed file.** No LAN addresses, no adb-over-network addresses, no home or mount paths
+  (your home folder, your mount points, Windows user folders), no assistant work folders, no personal e-mail addresses, no hostnames
+  of your own machines. Use placeholders: `<work dir>`, `<your dump folder>`, `<device ip>`.
+- **The public history starts at the import.** Banana Native's history before the fork point stays upstream; the
+  public repository begins with one commit that imports Banana Native at that point (crediting it, its license and
+  its authors in the message and in the README), followed by Peanuts' own commits.
+
 ## Using AI agents
 
-Much of Banana Native's own code was written with an AI coding assistant and tested by hand — this project follows
-that same practice, and does not ban or hide it. The checklist below is what keeps that practice honest. See
-`peanuts/docs/AGENTS.md` for the compact, machine-facing version of this same checklist.
+You may use coding tools, AI ones included, to prepare a change — but you are its author, you answer for it, and
+nothing in the repository or its history attributes it to a tool (see "Publishing rules" above). The checklist below
+applies to every change however it was produced. See `peanuts/docs/AGENTS.md` for the compact, machine-facing version.
 
 - **Verify on a real device before reporting something done.** A build succeeding, or code compiling, is not
   evidence a title boots, a companion loads, or a fix works. Every claim in a status note or commit message should
@@ -225,10 +241,9 @@ that same practice, and does not ban or hide it. The checklist below is what kee
 - **Cite the evidence.** A log excerpt, a crash address with its symbolication, a frame-rate measurement, a
   screenshot filename — something a reviewer (human or otherwise) can check independently, not just a claim that it
   works.
-- **Respect the upstream boundary.** Eden Duo's upstream (Eden) does not accept AI-assisted contributions, which is
-  why the Eden Duo companion runtime this project ports is developed privately. Nothing from this project should be
-  sent to Eden's upstream, and a contribution here should not assume it will ever go there. Banana Native's own
-  upstream has no such restriction and does accept AI-assisted PRs.
+- **Respect each upstream's own policy.** The Eden Duo companion runtime is maintained separately, as its own
+  project with its own contribution policy; nothing from this repository is sent to it or to Eden. Changes meant for
+  Banana Native go through its own repository and rules.
 
 ## How changes get in
 

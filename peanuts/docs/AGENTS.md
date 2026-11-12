@@ -103,9 +103,13 @@ this project has touched, and which edits are marked / queued for a Banana Nativ
   rebase past Banana Native's next release.
 - Commit message states the symptom, the cause, the fix, and what was checked on-device — cite the evidence (log
   line, crash address + symbol, frame-rate number, screenshot filename), don't just assert it works.
-- Commit and push only when explicitly asked. **This repository does have an `origin` remote** (a local bare repo,
-  not GitHub) — don't claim there's no remote; confirm with the owner before assuming a *public* remote exists or
-  should be created.
+- Commit and push only when explicitly asked. `origin` is a local bare repo; the GitHub repository is private and
+  only the owner pushes to it.
+- **No AI attribution:** never add a `Co-Authored-By`, `Signed-off-by`, `Assisted-by` or "Generated with" line naming
+  an AI tool or vendor, and never commit as an AI identity. The commit author is the owner's identity only.
+- **No private data:** no LAN or adb addresses, home or mount paths, work-folder paths, or personal e-mails in any
+  committed file or message; use placeholders (`<work dir>`, `<device ip>`).
+- `sh peanuts/scripts/check-publish.sh` must print "clean" before any push.
 
 ## Where findings go
 
