@@ -9,23 +9,25 @@ drift check; re-copy when upstream changes `Ui.java`).
 
 | File | Hook |
 |---|---|
-| `MainActivity.build()` | `Ui.page(this, frame, 900)` — 640 → 900 dp: three compact cards per row on a handheld |
+| `MainActivity.build()` | `Ui.page(this, frame, 900)` — 640 → 900 dp: four covers per row on a handheld |
 | `MainActivity.buildSettings()` | `dev.peanuts.ui.LibrarySettings.add(this, content);` before the Updates section |
-| `MainActivity.refresh()` | `dev.peanuts.ui.Library.fill(this, gameBox, games, Ondevice.cardView(), Ondevice::shows, this::gameCard, this::manage, this::addGame, this::refresh);` in place of the "Your games" block |
+| `MainActivity.refresh()` | `dev.peanuts.ui.Library.fill(this, gameBox, games, Ondevice.cardView(), Ondevice::shows, this::gameCard, this::manage, this::refresh);` in place of the "Your games" block |
 | `MainActivity.manage()` | the `🔨 Build again` row → `dev.peanuts.ui.GameSheet.open(this, g.titleId)` |
 | `MainActivity.onActivityResult()` | `if (dev.peanuts.ui.LibrarySettings.result(this, request, result, data)) return;` first (requests 60–66) |
 | `AndroidManifest.xml` | `CatalogActivity` under `@style/Theme.Banana`; no Peanuts launcher entry (MainActivity keeps LAUNCHER) |
 | `src/ondevice/AndroidManifest.xml` | the `BuildService` line (import → Prepare → companion) |
 
-`gameCard`, `manage`, `addGame`, `refresh` stay private in MainActivity: the hook passes them as method references.
+`gameCard`, `manage`, `refresh` stay private in MainActivity: the hook passes them as method references (`addGame` stays in MainActivity, unused by Home since SPEC3).
 
 ## Pieces
 
-- `Library` — Home's game box: the filter row (All · Ready · Build needed · Not in this app version, Find, Add game), READY (upstream's full cards two per row, the
-  progress card and the build card first and full width), BUILD NEEDED (compact cards three per row), NOT IN THIS APP VERSION (folded behind Show N); the first-run
-  card when no game folder is set; the scan (`LibraryScanner`) and the catalog (`CompanionPort`) off the main thread; a scanned game that is ready goes into
-  upstream's list (`Upstream.addToList`) so its card is Banana's own. The build's progress (`BuildPipeline` → `BuildListener`) lands on the build card; during Prepare
-  upstream's Ondevice card is the card.
+- `Library` — Home's game box (SPEC3): the filter row (All · Building · Ready · Build needed · Not in this app version, Find; Building only while a build or
+  upstream's Prepare runs, its count in banana), then one cover grid (PUi.tile at cell size with the NACP icon, four columns on a handheld, the state on the cover,
+  the name under it; Building → Ready by last played → Build needed A–Z → Not in this app version A–Z, no sections). Tap = Play (`Upstream.launch`, Banana's
+  `MainActivity.launch` by reflection) for a ready listed game, the sheet otherwise; long press / Y = Banana's Manage (listed) or the sheet (scanned); L/R shoulders
+  = previous/next filter. The Building filter holds the full cards (the build card, upstream's Ondevice card) two per row; in All the building game is a cover with
+  a progress strip and a `Building · N %` chip that opens that filter. The first-run card when no game folder is set; the scan (`LibraryScanner`) and the catalog
+  (`CompanionPort`) off the main thread; a scanned game that is ready goes into upstream's list (`Upstream.addToList`) so Play and Manage are Banana's own.
 - `GameSheet` — the game's dialog: Base / Update / DLC / Companion rows, Build or Rebuild, Add keys… when prod.keys are missing. Its Choose/Add pickers come back
   through `LibrarySettings.result` (requests 65, 66).
 - `LibrarySettings` — Settings › Library: folders, keys, firmware fonts, Rescan, Companions; the pickers (also the first-run card's and the sheet's).

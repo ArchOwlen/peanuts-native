@@ -139,7 +139,7 @@ public final class MainActivity extends Activity {
         FrameLayout frame = (FrameLayout) bananas.getParent();
         while (frame.getChildCount() > 1) frame.removeViewAt(1);
         boolean wide = getResources().getConfiguration().screenWidthDp >= 600;
-        LinearLayout content = Ui.page(this, frame, settingsGame != null && wide ? 1040 : 900);   // PEANUTS: the home's cards three per row on a handheld (upstream: 640);
+        LinearLayout content = Ui.page(this, frame, settingsGame != null && wide ? 1040 : 900);   // PEANUTS: four covers per row on a handheld (upstream: 640)
         if (settingsGame != null) for (Game x : Game.load(this)) if (x.gameDir.equals(settingsGame.gameDir)) { settingsGame = x; break; }   // its folders as they are now (Folders, Import pack)
         if (settingsGame != null) { accessCard = null; gameBox = null; overlayRow = null; GameSettings.build(this, content, settingsGame, this::gameSettingsAgain, () -> page(false)); }
         else if (settingsPage) buildSettings(content);
@@ -442,7 +442,7 @@ public final class MainActivity extends Activity {
             new Thread(() -> { if (Game.collapse(this)) runOnUiThread(() -> { if (!isFinishing()) refresh(); }); }, "nx-list-merge").start();
         }
         gameBox.removeAllViews();
-        dev.peanuts.ui.Library.fill(this, gameBox, games, Ondevice.cardView(), Ondevice::shows, this::gameCard, this::manage, this::addGame, this::refresh);   // PEANUTS: the library is Home's game list (the sections, the compact cards, the build card; the progress card placed first)
+        dev.peanuts.ui.Library.fill(this, gameBox, games, Ondevice.cardView(), Ondevice::shows, this::gameCard, this::manage, this::refresh);   // PEANUTS: the library is Home's game list (the cover grid, the Building filter with the build card and the progress card)
     }
 
     /** No game yet: the banana, the three steps, and Add game */

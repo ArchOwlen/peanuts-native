@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Peanuts rebrand overlay: the happy peanut's silhouette for themed (monochrome) icons: ic_banana_mono.xml
-     with ic_banana_happy.xml's face (eyes, smile) cut out. Only the alpha counts. Same resource name
-     (ic_banana_happy_mono) so this overrides src/main's monochrome happy banana. -->
+<!-- Peanuts rebrand overlay: the themed (monochrome) icon's silhouette of ic_banana_happy.xml — the shell with the two screens cut out (even-odd), so the
+     "two in one shell" mark still reads in one colour. Only the alpha counts. Same resource name (ic_banana_happy_mono) so this overrides src/main's. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
     <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd"
-        android:pathData="M54,20 C65,20 71,29 69,39 C68,46 62,50 58,54 C62,58 69,62 70,71 C72,82 65,90 54,90 C43,90 36,82 38,71 C39,62 46,58 50,54 C46,50 40,46 39,39 C37,29 43,20 54,20 Z M47,65 a1.8,2 0 1,0 3.6,0 a1.8,2 0 1,0 -3.6,0 Z M57,66.5 a1.8,2 0 1,0 3.6,0 a1.8,2 0 1,0 -3.6,0 Z M48.4,69.3 Q52,73.4 57.6,70.8 L57,69.5 Q52.6,71.6 49.6,68.1 Z" />
+        android:pathData="M54,20 C65,20 71,29 69,39 C68,46 62,50 58,54 C62,58 69,62 70,71 C72,82 65,90 54,90 C43,90 36,82 38,71 C39,62 46,58 50,54 C46,50 40,46 39,39 C37,29 43,20 54,20 Z M47.5,32 h13 a1.5,1.5 0 0 1 1.5,1.5 v7 a1.5,1.5 0 0 1 -1.5,1.5 h-13 a1.5,1.5 0 0 1 -1.5,-1.5 v-7 a1.5,1.5 0 0 1 1.5,-1.5 Z M46.1,65.5 h15.8 a1.6,1.6 0 0 1 1.6,1.6 v8.3 a1.6,1.6 0 0 1 -1.6,1.6 h-15.8 a1.6,1.6 0 0 1 -1.6,-1.6 v-8.3 a1.6,1.6 0 0 1 1.6,-1.6 Z" />
 </vector>

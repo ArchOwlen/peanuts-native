@@ -2,18 +2,33 @@ package dev.peanuts.ui;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.drawable.ClipDrawable;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.InsetDrawable;
+import android.graphics.drawable.LayerDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Layout;
+import android.text.SpannableString;
+import android.text.Spanned;
 import android.text.TextUtils;
+import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -42,16 +57,18 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
- * Banana's Home is the library (SPEC.md): {@link #fill} is the one call MainActivity.refresh makes for its game box. It lays out the filter row (All · Ready · Build
- * needed · Not in this app version, Find, Add game), then the sections: READY (Banana's own full cards, two per row, a building game's card first and full width),
- * BUILD NEEDED (compact cards, three per row, A–Z; a tap opens the game sheet) and NOT IN THIS APP VERSION (compact, folded behind "Show N"). The games come from
- * {@link LibraryScanner} (every NSP/XCI/.nup/dump in the game folder) merged with upstream's own list: a scanned game that is ready is put into upstream's list so
- * its card is Banana's (Play, ⋯ Manage); upstream's progress card (Ondevice) is placed first, full width, as refresh() did. The build (import → Prepare → companion,
- * BuildPipeline) shows on a card of Ondevice's shape: status, a sentence, the bar, Stop and a disabled Play; during Prepare upstream's own card is that card.
- * With no game folder set, the first-run card (emptyCard's shape with three Setting rows) is Home's one card.
+ * Banana's Home is the library (SPEC.md, SPEC3.md): {@link #fill} is the one call MainActivity.refresh makes for its game box. It lays out the filter row (All ·
+ * Building · Ready · Build needed · Not in this app version, Find), then one cover grid (Eden's shape in Banana's clothes: PUi.tile at cell size with the NACP icon,
+ * the name under it, the state on the cover, four columns on a handheld), ordered Building → Ready by last played → Build needed A–Z → Not in this app version A–Z,
+ * no sections. A tap plays a ready game (Banana's launch) or opens the game sheet; a long press (or Y) opens Banana's Manage sheet for a listed game. The Building
+ * filter exists only while something runs and holds the full cards: the build card (Ondevice's shape: status, a sentence, the bar, Stop/Retry and a disabled Play)
+ * and upstream's progress card (Ondevice); everywhere else the building game is a cover with a progress strip and a "Building · N %" chip that opens that filter.
+ * The games come from {@link LibraryScanner} (every NSP/XCI/.nup/dump in the game folder) merged with upstream's own list: a scanned game that is ready is put
+ * into upstream's list so Play and Manage are Banana's. With no game folder set, the first-run card (emptyCard's shape with three Setting rows) is Home's one card.
  */
 public final class Library {
-    private static final int ALL = 0, READY = 1, BUILD = 2, NO_PROFILE = 3;
+    private static final int ALL = 0, BUILDING = 1, READY = 2, BUILD = 3, NO_PROFILE = 4;
+    private static final int[] FILTERS = {ALL, BUILDING, READY, BUILD, NO_PROFILE};
     private static final String GOES_ON = " The build goes on if you leave the app.";
 
     /** The library of the activity that is showing (one MainActivity at a time; a recreated one gets a new instance that keeps the scan) */
@@ -78,16 +95,21 @@ public final class Library {
     private Predicate<Object> shows = g -> false;
     private Function<Object, View> card = g -> null;
     private Consumer<Object> manage = g -> {};
-    private Runnable addGame = () -> {}, refresh = () -> {};
+    private Runnable refresh = () -> {};
     private List<LibraryScanner.Title> titles = lastTitles;
     private boolean scanning;
     private int filter = ALL;
     private String find = "";
-    private boolean showNoProfile;
-    private final Map<String, TextView> tiles = new HashMap<>();   // the tiles of the cards showing, by title ID (icons land while they show)
+    private final Map<String, TextView> tiles = new HashMap<>();   // the tiles of the covers showing, by title ID (icons land while they show)
+    private final Map<String, Boolean> companions = new HashMap<>();   // title ID → a companion is installed (read once per pass; cleared by a scan and a build's end)
     // the build card's live parts (null when it is not on screen)
     private TextView buildStatus, buildBody, buildPct;
     private ProgressBar buildBar;
+    // the building game's cover marks (null when the Building filter shows the card instead)
+    private TextView coverChip;
+    private ProgressBar coverStrip;
+    private View firstCover;   // the grid's first cover of this render (focused after a shoulder-button filter change)
+    private boolean focusGrid;
 
     private Library(Activity a) { this.a = a; }
 
@@ -97,13 +119,13 @@ public final class Library {
             if (b == null) return;
             boolean stepChanged = !step.equals(b.step);
             b.step = step; b.percent = percent; b.detail = detail == null ? "" : detail;
-            if (stepChanged || buildStatus == null || box == null) render(); else updateBuildCard(b);
+            if (stepChanged || (buildStatus == null && coverChip == null) || box == null) render(); else updateBuildCard(b);
         }
         @Override public void done(boolean ok, String message) {
             Build b = build;
             if (b == null) return;
             if (ok) {
-                build = null;
+                build = null; companions.clear();
                 Toast.makeText(a, b.name + " is ready to play.", Toast.LENGTH_LONG).show();
                 scan();
             } else {
@@ -117,14 +139,14 @@ public final class Library {
 
     /**
      * MainActivity.refresh's game box: games is upstream's list, ondeviceCard its progress card when it shows (Ondevice.cardView), shows says whether that card is a
-     * game's (Ondevice.shows), card makes a game's own card (gameCard), manage opens its Manage sheet, addGame is Add game, refresh is refresh() itself
+     * game's (Ondevice.shows), card makes a game's own card (gameCard; unused since the covers, kept for the hook's shape), manage opens its Manage sheet, refresh is refresh() itself
      */
     @SuppressWarnings("unchecked")
-    public static <G> void fill(Activity a, LinearLayout box, List<G> games, View ondeviceCard, Predicate<G> shows, Function<G, View> card, Consumer<G> manage, Runnable addGame, Runnable refresh) {
+    public static <G> void fill(Activity a, LinearLayout box, List<G> games, View ondeviceCard, Predicate<G> shows, Function<G, View> card, Consumer<G> manage, Runnable refresh) {
         if (current == null || current.a != a) current = new Library(a);
         Library l = current;
         l.box = box; l.games = new ArrayList<>(games); l.ondeviceCard = ondeviceCard;
-        l.shows = (Predicate<Object>) shows; l.card = (Function<Object, View>) card; l.manage = (Consumer<Object>) manage; l.addGame = addGame; l.refresh = refresh;
+        l.shows = (Predicate<Object>) shows; l.card = (Function<Object, View>) card; l.manage = (Consumer<Object>) manage; l.refresh = refresh;
         if (build != null) {
             if (BuildPipeline.running() == build.id) BuildPipeline.attach(build.id, l.listener);   // an activity made anew while the service builds
             else if (!build.failed) build = null;   // the service ended while no listener heard it
@@ -147,7 +169,7 @@ public final class Library {
         if (!current.scanning) current.scan();
     }
 
-    /** The game sheet of a title (MainActivity's Manage › Build again, a compact card's tap): the scanned title, else one made from upstream's list entry */
+    /** The game sheet of a title (MainActivity's Manage › Build again, a cover's tap): the scanned title, else one made from upstream's list entry */
     static void openSheet(Activity a, String titleId) {
         if (current == null || current.a != a) return;
         current.sheet(current.titleFor(titleId));
@@ -172,7 +194,7 @@ public final class Library {
             UI.post(() -> {
                 lastTitles = t; catalog = c; catalogFetched = true; everScanned = true;
                 if (current != this) return;
-                titles = t; scanning = false;
+                titles = t; scanning = false; companions.clear();
                 if (box != null && box.isAttachedToWindow()) refresh.run(); else render();   // upstream's list again too (Prepare and the add above put games into it)
             });
             for (LibraryScanner.Title x : t) {   // the fonts and build id every ready game's env needs (GameEnv), and the icons
@@ -225,7 +247,7 @@ public final class Library {
 
     // ---- Home ----
 
-    /** One card of the list: upstream's game (a full card) or a scanned title (compact), or both when they are the same game */
+    /** One cover of the grid: upstream's game or a scanned title, or both when they are the same game */
     private static final class Row {
         final Object game; final Upstream.Entry entry; final LibraryScanner.Title title;
         Row(Object game, Upstream.Entry entry, LibraryScanner.Title title) { this.game = game; this.entry = entry; this.title = title; }
@@ -253,11 +275,18 @@ public final class Library {
         return out;
     }
 
+    /** Whether this row's game is being built now: upstream's Prepare shows its card for it, or the Peanuts build (running, or stopped until retried) is its */
+    private boolean isBuilding(Row r) {
+        if (r.game != null && shows.test(r.game)) return true;
+        Build b = build;
+        return b != null && r.id().equalsIgnoreCase(b.titleId);
+    }
+
     private void render() {
         if (box == null) return;
         box.removeAllViews();
         tiles.clear();
-        buildStatus = null; buildBody = null; buildPct = null; buildBar = null;
+        buildStatus = null; buildBody = null; buildPct = null; buildBar = null; coverChip = null; coverStrip = null; firstCover = null;
         View pc = ondeviceCard;
         if (pc != null && pc.getParent() instanceof ViewGroup) ((ViewGroup) pc.getParent()).removeView(pc);
         boolean setup = PeanutsPrefs.gameDir(a) == null || !PeanutsPrefs.setupDone(a);
@@ -265,8 +294,25 @@ public final class Library {
         List<Row> rows = rows();
         if (setup && rows.isEmpty() && pc == null) return;
 
+        Build b = build;
+        boolean buildCard = b != null && !(b.step.equals("prepare") && pc != null && !b.failed);   // during Prepare upstream's own card is the card
+        int building = (pc != null ? 1 : 0) + (buildCard ? 1 : 0);
+        if (building == 0 && filter == BUILDING) filter = ALL;   // the last job finished: the filter goes away
         int all = rows.size(), ready = 0, toBuild = 0, noProfile = 0;
-        for (Row r : rows) { switch (r.status()) { case READY: ready++; break; case BUILD: toBuild++; break; default: noProfile++; } }
+        List<Row> bl = new ArrayList<>(), rd = new ArrayList<>(), bd = new ArrayList<>(), np = new ArrayList<>();
+        for (Row r : rows) {
+            boolean shown = find.isEmpty() || r.name().toLowerCase(Locale.ROOT).contains(find.toLowerCase(Locale.ROOT));
+            if (isBuilding(r)) { if (shown) bl.add(r); continue; }   // the other filters never show it
+            switch (r.status()) {
+                case READY: ready++; if (shown) rd.add(r); break;
+                case BUILD: toBuild++; if (shown) bd.add(r); break;
+                default: noProfile++; if (shown) np.add(r);
+            }
+        }
+        Collections.sort(bl, (x, y) -> Boolean.compare(y.game != null && shows.test(y.game), x.game != null && shows.test(x.game)));   // upstream's Prepare first, like its card
+        Collections.sort(rd, (x, y) -> x.used() != y.used() ? Long.compare(y.used(), x.used()) : x.name().compareToIgnoreCase(y.name()));
+        Collections.sort(bd, (x, y) -> x.name().compareToIgnoreCase(y.name()));
+        Collections.sort(np, (x, y) -> x.name().compareToIgnoreCase(y.name()));
 
         // the filter row
         LinearLayout top = PUi.row(a);
@@ -274,6 +320,11 @@ public final class Library {
         chips.setHorizontalScrollBarEnabled(false);
         LinearLayout chipRow = PUi.row(a);
         chip(chipRow, "All " + all, ALL);
+        if (building > 0) {
+            SpannableString s = new SpannableString("Building " + building);
+            if (filter != BUILDING) s.setSpan(new ForegroundColorSpan(PUi.col(a, R.color.bn_banana)), 9, s.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);   // the count in banana: something runs
+            chip(chipRow, s, BUILDING);
+        }
         chip(chipRow, "Ready " + ready, READY);
         chip(chipRow, "Build needed " + toBuild, BUILD);
         chip(chipRow, "Not in this app version " + noProfile, NO_PROFILE);
@@ -282,12 +333,9 @@ public final class Library {
         Button findB = PUi.button(a, find.isEmpty() ? "Find" : "Find · " + find, PUi.Kind.QUIET, v -> findDialog());
         findB.setCompoundDrawablesRelativeWithIntrinsicBounds(PUi.icon(a, R.drawable.ic_search, R.color.bn_accent), null, null, null);
         findB.setCompoundDrawablePadding(PUi.dp(a, 6));
+        findB.setOnKeyListener(shoulders);
         LinearLayout.LayoutParams flp = PUi.wrap(); flp.leftMargin = PUi.dp(a, 8);
         top.addView(findB, flp);
-        Button add = PUi.button(a, "Add game", PUi.Kind.QUIET, v -> addGame.run());
-        add.setCompoundDrawablesRelativeWithIntrinsicBounds(PUi.icon(a, R.drawable.ic_add, R.color.bn_accent), null, null, null);
-        add.setCompoundDrawablePadding(PUi.dp(a, 6));
-        top.addView(add);
         PUi.add(box, top, setup ? 16 : 2);
         if (scanning) {
             int n = PeanutsPrefs.roots(a).size();
@@ -296,60 +344,71 @@ public final class Library {
             PUi.add(box, PUi.small(a, "No games found in " + PeanutsPrefs.gameDir(a) + ". Put NSP, XCI, .nup files or dump folders there, then Rescan (Settings › Library)."), 8);
         }
 
-        // the sections
-        List<Row> rd = new ArrayList<>(), bd = new ArrayList<>(), np = new ArrayList<>();
-        for (Row r : rows) {
-            if (!find.isEmpty() && !r.name().toLowerCase(Locale.ROOT).contains(find.toLowerCase(Locale.ROOT))) continue;
-            switch (r.status()) { case READY: rd.add(r); break; case BUILD: bd.add(r); break; default: np.add(r); }
-        }
-        Collections.sort(rd, (x, y) -> x.used() != y.used() ? Long.compare(y.used(), x.used()) : x.name().compareToIgnoreCase(y.name()));
-        Collections.sort(bd, (x, y) -> x.name().compareToIgnoreCase(y.name()));
-        Collections.sort(np, (x, y) -> x.name().compareToIgnoreCase(y.name()));
-
-        Build b = build;
-        boolean buildCard = b != null && !(b.step.equals("prepare") && pc != null && !b.failed);   // during Prepare upstream's own card is the card
-        if (filter == ALL || filter == READY) {
+        // the Building filter: the full cards, two per row
+        if (filter == BUILDING) {
             List<View> full = new ArrayList<>();
             if (pc != null) full.add(pc);
             if (buildCard) full.add(buildCard(b));
-            List<View> cards = new ArrayList<>();
-            for (Row r : rd) {
-                if (r.game != null && shows.test(r.game)) continue;   // its card is the progress card
-                if (b != null && buildCard && r.id().equalsIgnoreCase(b.titleId)) continue;   // its card is the build card
-                cards.add(r.game != null ? fullCard(r) : compactCard(r.title, "Ready", R.color.bn_leaf));
-            }
-            if (!full.isEmpty() || !cards.isEmpty()) {
-                PUi.add(box, PUi.section(a, "Ready" + (rd.isEmpty() ? "" : " · " + rd.size())), 20);
-                for (View v : full) PUi.add(box, v, 10);
-                grid(cards, fullColumns());
-            }
+            grid(full, fullColumns(), PUi.GAP);
+            PUi.add(box, PUi.small(a, "When a build finishes, its game moves to Ready and this filter goes away."), 10);
+            focusAfterRender(chipRow);
+            return;
         }
-        if (filter == ALL || filter == BUILD) {
-            List<View> cards = new ArrayList<>();
-            for (Row r : bd) { if (b != null && buildCard && r.id().equalsIgnoreCase(b.titleId)) continue; cards.add(compactCard(r.title, "Build needed", R.color.bn_accent)); }
-            if (!cards.isEmpty()) { PUi.add(box, PUi.section(a, "Build needed · " + bd.size()), 20); grid(cards, compactColumns()); }
+
+        // the cover grid: one grid, the filters are the sections
+        List<Row> show = new ArrayList<>();
+        switch (filter) {
+            case READY: show.addAll(rd); break;
+            case BUILD: show.addAll(bd); break;
+            case NO_PROFILE: show.addAll(np); break;
+            default: show.addAll(bl); show.addAll(rd); show.addAll(bd); show.addAll(np);
         }
-        if ((filter == ALL || filter == NO_PROFILE) && !np.isEmpty()) {
-            PUi.add(box, PUi.section(a, "Not in this app version · " + np.size()), 20);
-            if (filter == NO_PROFILE || showNoProfile) {
-                List<View> cards = new ArrayList<>();
-                for (Row r : np) {
-                    if (r.game != null) { Object g = r.game; cards.add(compactCard(r.name(), r.id(), "Not in this app version", R.color.bn_danger, v -> manage.accept(g))); }   // upstream's own Manage sheet: the sentence, Remove from list
-                    else cards.add(compactCard(r.title, "Not in this app version", R.color.bn_danger));
-                }
-                grid(cards, compactColumns());
-            } else {
-                PUi.add(box, PUi.button(a, "Show " + np.size(), PUi.Kind.QUIET, v -> { showNoProfile = true; render(); }), 6, PUi.wrap());
-            }
-        }
+        int cols = coverColumns();
+        int cell = (Math.min(widthDp(), 900) - 40 - PUi.GAP * (cols - 1)) / cols;   // Banana's 20 dp gutters and 12 dp gaps
+        List<View> cells = new ArrayList<>();
+        for (Row r : show) cells.add(coverCell(r, cell));
+        grid(cells, cols, 16);
+        focusAfterRender(chipRow);
     }
 
-    private void chip(LinearLayout row, String label, int which) {
+    /** After a shoulder-button filter change the first cover (else the chosen chip) takes the focus, so the controller stays in the grid */
+    private void focusAfterRender(LinearLayout chipRow) {
+        if (!focusGrid) return;
+        focusGrid = false;
+        View f = firstCover;
+        if (f == null) for (int i = 0; i < chipRow.getChildCount(); i++) if (chipRow.getChildAt(i).isSelected()) f = chipRow.getChildAt(i);
+        if (f == null && chipRow.getChildCount() > 0) f = chipRow.getChildAt(0);
+        if (f != null) { View v = f; v.post(v::requestFocus); }
+    }
+
+    private void chip(LinearLayout row, CharSequence label, int which) {
         boolean on = filter == which;
-        Button c = PUi.button(a, label, on ? PUi.Kind.PRIMARY : PUi.Kind.TONAL, v -> { filter = which; showNoProfile = false; render(); });
+        Button c = PUi.button(a, label, on ? PUi.Kind.PRIMARY : PUi.Kind.TONAL, v -> { filter = which; render(); });
+        c.setSelected(on);
+        c.setOnKeyListener(shoulders);
         LinearLayout.LayoutParams lp = PUi.wrap();
         if (row.getChildCount() > 0) lp.leftMargin = PUi.dp(a, 8);
         row.addView(c, lp);
+    }
+
+    /** L/R shoulder on any of the library's own focusable views (covers, chips, Find): the previous/next filter chip */
+    private final View.OnKeyListener shoulders = (v, code, ev) -> {
+        if (ev.getAction() != KeyEvent.ACTION_DOWN || ev.getRepeatCount() != 0) return false;
+        if (code == KeyEvent.KEYCODE_BUTTON_L1) { stepFilter(-1); return true; }
+        if (code == KeyEvent.KEYCODE_BUTTON_R1) { stepFilter(1); return true; }
+        return false;
+    };
+
+    private void stepFilter(int d) {
+        Build b = build;
+        boolean buildCard = b != null && !(b.step.equals("prepare") && ondeviceCard != null && !b.failed);
+        boolean hasBuilding = ondeviceCard != null || buildCard;
+        List<Integer> avail = new ArrayList<>();
+        for (int f : FILTERS) if (f != BUILDING || hasBuilding) avail.add(f);
+        int i = Math.max(0, avail.indexOf(filter));
+        filter = avail.get(((i + d) % avail.size() + avail.size()) % avail.size());
+        focusGrid = true;
+        render();
     }
 
     private void findDialog() {
@@ -370,10 +429,10 @@ public final class Library {
 
     private int widthDp() { Configuration c = a.getResources().getConfiguration(); return c.screenWidthDp; }
     private int fullColumns() { return widthDp() >= 700 ? 2 : 1; }
-    private int compactColumns() { return widthDp() >= 800 ? 3 : widthDp() >= 540 ? 2 : 1; }
+    private int coverColumns() { return widthDp() >= 700 ? 4 : widthDp() >= 540 ? 3 : 2; }
 
-    /** Cards in rows of cols weighted cells, 12 dp apart; an odd last card keeps its cell's width (empty cells fill the rest) */
-    private void grid(List<View> cards, int cols) {
+    /** Views in rows of cols weighted cells, 12 dp apart, rowGap dp between rows; an odd last cell keeps its width (empty cells fill the rest) */
+    private void grid(List<View> cards, int cols, int rowGap) {
         for (int i = 0; i < cards.size(); i += cols) {
             LinearLayout r = new LinearLayout(a);
             r.setOrientation(LinearLayout.HORIZONTAL);
@@ -383,69 +442,177 @@ public final class Library {
                 if (k > 0) lp.leftMargin = PUi.dp(a, PUi.GAP);
                 r.addView(v, lp);
             }
-            PUi.add(box, r, i == 0 ? 10 : PUi.GAP);
+            PUi.add(box, r, i == 0 ? 10 : rowGap);
         }
     }
 
-    /** Upstream's own card for a listed game, its tile showing the scanned icon (the NACP's, LibraryScanner.icon) in place of the letter when there is one */
-    private View fullCard(Row r) {
-        View v = card.apply(r.game);
-        TextView tile = tileOf(v);
-        if (tile != null) {
-            tiles.put(r.id(), tile);
-            Bitmap b = icons.get(r.id());
-            if (b != null) PUi.tileIcon(tile, b);
+    // ---- The covers ----
+
+    /**
+     * One cell of the grid: the cover (PUi's tile at cell size, the NACP icon once it has landed) with the state on it, the name under it. The cover is the focusable,
+     * clickable thing: a tap plays a ready game, opens the Building filter for a building one, the sheet or Manage otherwise; a long press (or Y) opens Manage
+     * (listed) or the sheet (scanned); a 3 dp banana ring and a banana name show the focus
+     */
+    private View coverCell(Row r, int cellDp) {
+        int st = r.status();
+        Build b = build;
+        boolean building = isBuilding(r);
+        boolean ownBuild = building && b != null && r.id().equalsIgnoreCase(b.titleId);   // the Peanuts build's game (else upstream's Prepare: no percent to show)
+        boolean stopped = ownBuild && b.failed;
+        String name = r.name();
+        boolean companion = companionInstalled(r);
+        String state = building ? (stopped ? "Build stopped" : ownBuild ? "Building · " + b.percent + " %" : "Building · preparing")
+                : st == READY ? "Ready" : st == BUILD ? "Build needed" : "Not in this app version";
+
+        LinearLayout cell = new LinearLayout(a);
+        cell.setOrientation(LinearLayout.VERTICAL);
+        FrameLayout cover = new FrameLayout(a);
+        int p4 = PUi.dp(a, 4), p8 = PUi.dp(a, 8);
+        cover.setPadding(p4, p4, p4, p4);
+        cover.setClickable(true);
+        cover.setFocusable(true);
+        cover.setContentDescription(name + ", " + state + (companion ? ", companion installed" : ""));
+        // the ripple under the cover (masked to its 16 dp corners) and the focus ring, 3 dp outside the cover's edge
+        StateListDrawable ring = new StateListDrawable();
+        ring.addState(new int[] {android.R.attr.state_focused}, PUi.round(Color.TRANSPARENT, PUi.dp(a, 20), PUi.col(a, R.color.bn_banana), PUi.dp(a, 3)));
+        ring.addState(new int[0], new ColorDrawable(Color.TRANSPARENT));
+        RippleDrawable ripple = new RippleDrawable(ColorStateList.valueOf(0x336B4423), null, new InsetDrawable(PUi.round(Color.BLACK, PUi.dp(a, 16), 0, 0), p4));
+        cover.setForeground(new LayerDrawable(new Drawable[] {ripple, ring}));
+
+        int coverDp = cellDp - 8;   // the cell less the 4 dp the focus ring needs on each side: the cover stays square
+        TextView tile = PUi.tile(a, name, coverDp);
+        tile.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, PUi.dp(a, coverDp)));
+        Bitmap bm = icons.get(r.id());
+        if (bm != null) PUi.tileIcon(tile, bm);
+        if (!building && st == NO_PROFILE) tile.setAlpha(0.45f);
+        tiles.put(r.id(), tile);
+        cover.addView(tile);
+
+        // the state on the cover
+        if (building) {
+            coverChip = mark(state, PUi.col(a, R.color.bn_card), stopped ? R.color.bn_danger : R.color.bn_accent, true, Gravity.TOP | Gravity.START);
+            cover.addView(coverChip);
+            coverStrip = strip(!ownBuild);
+            if (stopped) coverStrip.setVisibility(View.GONE); else if (ownBuild) coverStrip.setProgress(Math.max(0, Math.min(100, b.percent)));
+            cover.addView(coverStrip);
+        } else if (st == READY) {
+            TextView ok = PUi.text(a, "✓", 12, R.color.bn_on_leaf, 700);
+            ok.setGravity(Gravity.CENTER);
+            ok.setIncludeFontPadding(false);
+            ok.setBackground(PUi.round(PUi.col(a, R.color.bn_leaf), PUi.dp(a, 999), 0, 0));
+            ok.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(PUi.dp(a, 22), PUi.dp(a, 22), Gravity.TOP | Gravity.END);
+            lp.setMargins(p8, p8, p8, p8);
+            cover.addView(ok, lp);
+        } else if (st == BUILD) {
+            cover.addView(mark("Build", PUi.col(a, R.color.bn_banana), R.color.bn_on_banana, false, Gravity.TOP | Gravity.START));
+        } else {
+            cover.addView(mark("Not in this app version", PUi.col(a, R.color.bn_danger_tint), R.color.bn_danger, false, Gravity.TOP | Gravity.START));
         }
-        return v;
-    }
+        if (companion) cover.addView(companionBadge(building && !stopped));
 
-    /** The tile of upstream's game card (gameCard: the card's first row's first child, Ui.tile's 52 dp TextView) */
-    private TextView tileOf(View card) {
-        if (!(card instanceof ViewGroup) || ((ViewGroup) card).getChildCount() == 0) return null;
-        View top = ((ViewGroup) card).getChildAt(0);
-        if (!(top instanceof ViewGroup) || ((ViewGroup) top).getChildCount() == 0) return null;
-        View t = ((ViewGroup) top).getChildAt(0);
-        return t instanceof TextView && t.getLayoutParams() != null && t.getLayoutParams().width == PUi.dp(a, 52) ? (TextView) t : null;
-    }
-
-    private View compactCard(LibraryScanner.Title t, String state, int colorRes) { return compactCard(t.name, t.titleId, state, colorRes, v -> sheet(t)); }
-
-    /** A game that is not playable yet (or not in this app): its tile, name over its state, and a chevron; the whole card opens the sheet (or, for a listed game without a profile, its Manage) */
-    private View compactCard(String name, String titleId, String state, int colorRes, View.OnClickListener open) {
-        LinearLayout c = PUi.card(a);
-        c.setOrientation(LinearLayout.HORIZONTAL);
-        c.setGravity(Gravity.CENTER_VERTICAL);
-        int p = PUi.dp(a, 12);
-        c.setPadding(p, p, p, p);
-        c.setMinimumHeight(PUi.dp(a, 80));
-        c.setBackground(PUi.ripple(a, PUi.round(PUi.col(a, R.color.bn_card), PUi.dp(a, 20), PUi.col(a, R.color.bn_card_stroke), PUi.dp(a, 1))));
-        c.setClickable(true);
-        c.setFocusable(true);
-        c.setOnClickListener(open);
-        c.setOnLongClickListener(v -> { open.onClick(v); return true; });
-        c.setContentDescription(name + ", " + state);
-        TextView tile = PUi.tile(a, name, 44);
-        c.addView(tile);
-        Bitmap b = icons.get(titleId);
-        if (b != null) PUi.tileIcon(tile, b);
-        tiles.put(titleId, tile);
-        LinearLayout col = new LinearLayout(a);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(PUi.dp(a, 12), 0, PUi.dp(a, 6), 0);
-        TextView n = PUi.text(a, name, 15, R.color.bn_text, 600);
+        // the name
+        int nameColor = !building && st == NO_PROFILE ? R.color.bn_text_2 : R.color.bn_text;
+        TextView n = PUi.text(a, name, 14, nameColor, 600);
         n.setMaxLines(2);
         n.setEllipsize(TextUtils.TruncateAt.END);
         n.setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE);
         n.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
-        col.addView(n);
-        TextView st = PUi.status(a, state, colorRes);
-        st.setPadding(0, PUi.dp(a, 2), 0, 0);
-        col.addView(st);
-        c.addView(col, PUi.weight());
-        ImageView ch = new ImageView(a);
-        ch.setImageDrawable(PUi.icon(a, R.drawable.ic_chevron, R.color.bn_text_2));
-        ch.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        c.addView(ch, new LinearLayout.LayoutParams(PUi.dp(a, 20), PUi.dp(a, 20)));
+        n.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams nlp = PUi.fill();
+        nlp.setMargins(p4, p4, p4, 0);
+        cover.setOnFocusChangeListener((v, f) -> n.setTextColor(PUi.col(a, f ? R.color.bn_banana : nameColor)));
+
+        // tap, long press, Y, shoulders
+        Runnable tap, hold;
+        Runnable manageOrSheet = r.game != null ? () -> manage.accept(r.game) : () -> sheet(r.title);
+        if (building) { tap = () -> { filter = BUILDING; render(); }; hold = manageOrSheet; }
+        else if (st == READY) { tap = r.game != null ? () -> play(r) : () -> sheet(r.title); hold = manageOrSheet; }
+        else if (st == BUILD) { tap = () -> sheet(r.title); hold = tap; }
+        else { tap = manageOrSheet; hold = manageOrSheet; }   // listed: Banana's Manage (the sentence, Remove from list); scanned: the sheet (Profile.missing's sentence)
+        cover.setOnClickListener(v -> tap.run());
+        cover.setOnLongClickListener(v -> { hold.run(); return true; });
+        cover.setOnKeyListener((v, code, ev) -> {
+            if (ev.getAction() == KeyEvent.ACTION_DOWN && ev.getRepeatCount() == 0 && code == KeyEvent.KEYCODE_BUTTON_Y) { hold.run(); return true; }
+            return shoulders.onKey(v, code, ev);
+        });
+
+        cell.addView(cover, PUi.fill());
+        cell.addView(n, nlp);
+        if (firstCover == null) firstCover = cover;
+        return cell;
+    }
+
+    /** Play for a listed, ready game: Banana's own launch (the pack search, the checks, its dialogs); its Manage sheet if that cannot be reached */
+    private void play(Row r) { if (!Upstream.launch(a, r.game)) manage.accept(r.game); }
+
+    /** A pill on the cover, 8 dp in from its corner: 12 sp 700, a 1 dp shadow so it reads on any art */
+    private TextView mark(String s, int fill, int textRes, boolean stroke, int gravity) {
+        TextView t = PUi.text(a, s, 12, textRes, 700);
+        t.setSingleLine(true);
+        t.setBackground(PUi.round(fill, PUi.dp(a, 999), stroke ? PUi.col(a, R.color.bn_card_stroke) : 0, stroke ? Math.max(1, PUi.dp(a, 1)) : 0));
+        t.setPadding(PUi.dp(a, 10), PUi.dp(a, 5), PUi.dp(a, 10), PUi.dp(a, 5));
+        t.setElevation(PUi.dp(a, 1));
+        t.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, gravity);
+        int p8 = PUi.dp(a, 8);
+        lp.setMargins(p8, p8, p8, p8);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    /** The building cover's 6 dp progress strip along the bottom edge, 8 dp inset: banana deep on 70 % of the screen's colour; indeterminate for upstream's Prepare */
+    private ProgressBar strip(boolean indeterminate) {
+        ProgressBar p = new ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal);
+        p.setMax(100);
+        p.setIndeterminate(indeterminate);
+        int track = (PUi.col(a, R.color.bn_bg) & 0x00FFFFFF) | 0xB3000000;
+        GradientDrawable fill = PUi.round(PUi.col(a, R.color.bn_banana_deep), PUi.dp(a, 3), 0, 0);
+        LayerDrawable ld = new LayerDrawable(new Drawable[] {PUi.round(track, PUi.dp(a, 3), 0, 0), new ClipDrawable(fill, Gravity.START, ClipDrawable.HORIZONTAL)});
+        ld.setId(0, android.R.id.background);
+        ld.setId(1, android.R.id.progress);
+        p.setProgressDrawable(ld);
+        p.setIndeterminateTintList(ColorStateList.valueOf(PUi.col(a, R.color.bn_banana_deep)));
+        p.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, PUi.dp(a, 6), Gravity.BOTTOM);
+        int p8 = PUi.dp(a, 8);
+        lp.setMargins(p8, 0, p8, p8);
+        p.setLayoutParams(lp);
+        return p;
+    }
+
+    /** The green two-screen badge, bottom-right of a cover whose game has a companion installed (above the strip while it builds) */
+    private View companionBadge(boolean aboveStrip) {
+        LinearLayout v = new LinearLayout(a);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setGravity(Gravity.CENTER);
+        v.setBackground(PUi.round(PUi.col(a, R.color.bn_leaf), PUi.dp(a, 6), 0, 0));
+        v.setElevation(PUi.dp(a, 1));
+        v.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        for (int i = 0; i < 2; i++) {
+            View s = new View(a);
+            s.setBackground(PUi.round(PUi.col(a, R.color.bn_on_leaf), PUi.dp(a, 1), 0, 0));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(PUi.dp(a, 12), PUi.dp(a, 5));
+            if (i > 0) lp.topMargin = PUi.dp(a, 2);
+            v.addView(s, lp);
+        }
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(PUi.dp(a, 22), PUi.dp(a, 22), Gravity.BOTTOM | Gravity.END);
+        int p8 = PUi.dp(a, 8);
+        lp.setMargins(p8, p8, p8, aboveStrip ? PUi.dp(a, 20) : p8);
+        v.setLayoutParams(lp);
+        return v;
+    }
+
+    /** Whether a companion is installed for this title (Installer.installedVersion under the title's companion root), cached until the next scan or build */
+    private boolean companionInstalled(Row r) {
+        Boolean c = companions.get(r.id());
+        if (c == null) {
+            CompanionPort.Item it = CompanionPort.forTitle(catalog, r.id());
+            File pack = r.title == null && !r.entry.packDir.isEmpty() ? new File(r.entry.packDir) : null;
+            File root = r.title != null ? r.title.companionRoot() : pack == null || pack.getParentFile() == null ? null : new File(pack.getParentFile(), "peanuts");
+            c = it != null && root != null && CompanionPort.installedVersion(root, it.packageName) != null;
+            companions.put(r.id(), c);
+        }
         return c;
     }
 
@@ -508,6 +675,11 @@ public final class Library {
     }
 
     private void updateBuildCard(Build b) {
+        if (coverChip != null) {   // the building cover's chip and strip (the Building filter not chosen)
+            coverChip.setText(b.failed ? "Build stopped" : "Building · " + b.percent + " %");
+            coverChip.setTextColor(PUi.col(a, b.failed ? R.color.bn_danger : R.color.bn_accent));
+            if (coverStrip != null) { coverStrip.setVisibility(b.failed ? View.GONE : View.VISIBLE); if (!coverStrip.isIndeterminate()) coverStrip.setProgress(Math.max(0, Math.min(100, b.percent))); }
+        }
         if (buildStatus == null) return;
         PUi.status(buildStatus, stepWords(b), b.failed ? R.color.bn_danger : b.step.equals("done") ? R.color.bn_leaf : R.color.bn_accent);
         if (b.failed) {

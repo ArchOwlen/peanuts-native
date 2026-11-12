@@ -139,6 +139,16 @@ final class Upstream {
         return out;
     }
 
+    /** Banana's Play for a listed game (MainActivity.launch(Game): the pack search, the save and shader checks, its dialogs); false when it could not be called */
+    static boolean launch(android.app.Activity a, Object g) {
+        try {
+            Method m = Class.forName(P + "MainActivity").getDeclaredMethod("launch", Class.forName(P + "Game"));
+            m.setAccessible(true);
+            m.invoke(a, g);
+            return true;
+        } catch (Throwable t) { Log.w("peanuts", "launch: " + cause(t)); return false; }
+    }
+
     /** The pack folder upstream would use for a game (Folders.packFor: the picked one, the app's packs/<id>, beside or inside the game, <id>-work/<any>); null without one */
     static File packFor(Context c, File game, String titleId) {
         try {
