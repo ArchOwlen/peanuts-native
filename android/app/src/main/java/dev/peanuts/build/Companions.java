@@ -1,5 +1,7 @@
 package dev.peanuts.build;
 
+import android.content.Context;
+
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
@@ -72,6 +74,28 @@ public final class Companions {
         return out;
     }
 
+    /** Installer.installedVerified(root, package): true when the installed version was checked against a publisher-provided digest (its sha256, or a sibling
+     * .sha256 asset), false for "unverified" (no digest was published anywhere, so only this device's own first-install fingerprint is on file) or not installed */
+    public static boolean installedVerified(File root, String packageName) {
+        if (root == null) return false;
+        try {
+            return (Boolean) call(Class.forName(INSTALLER), "installedVerified", new Class<?>[] {File.class, String.class}, root, packageName);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Installer.repair(root, package): completes or rolls back a swap a killed process left half-done (no single app-startup hook reaches dev.peanuts from
+     * here, so this is called opportunistically wherever a package is touched - CompanionSection's refreshInstalled() calls it) */
+    public static void repair(File root, String packageName) {
+        if (root == null) return;
+        try {
+            call(Class.forName(INSTALLER), "repair", new Class<?>[] {File.class, String.class}, root, packageName);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            // best effort; the next install()/activateLocalVersion() retries it anyway
+        }
+    }
+
     /** Catalog.compareVersions: &gt;0 when a is newer */
     public static int compareVersions(String a, String b) {
         try {
@@ -81,7 +105,12 @@ public final class Companions {
         }
     }
 
-    public static void install(Item item, File root, File cacheDir, Progress progress) throws IOException {
+    /** Never refuses for a running game (no Context) - the build pipeline's own install, where the title being built can't be the one playing */
+    public static void install(Item item, File root, File cacheDir, Progress progress) throws IOException { install(item, root, cacheDir, progress, null); }
+
+    /** As above, plus ctx (nullable): refuses with "close the game first" if this app's own game process is running (Installer.gameRunning) -
+     * CompanionSection's Install/Update can run while a different companion's game session is live, same hazard as CompanionVersions' Switch to. */
+    public static void install(Item item, File root, File cacheDir, Progress progress, Context ctx) throws IOException {
         try {
             Class<?> inst = Class.forName(INSTALLER);
             Class<?> pi = Class.forName(INSTALLER + "$Progress");
@@ -92,7 +121,7 @@ public final class Companions {
                 if (m.getName().equals("equals")) return p == args[0];
                 return null;
             });
-            call(inst, "install", new Class<?>[] {Class.forName(CATALOG + "$Item"), File.class, File.class, pi}, item.raw, root, cacheDir, proxy);
+            call(inst, "install", new Class<?>[] {Class.forName(CATALOG + "$Item"), File.class, File.class, pi, String.class, Context.class}, item.raw, root, cacheDir, proxy, null, ctx);
         } catch (ReflectiveOperationException e) {
             Throwable c = e.getCause();
             if (c instanceof IOException) throw (IOException) c;
@@ -100,11 +129,17 @@ public final class Companions {
         }
     }
 
-    public static void remove(File root, String packageName) throws IOException {
+    /** Never refuses for a running game (no Context) */
+    public static void remove(File root, String packageName) throws IOException { remove(root, packageName, null); }
+
+    /** As above, plus ctx (nullable): refuses ("close the game first") while the game is running - see install()'s overload */
+    public static void remove(File root, String packageName, Context ctx) throws IOException {
         try {
-            call(Class.forName(INSTALLER), "remove", new Class<?>[] {File.class, String.class}, root, packageName);
+            call(Class.forName(INSTALLER), "remove", new Class<?>[] {File.class, String.class, Context.class}, root, packageName, ctx);
         } catch (ReflectiveOperationException e) {
-            throw new IOException("remove: " + e.getMessage(), e);
+            Throwable c = e.getCause();
+            if (c instanceof IOException) throw (IOException) c;
+            throw new IOException("remove: " + (c != null ? c : e), e);
         }
     }
 

@@ -86,13 +86,19 @@ public final class CatalogActivity extends Activity {
                     : installed == null ? item.version + " · " + String.format(Locale.US, "%.0f KB", item.size / 1024.0)
                     : installed.equals(item.version) ? "installed " + installed + " · up to date" : "installed " + installed + " · update " + item.version;
         if (g != null && root == null) line += " · build the game first";
-        PUi.Setting s = new PUi.Setting(this, "🖥️", name, null).value(line);
+        boolean hasVersions = item != null && root != null;
+        PUi.Setting s = new PUi.Setting(this, "🖥️", name, !hasVersions ? null : v -> dev.peanuts.ui.CompanionVersions.open(this, item.titleId, this::render)).value(line);
+        if (hasVersions) s.chevron(this);
         if (item != null && root != null) {
             Button b = PUi.button(this, installed == null ? "Install" : installed.equals(item.version) ? "Remove" : "Update", installed != null && installed.equals(item.version) ? PUi.Kind.DANGER : PUi.Kind.TONAL, null);
             File froot = root;
             b.setOnClickListener(v -> {
                 if ("Remove".contentEquals(b.getText())) {
-                    PUi.confirmDanger(this, "Remove the companion?", name + "'s companion is deleted from " + froot + ". The game and its saves stay.", "Remove", () -> { Installer.remove(froot, item.packageName); Toast.makeText(this, "Removed", Toast.LENGTH_SHORT).show(); render(); });
+                    PUi.confirmDanger(this, "Remove the companion?", name + "'s companion is deleted from " + froot + ". The game and its saves stay.", "Remove", () -> {
+                        try { Installer.remove(froot, item.packageName, this); Toast.makeText(this, "Removed", Toast.LENGTH_SHORT).show(); }   // ctx = this: refuses while the game is running (CRITIQUE-phase2c.md §B)
+                        catch (java.io.IOException e) { Toast.makeText(this, "Remove failed: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+                        render();
+                    });
                     return;
                 }
                 b.setEnabled(false);
@@ -109,7 +115,7 @@ public final class CatalogActivity extends Activity {
             String err = null;
             try {
                 if (!root.isDirectory() && !root.mkdirs()) throw new java.io.IOException("cannot create " + root);
-                Installer.install(item, root, getCacheDir(), (what, done, total) -> ui.post(() -> status.setText(what + " " + (total > 0 ? (done * 100 / total) + " %" : done + " files"))));
+                Installer.install(item, root, getCacheDir(), (what, done, total) -> ui.post(() -> status.setText(what + " " + (total > 0 ? (done * 100 / total) + " %" : done + " files"))), null, this);   // ctx = this: refuses while the game is running
             } catch (Exception e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
             final String ferr = err;
             ui.post(() -> {

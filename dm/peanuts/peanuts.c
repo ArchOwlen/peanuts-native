@@ -385,6 +385,52 @@ static uint64_t rt_running_title(void) {
 // The companion package of the running title: in one of the roots a package can be installed in (beside the pack: <pack>/../peanuts, which is the app's packs/peanuts for a pack
 // the app owns; and <title ID>-work/peanuts beside the dump, from DM_ROMFS's path), the one whose manifest names the title. Earlier builds took the first package in the first
 // root, so another title's companion loaded (Three Houses' for Echoes of Wisdom)
+//
+// PEANUTS (companion-versions work package): a root now holds exactly one *active* package folder per package name (dev.peanuts.Installer keeps every other installed
+// version archived outside these roots, under a dot-prefixed ".peanuts-versions" folder that readdir() already skips below via the leading-dot check) - so under normal
+// operation at most one entry per root ever has a manifest matching the running title. The one unsafe window is a process kill mid-install: Installer briefly has a
+// "<package>.new" (being extracted/verified) and/or a "<package>.old" (the previous active folder, about to be archived) sitting beside the real active folder, and a
+// killed process can leave either of those non-dot-prefixed stray folders behind with a complete, title-matching manifest - at that point two "live-looking" folders for the
+// same title exist in one root and which one readdir() returns first is filesystem order, i.e. random. Skip both known transient suffixes explicitly so a stray never
+// competes with the real active folder.
+//
+// PEANUTS (round 3, CRITIQUE-phase2b.md §B "early recovery"): Installer.repair() only runs when the app itself next touches the package (opening a settings
+// screen, starting another install) - a player who launches the game straight after a kill that landed between the two renames of a swap gets no companion at
+// all, because the active folder is genuinely missing and ".old"/".new" are both skipped. Rather than wait for the app side, a second pass here falls back to
+// a parked "<pkg>.old" (never ".new" - an extraction in progress has no business being loaded) when no root has an active folder for the title, logging that
+// it did. This can only ever help: ".old" holds a version that was active and working a moment ago, found only once nothing else matched.
+static int rt_pkgdir_suffix(const char *name, const char *suf) {
+    size_t l = strlen(name), sl = strlen(suf);
+    return l > sl && !strcmp(name + l - sl, suf);
+}
+
+// One root, one pass; allow_old lets the second (fallback-only) pass accept a "<pkg>.old" match, logging that it fell back. ".new" is never accepted, in
+// either pass - it may still be being written.
+static int rt_scan_root(const char *root, uint64_t want, int allow_old, char *dir, size_t n, uint64_t *title) {
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;   // skips dotfiles and the ".peanuts-versions" archive, never the active package
+        if (rt_pkgdir_suffix(e->d_name, ".new")) continue;   // PEANUTS: never - an install/switch may still be writing into it
+        int is_old = rt_pkgdir_suffix(e->d_name, ".old");
+        if (is_old && !allow_old) continue;   // PEANUTS: a stray from a killed swap - the first pass skips it, the fallback pass (below) accepts it
+        char manifest[768]; snprintf(manifest, sizeof manifest, "%s/%s/dualscreen/manifest.json", root, e->d_name);
+        FILE *f = fopen(manifest, "r");
+        if (!f) continue;
+        char head[4096] = {0}; size_t got = fread(head, 1, sizeof head - 1, f); fclose(f); (void)got;
+        uint64_t t = 0; const char *ts = strstr(head, "\"title_id\"");
+        if (ts) { ts = strchr(ts + 10, '"'); if (ts) t = strtoull(ts + 1, NULL, 16); }
+        if (want && t != want) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s/%s is for title %016" PRIx64 ", not %016" PRIx64 ": passed over", root, e->d_name, t, want); continue; }
+        *title = t;
+        snprintf(dir, n, "%s/%s", root, e->d_name);
+        if (is_old) __android_log_print(ANDROID_LOG_WARN, "peanuts", "no active companion package for title %016" PRIx64 "; falling back to the parked previous version %s (a swap was interrupted before it finished)", want, dir);
+        closedir(d);
+        return 1;
+    }
+    closedir(d);
+    return 0;
+}
 static int rt_find_package(char *dir, size_t n, uint64_t *title) {
     uint64_t want = rt_running_title();
     char roots[2][512]; int nroots = 0;
@@ -395,26 +441,8 @@ static int rt_find_package(char *dir, size_t n, uint64_t *title) {
         for (const char *q = romfs; q < (nup ? nup : romfs + strlen(romfs)); q++) if (*q == '/') slash = q;
         if (slash) snprintf(roots[nroots++], sizeof roots[0], "%.*s/%016" PRIX64 "-work/peanuts", (int)(slash - romfs), romfs, want);
     }
-    for (int r = 0; r < nroots; r++) {
-        DIR *d = opendir(roots[r]);
-        if (!d) continue;
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            if (e->d_name[0] == '.') continue;
-            char manifest[768]; snprintf(manifest, sizeof manifest, "%s/%s/dualscreen/manifest.json", roots[r], e->d_name);
-            FILE *f = fopen(manifest, "r");
-            if (!f) continue;
-            char head[4096] = {0}; size_t got = fread(head, 1, sizeof head - 1, f); fclose(f); (void)got;
-            uint64_t t = 0; const char *ts = strstr(head, "\"title_id\"");
-            if (ts) { ts = strchr(ts + 10, '"'); if (ts) t = strtoull(ts + 1, NULL, 16); }
-            if (want && t != want) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s/%s is for title %016" PRIx64 ", not %016" PRIx64 ": passed over", roots[r], e->d_name, t, want); continue; }
-            *title = t;
-            snprintf(dir, n, "%s/%s", roots[r], e->d_name);
-            closedir(d);
-            return 1;
-        }
-        closedir(d);
-    }
+    for (int r = 0; r < nroots; r++) if (rt_scan_root(roots[r], want, /*allow_old=*/0, dir, n, title)) return 1;
+    for (int r = 0; r < nroots; r++) if (rt_scan_root(roots[r], want, /*allow_old=*/1, dir, n, title)) return 1;   // PEANUTS: fall back to ".old" before giving up, see comment above
     return 0;
 }
 
