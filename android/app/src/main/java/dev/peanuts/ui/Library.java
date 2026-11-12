@@ -98,6 +98,24 @@ public final class Library {
     private static final Map<String, Long> missingSince = new java.util.concurrent.ConcurrentHashMap<>();
     private static Build build;   // the running (or stopped) build, kept across activity recreation (the service runs on)
     private static final Handler UI = new Handler(Looper.getMainLooper());
+    /**
+     * Round 5: the stale-hide gate in {@link #staleGames} needs two scans at least 60 s apart, but a full {@link #scan()} only ever runs once per
+     * process ({@code everScanned}) unless Settings › Library › Rescan or a folder change triggers another. Upstream's own {@code onResume} only
+     * calls {@code refresh()} (which reaches {@link #fill}) when its Game list's *size* changed, so a card whose file silently disappeared without
+     * the list shrinking (nothing removed it) never gets a fresh look on resume at all -- confirmed on the Thor, where a stale Octopath card never
+     * hid across repeated background/resume cycles. Since this file cannot change upstream's onResume, this timer instead re-runs the cheap stale
+     * check on a plain interval, independent of any lifecycle callback: it keeps ticking as long as the process is alive, so by the time a player
+     * backgrounds and resumes the app 60+ seconds later, the two scans the gate needs have already happened on their own
+     */
+    private static final long STALE_TICK_MS = 30_000L;
+    private static boolean staleTimerStarted;
+    private static final Runnable staleTick = new Runnable() {
+        @Override public void run() {
+            Library l = current;
+            if (l != null && l.box != null && !l.scanning && PeanutsPrefs.gameDir(l.a) != null) l.staleCheck();
+            UI.postDelayed(this, STALE_TICK_MS);
+        }
+    };
 
     /** A build as the card shows it */
     static final class Build {
@@ -116,6 +134,7 @@ public final class Library {
     private Runnable refresh = () -> {};
     private List<LibraryScanner.Title> titles = lastTitles;
     private boolean scanning;
+    private boolean staleChecking;   // one in flight at a time; staleTick skips a tick rather than piling up background threads
     private int filter = ALL;
     private String find = "";
     private boolean showHidden;   // the "Hidden: N missing games · Show/Hide" toggle (critique-phase2c §A-3): off by default, so a hidden card needs an explicit tap to reveal
@@ -172,6 +191,7 @@ public final class Library {
         }
         l.render();
         if (!everScanned && !l.scanning && PeanutsPrefs.gameDir(a) != null) l.scan();
+        if (!staleTimerStarted) { staleTimerStarted = true; UI.postDelayed(staleTick, STALE_TICK_MS); }
     }
 
     /** Settings › Library › Rescan, a folder change: the folders are read again */
@@ -228,6 +248,25 @@ public final class Library {
         }, "peanuts-scan").start();
     }
 
+    /**
+     * The lightweight half of {@link #scan()}, run on its own by {@link #staleTick} (round 5): only reads upstream's own Game list
+     * ({@link Upstream#games}, no filesystem walk of the whole library) and runs {@link #staleGames} on it, which itself stats only a handful of
+     * paths per entry whose file does not plainly {@code exists()}. Cheap enough to run on a timer; a full {@link #scan()} already does this too, so
+     * this is skipped while one is running rather than duplicating the work
+     */
+    private void staleCheck() {
+        if (scanning || staleChecking) return;
+        staleChecking = true;
+        new Thread(() -> {
+            List<Upstream.Entry> list = Upstream.games(a);
+            staleGames(list, a);
+            UI.post(() -> {
+                staleChecking = false;
+                if (current == this && box != null && box.isAttachedToWindow()) render();
+            });
+        }, "peanuts-stale").start();
+    }
+
     private static boolean listedIn(List<Upstream.Entry> list, LibraryScanner.Title t) {
         for (Upstream.Entry e : list) if (samePath(e.gameDir, t.launch.getPath())) return true;
         return false;
@@ -267,18 +306,20 @@ public final class Library {
         if (act == null) return;   // nothing to ask the StorageManager/reflection with right now: leave every record exactly as it is, try again next scan
         Set<String> hiddenNow = new HashSet<>();
         Set<String> seenThisPass = new HashSet<>();
+        int candidates = 0;
         for (Upstream.Entry e : list) {
             String gameDir = e.gameDir;
             if (gameDir == null || gameDir.isEmpty()) continue;
             seenThisPass.add(gameDir);
             if (new File(gameDir).exists()) { missingSince.remove(gameDir); continue; }   // plainly there: clear any stale bookkeeping, nothing to hide
+            candidates++;
             Boolean mounted = volumeMounted(act, gameDir);
             if (mounted == null) continue;   // cannot tell: leave the record and its card exactly as they are, try again next scan
             if (!mounted) { hiddenNow.add(gameDir); continue; }   // its volume is not plugged in right now: hide at once, no 60-second gate needed
             // the volume is mounted, so !exists() is actually worth asking about -- but only with the gates above, never on !exists() alone
             if (pickedNupStandIn(act, gameDir)) { missingSince.remove(gameDir); continue; }
             if (!readableOutsideApp(act, gameDir)) { missingSince.remove(gameDir); continue; }
-            if (!confirmedAbsent(gameDir)) { missingSince.remove(gameDir); continue; }
+            if (!confirmedAbsent(act, gameDir)) { missingSince.remove(gameDir); continue; }
             long now = System.currentTimeMillis();
             Long since = missingSince.putIfAbsent(gameDir, now);
             if (since != null && now - since >= 60_000L) hiddenNow.add(gameDir);   // confirmed absent on two scans at least 60 s apart: hide, never remove
@@ -286,6 +327,7 @@ public final class Library {
         missingSince.keySet().retainAll(seenThisPass);   // an entry gone from upstream's list some other way (the user removed it themselves, etc.) drops its bookkeeping too
         hiddenUnmounted.clear();
         hiddenUnmounted.addAll(hiddenNow);
+        Log.i("peanuts", "[library] stale check: " + candidates + " candidates, " + hiddenNow.size() + " hidden");
     }
 
     /** Whether path is on a volume Android currently lists (internal storage, or a mounted SD/USB); null when this cannot be told (no StorageManager, or
@@ -335,18 +377,55 @@ public final class Library {
         } catch (Throwable t) { return false; }
     }
 
-    /** Positive proof the file is gone (critique-phase2c §A-1), not merely {@code !exists()}: the parent folder itself resolves and can be listed
-     *  ({@code list()} non-null — a permission problem or a transient provider hiccup gives null, not an empty array, so that case is "no proof"
-     *  too), and the file's own name is not among its entries */
-    private static boolean confirmedAbsent(String gameDir) {
-        File f = new File(gameDir);
-        File parent = f.getParentFile();
-        if (parent == null) return false;
-        String[] names = parent.list();
+    /**
+     * Positive proof the file is gone, not merely {@code !exists()}. Round 4 required the immediate parent to exist, which misses the common case
+     * (confirmed on the Thor, round 5): the whole game folder is deleted along with the file, e.g. ".../ROMs/switch/OCTOPATH TRAVELER 0/OCTOPATH
+     * TRAVELER 0.nup" where "OCTOPATH TRAVELER 0/" is gone too, not just the .nup — the immediate parent can never be listed, so the old check always
+     * returned "no proof" and the card never hid. This instead walks up to the nearest existing ancestor and requires two extra things of it:
+     * <ol>
+     * <li>it must be listable ({@code list()} non-null — a permission problem or a provider hiccup gives null, not an empty array, so that is still
+     *     "no proof"), and must not contain the next path component down (the first one that is missing);</li>
+     * <li>it must still be on the same mounted volume as the original path (re-checked at the ancestor's own level, since walking up far enough
+     *     could in principle cross onto a different volume on some setups), and it must <b>not be the volume's root itself</b> — an unmounted or
+     *     not-yet-mounted removable volume can present its mount point as an existing, empty, listable directory, which would otherwise "confirm"
+     *     every game on that volume as gone the moment it is unplugged, before {@link #volumeMounted} even gets a chance to say so.</li>
+     * </ol>
+     */
+    private static boolean confirmedAbsent(Context ctx, String gameDir) {
+        File missing = new File(gameDir);
+        File ancestor = missing.getParentFile();
+        File child = missing;
+        while (ancestor != null && !ancestor.isDirectory()) {
+            child = ancestor;
+            ancestor = ancestor.getParentFile();
+        }
+        if (ancestor == null) return false;   // walked all the way to the root with nothing existing: no proof
+        String[] names = ancestor.list();
         if (names == null) return false;
-        String want = f.getName();
-        for (String n : names) if (n.equals(want)) return false;
+        String nextComponent = child.getName();
+        for (String n : names) if (n.equals(nextComponent)) return false;   // the next step down IS there after all: not proof
+        Boolean mounted = volumeMounted(ctx, ancestor.getPath());
+        if (mounted == null || !mounted) return false;
+        if (isVolumeRoot(ctx, ancestor)) return false;
         return true;
+    }
+
+    /** Whether dir is exactly a currently-listed volume's own root (not a folder inside one) — an unmounted/not-yet-mounted removable volume can
+     *  present its mount point this way, so {@link #confirmedAbsent} must never treat that bare root as proof of anything missing under it. An
+     *  exception defaults to true ("assume it is the root"), the reading that only ever costs a missed hide, never a wrong one */
+    private static boolean isVolumeRoot(Context ctx, File dir) {
+        try {
+            StorageManager sm = ctx.getSystemService(StorageManager.class);
+            if (sm == null) return true;
+            String path = dir.getCanonicalPath();
+            for (StorageVolume v : sm.getStorageVolumes()) {
+                File d = v.getDirectory();
+                if (d != null && path.equals(d.getCanonicalPath())) return true;
+            }
+            return false;
+        } catch (RuntimeException | java.io.IOException e) {
+            return true;
+        }
     }
 
     private static final Map<String, String> canon = new HashMap<>();   // path → canonical path (a render compares every listed game with every scanned one)

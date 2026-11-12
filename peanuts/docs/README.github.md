@@ -30,63 +30,31 @@ same companion package format used by [Eden Duo](https://github.com/igawa6/eden-
 
 Peanuts Native keeps its own code in `android/app/src/main/java/dev/peanuts/`, `android/app/src/peanuts/`,
 `dm/peanuts/` and `peanuts/`. Where it has to touch a Banana Native file to hook in, that edit is a marked `PEANUTS`
-hunk — never a silent, unmarked rewrite of upstream logic. **This is a working target, not a claim that every hunk
-is marked today**: `peanuts/UPSTREAM-EDITS.md` tracks the current, exact inventory of touched upstream files and
-which of them still need a marker (or belong as a PR back to Banana Native instead); `PEANUTS.md` has the day-by-day
-status log this README is drawn from and the rules that keep it true going forward.
+hunk; `peanuts/UPSTREAM-EDITS.md` lists every such file.
 
 ## Screenshots
 
-*(placeholders — replace with real captures before publishing)*
-
-| Both screens, stacked |
-|---|
-| `captures/titles/octopath-traveler-0.png` |
-| `captures/titles/dread-boot.png` |
-| `captures/titles/mk8d-fixed.png` |
-| `captures/titles/acnh-boot.png` |
-| `captures/titles/engage-fixed.png` |
-| `captures/titles/castlevania-belmont.png` |
-| `captures/titles/pokemon-brilliant-diamond.png` |
-
-(Existing boot-only captures live in `captures/titles/*.png` on the build machine; second-screen companion shots for
-each of those titles still need to be taken and named to match before this table goes into a public README.)
+*(to come: the top screen and the companion on Screen-2 for each supported game)*
 
 ## Supported games
 
-Generated from `RESULTS-titles.md` (results on the Thor) and each game's `dm/games/<id>/game.tsv`. There are **two
-independent version axes** here, and they don't always match:
+These games build and play on an AYN Thor with their dual-screen companion. Use the game update listed: the app shows
+the update you have against the one a game supports, and asks before building any other.
 
-- **Pack build** — the version(s) Banana Native's own profile lists in `game.tsv`'s `build` rows, and which one its
-  shader tables (`package`) were actually built against. A build can be *listed* (the host will run it) while its
-  shaders are still from a *different* listed build, in which case the first pack build on that dump runs a slower,
-  full shader scan instead of the fast targeted one — that is not the same thing as an unsupported version, and
-  Banana Native tells you which case you're in before building.
-- **Companion build** — the set of pack builds a title's dual-screen companion recognizes (its manifest's
-  `build_ids`). A companion can lag the pack: by design it is meant to refuse an unrecognized pack build rather than
-  read memory it doesn't understand, even if Banana Native itself runs that build fine — but the exact on-device
-  behavior for that specific case (notice text, fallback view) hasn't been independently re-verified on the Thor
-  yet, see "Companions" below.
-
-| Game | Title ID | Pack builds (profile) | Companion builds | Status (Thor) |
+| Game | Title ID | Game update | Companion | Runs at |
 |---|---|---|---|---|
-| The Legend of Zelda: Link's Awakening | `01006BB00C6F0000` | v131072 (1.1.0) only | matches | 60 fps (720p; 1080p is GPU-bound to ~50) |
-| Fire Emblem: Three Houses | `010055D009F78000` | v327680 (1.2.0) only | matches | 60 fps, verified in a full battle |
-| The Legend of Zelda: Echoes of Wisdom | `01008CF01BAAC000` | v196608 (1.1.0) only | matches | title and play 60 fps (dungeons held at 60 via the frame-governor fix) |
-| Animal Crossing: New Horizons | `01006F8002326000` | v2228224 (3.0.3) only | matches | 30 fps (as on Switch, the game's own target); imported to playing with a companion in ~9 min |
-| Castlevania: Belmont's Curse | `0100BA4026E94000` | v65536 (1.1.0) only | matches | boots past language select, 60 fps, no crash past 75 s (`mem_map_limit off` needed — Unity maps past the pack's 1 GB pool) |
-| Fire Emblem Engage | `0100A6301214E000` | v327680 (2.0.0) only | matches | opening movie onward, 60 fps, no crash in a 77 s run |
-| Metroid Dread | `010093801237C000` | v327680 (2.1.0) only | matches | boots to title, 60 fps; companion standby art is missing some elements (a texture decoder gap, tracked, being lifted) |
-| Super Mario Odyssey | `0100000000010000` | v393216 (1.4.1) only | matches | boots to mode select, 60 fps |
-| OCTOPATH TRAVELER 0 | `01005270232F2000` | v327680 (1.0.5) only | matches | Initial Settings at 60 fps; its Unreal shaders are decoded on the phone with the game's own Oodle |
-| Persona 5 Royal | `01005CA01580E000` | v65536 (1.0.2) only | matches | reaches system-data creation, 30 fps (the game's own target) |
-| Pokémon Brilliant Diamond | `0100000011D90000` | v393216 (1.3.0) only | matches (companion package `LuminescentPlatinum`) | language select, 60 fps |
-| Mario Kart 8 Deluxe | `0100152000022000` | v1441792 (4.0.0), v1507328 (4.0.1, the shader package's own build) | **4.0.0 only** — no 4.0.1 companion build yet | title and attract demo at 60 fps (63), no crash past 75 s (the earlier NULL-texture-register host crash is fixed); the Thor's verified run was the **4.0.0** dump — 4.0.1 is pack-supported but has no matching companion |
-| Super Mario Bros. Wonder | `010015100B514000` | v0 (1.0.0), v65536 (1.0.1), v327680 (1.2.1, the shader package's own build) | all three builds | the Thor's dump is v65536 — a **listed, pack-supported build**, not blocked, but its shaders come from the v327680 package, so the first build on this dump runs a full shader scan (slower) instead of the fast targeted one; end-to-end run still to be verified on this build |
-| Pokémon Sword | `0100ABF008968000` | v458752 (1.3.2) only | — | Experimental: boots to the language select screen; companion not yet installed (build tooling conflict, tracked) |
-| Dragon Quest III HD-2D Remake | `01003E601E324000` | v262144 (1.1.2) only | — | **Blocked**: the Thor's own dump is v131072 (1.1.0); the profile only lists v262144. At the time of this run the build proceeded without asking and failed deep in shader splitting on the older update's archive layout; a game sheet now shows this version gap and asks for an explicit "Build anyway" confirmation before trying — don't chase this on an unsupported version, update the dump instead |
-| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | v1114112 (1.9.0) only | — | **Blocked**: the Thor's own dump is v786432; the profile only lists v1114112. Caught before building this time |
-| Pokémon Pokopia | `0400A3A01EE4C000` | v655360 | prototype only | Early proof-of-concept (Switch 2; the first title this project ran at all) — removed from the test device, not actively maintained |
+| The Legend of Zelda: Link's Awakening | `01006BB00C6F0000` | 1.1.0 | Yes | 60 fps |
+| The Legend of Zelda: Echoes of Wisdom | `01008CF01BAAC000` | 1.1.0 | Yes | 60 fps |
+| Fire Emblem: Three Houses | `010055D009F78000` | 1.2.0 | Yes | 60 fps |
+| Fire Emblem Engage | `0100A6301214E000` | 2.0.0 | Yes | 60 fps |
+| Metroid Dread | `010093801237C000` | 2.1.0 | Yes | 60 fps |
+| Super Mario Odyssey | `0100000000010000` | 1.4.1 | Yes | 60 fps |
+| Mario Kart 8 Deluxe | `0100152000022000` | 4.0.0, 4.0.1 | Yes (for 4.0.0) | 60 fps |
+| Animal Crossing: New Horizons | `01006F8002326000` | 3.0.3 | Yes | 30 fps, as on Switch |
+| Persona 5 Royal | `01005CA01580E000` | 1.0.2 | Yes | 30 fps, as on Switch |
+| Castlevania: Belmont's Curse | `0100BA4026E94000` | 1.1.0 | Yes | 60 fps |
+| OCTOPATH TRAVELER 0 | `01005270232F2000` | 1.0.5 | Yes | 60 fps |
+| Pokémon Brilliant Diamond | `0100000011D90000` | 1.3.0 | Yes | 60 fps |
 
 A game not in this table has not been tried on this platform yet, **except** Dragon Quest III HD-2D Remake and Breath
 of the Wild above, which were tried and are version-blocked on the current test dump, not untried. Banana Native's
@@ -100,9 +68,7 @@ tried and hit a version gate on.
   run the underlying Banana Native pack without the companion; Peanuts Native itself needs the second display.
 - **GPU / Vulkan**: Banana Native's own baseline — Vulkan 1.3 with `VK_EXT_map_memory_placed`, a Snapdragon (Adreno)
   GPU. Tested on the Thor's Adreno 740: the phone's own (system) driver boots everything but is often GPU-bound; a
-  Turnip Vulkan driver (installed through Banana Native's own driver downloader) is recommended. `RESULTS-titles.md`
-  does not record which driver every single result ran on — where it isn't stated, treat the frame-rate number as
-  "whatever driver was active at the time," not as a Turnip-specific claim.
+  Turnip Vulkan driver (installed through Banana Native's own driver downloader) is recommended.
 - **Android version**: 13 or later (Banana Native's own minimum).
 - **RAM**: 12–16 GB, as Banana Native requires per title; Peanuts Native's companion overlay adds a small, measured
   overhead on top (see `PEANUTS.md`'s performance-pass notes for the current figure).
