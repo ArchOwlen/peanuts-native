@@ -68,6 +68,8 @@
 #   containers only, not whole (direct_targets, direct_file); its tables must still be the profile's, else the targeted scan of the whole files follows (log: 'direct split: ...')
 # Memory: the shaders are deduplicated by key as they are found (Shaders), and a large compressed container is inflated into a temporary file rather than memory (idrk_shaders); a file of
 #   RomFS over LARGE bytes prints 'progress: <done>/<total> <n>%' as it is read, when the scan runs in this process (J=1)
+#   Environment DM_SPLIT_WORKER=<command> (the phone's split, PackService): the pool's workers (J > 1) are processes of that command, which runs Python as `python3 -c` does, fed over pipes
+#   (split_pool.py; the phone's Python has no python executable and no _multiprocessing: dm/peanuts/pack_worker's nxpack_worker through /system/bin/linker64); unset, concurrent.futures' process pool
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
 import base64, collections, concurrent.futures as cf, hashlib, json, os, pickle, re, struct, subprocess, sys, time, zlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
@@ -3109,7 +3111,17 @@ class InProcess:
     def map(self, fn, it): return map(fn, it)
 
 def pool(J, *initargs):
-    """The scan's workers: J processes, or this process when J is 1 (InProcess)"""
+    """The scan's workers: J processes, or this process when J is 1 (InProcess). DM_SPLIT_WORKER=<command> (the phone's split, PackService): the workers are
+    processes of that command, which runs Python as `python3 -c` does, over pipes (split_pool.py: the phone's Python has no python executable and no
+    _multiprocessing); workers that do not come up leave the scan in this process, with one line saying why"""
+    if J > 1 and (cmd := os.environ.get('DM_SPLIT_WORKER')):
+        import shlex, split_pool
+        try:
+            fd, sep, _ = os.environ.get('DM_NUP_FD', '').partition(':')   # a .nup read through a descriptor of this process (nup.py): the workers read it through the same one
+            return split_pool.PipePool(shlex.split(cmd), J, os.path.abspath(__file__), _pool_init, initargs, pass_fds=(int(fd),) if sep and fd.isdigit() else ())
+        except (OSError, RuntimeError, pickle.PickleError, ValueError) as e:
+            print(f'split: the pool workers did not start ({cmd}: {e}); the scan runs in this process (DM_SPLIT_WORKER)', flush=True)
+            J = 1
     return cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=initargs) if J > 1 else InProcess(_pool_init, initargs)
 
 class ScanCache:

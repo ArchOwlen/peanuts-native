@@ -14,6 +14,7 @@
 #     lib/libpython3.14.so, libnxpack.so, libzbicdec.so, libdmsh_xlate.so, libSPIRV-Tools-shared.so   arm64-v8a jniLibs the APK packs
 #     python/lib/python3.14/            the Python home: stdlib + lib-dynload/, site-packages/capstone (+ lib/libcapstone.so), site-packages/lz4
 #     bin/dm_pack_cli                   adb shell test runner (not packed into the APK)
+#     python/bin/nxpack_worker          PEANUTS: shader_split.py's pool worker on the phone (dm/peanuts/pack_worker; goes into python.zip with the Python home)
 #
 # Usage: peanuts/scripts/ondevice-stage.sh <work dir> [all|python|tools|zbic]   (default all; same WHAT values as android/ondevice/build.sh)
 #   ANDROID_NDK_HOME must already point at the NDK (e.g. ~/android-sdk/ndk/28.2.13676358). Put <work dir> outside the repo (downloads + build intermediates).
@@ -27,4 +28,5 @@ command -v zsh >/dev/null || { echo "[RED] zsh is required (upstream's build.sh 
 
 export MSBuildEnableWorkloadResolver=false   # this machine's dotnet SDK has broken workload manifests; see header comment
 
-exec zsh "$REPO/android/ondevice/build.sh" "$@"
+zsh "$REPO/android/ondevice/build.sh" "$@"
+sh "$REPO/dm/peanuts/pack_worker/build.sh" "$1/stage" "$1/py/prefix/include/python3.14"   # PEANUTS hook: nxpack_worker into stage/python/bin (shader_split.py's pool workers on the phone)
