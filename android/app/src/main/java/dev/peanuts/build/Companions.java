@@ -86,11 +86,15 @@ public final class Companions {
     }
 
     /** Installer.repair(root, package): completes or rolls back a swap a killed process left half-done (no single app-startup hook reaches dev.peanuts from
-     * here, so this is called opportunistically wherever a package is touched - CompanionSection's refreshInstalled() calls it) */
-    public static void repair(File root, String packageName) {
+     * here, so this is called opportunistically wherever a package is touched - CompanionSection's refreshInstalled() calls it). Kept for callers with no
+     * Context (never skips for a running game). */
+    public static void repair(File root, String packageName) { repair(root, packageName, null); }
+
+    /** As above, plus ctx (nullable): skips entirely while this app's own game process is running - see dev.peanuts.ui.CompanionPort's matching overload */
+    public static void repair(File root, String packageName, Context ctx) {
         if (root == null) return;
         try {
-            call(Class.forName(INSTALLER), "repair", new Class<?>[] {File.class, String.class}, root, packageName);
+            call(Class.forName(INSTALLER), "repair", new Class<?>[] {File.class, String.class, Context.class}, root, packageName, ctx);
         } catch (ReflectiveOperationException | RuntimeException e) {
             // best effort; the next install()/activateLocalVersion() retries it anyway
         }

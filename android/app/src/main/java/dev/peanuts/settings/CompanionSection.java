@@ -115,7 +115,7 @@ public final class CompanionSection {
         void refreshInstalled(Companions.Item item) {
             // Self-heal before reading anything: a killed install/switch is completed or rolled back here, never left with no active companion. The package
             // name to repair can only come from the catalog item at this point (a fully-vanished active folder has no package.json for installed() to find).
-            if (item != null) Companions.repair(root, item.packageName);
+            if (item != null) Companions.repair(root, item.packageName, c);   // ctx = c: skips while the game is running (the lock alone does not cover that - CRITIQUE-phase2d.md B-2)
             List<String> installed = Companions.installed(root);
             installedPkg = item != null ? item.packageName : installed.isEmpty() ? null : installed.get(0);
             installedVersion = installedPkg == null ? null : Companions.installedVersion(root, installedPkg);

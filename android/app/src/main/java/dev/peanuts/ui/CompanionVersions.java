@@ -107,7 +107,7 @@ public final class CompanionVersions {
                     v = filtered;
                 }
                 if (pkg != null && r != null) {
-                    CompanionPort.repair(r, pkg);   // self-heal a half-done swap before reading any state, not only before the next install/switch
+                    CompanionPort.repair(r, pkg, act);   // self-heal a half-done swap before reading any state, not only before the next install/switch; ctx = act so this skips while the game is running (the lock alone does not cover that - CRITIQUE-phase2d.md B-2)
                     lv = CompanionPort.localVersions(r, pkg);
                     active = CompanionPort.installedVersion(r, pkg);
                     if ("?".equals(active)) active = null;   // a package.json with no installed.json: not a version this sheet can act on

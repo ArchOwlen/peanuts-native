@@ -120,7 +120,7 @@ public final class Installer {
             try {
                 download(item.url, zip, item.size, progress);
                 verify(zip, item, progress);   // throws on a mismatch or a missing digest - never "installs as unverified"
-                return extractAndActivate(zip, item.titleId, item.packageName, item.version, item.tag, item.url, root, knownBuildId, progress);
+                return extractAndActivate(zip, item.titleId, item.packageName, item.version, item.tag, item.url, root, knownBuildId, ctx, progress);
             } finally {
                 zip.delete();
             }
@@ -150,6 +150,7 @@ public final class Installer {
             if (!src.isDirectory()) throw new IOException(packageName + " " + version + " is not on this device");
             refuseIfIncompatible(src);
             String warning = buildIdWarning(src, knownBuildId);
+            refuseIfGameRunning(ctx);   // re-check right before the swap (CRITIQUE-phase2d.md B-1): this window is tiny, but still a window
             swap(root, packageName, src, version);
             return warning;
         } finally {
@@ -320,7 +321,7 @@ public final class Installer {
         } finally { c.disconnect(); }
     }
 
-    private static String extractAndActivate(File zip, String titleId, String packageName, String version, String tag, String url, File root, String knownBuildId, Progress progress) throws IOException {
+    private static String extractAndActivate(File zip, String titleId, String packageName, String version, String tag, String url, File root, String knownBuildId, Context ctx, Progress progress) throws IOException {
         File fresh = new File(root, packageName + ".new");
         delete(fresh);
         if (!fresh.mkdirs()) throw new IOException("cannot create " + fresh);
@@ -335,6 +336,10 @@ public final class Installer {
             try (OutputStream o = new FileOutputStream(new File(fresh, "installed.json"))) {
                 o.write(new JSONObject().put("version", version).put("tag", tag).put("url", url).put("verified", true).toString(2).getBytes(StandardCharsets.UTF_8));
             }
+            // CRITIQUE-phase2d.md B-1: the game-running check at install()'s entry only covers the moment the download started; download+verify+extract
+            // above can take minutes, long enough for the user to start the game in the meantime. Re-check right before the swap, which is the actual
+            // hazard, rather than trust a check that is now stale.
+            refuseIfGameRunning(ctx);
             swap(root, packageName, fresh, version);
             return warning;
         } catch (org.json.JSONException e) {
@@ -387,15 +392,27 @@ public final class Installer {
     }
 
     /** Self-heal entry point for callers outside an install/switch/remove - dev.peanuts.ui.CompanionVersions.load() and dev.peanuts.settings.CompanionSection
-     * call this when their screen opens, on their own worker thread, so a half-done swap is noticed without waiting for the next install. CRITIQUE-phase2b.md
-     * §B: this must never run while install()/activateLocalVersion()/remove()/forgetLocalVersion() holds the package's lock - repair()'s delete(newSlot)
-     * could otherwise wipe a half-extracted ".new" an install() is still writing into, or restore ".old" mid-swap and make that swap's own "the previous
-     * version is safely parked" error lie. tryLock(): if the package is busy, this is a no-op - the operation holding the lock will finish the job itself
-     * (install()/activateLocalVersion() call {@link #repairLocked} directly, under the same lock, before doing anything else). */
-    public static void repair(File root, String packageName) {
+     * call this when their screen opens, on their own worker thread, so a half-done swap is noticed without waiting for the next install. Kept for callers
+     * with no Context (never skips for a running game - see the Context overload below for why that matters). */
+    public static void repair(File root, String packageName) { repair(root, packageName, null); }
+
+    /** As above, plus ctx (nullable). Two separate guards apply, for two different reasons:
+     * <ul>
+     * <li>tryLock(): this must never run while install()/activateLocalVersion()/remove()/forgetLocalVersion() holds the package's lock - repair()'s
+     * delete(newSlot) could otherwise wipe a half-extracted ".new" an install() is still writing into, or restore ".old" mid-swap and make that swap's own
+     * "the previous version is safely parked" error lie. If the package is busy, this is a no-op - the operation holding the lock will finish the job
+     * itself (install()/activateLocalVersion() call {@link #repairLocked} directly, under the same lock, before doing anything else).</li>
+     * <li>gameRunning(ctx): the lock above only serializes repair with another Installer call on this process - it says nothing about whether the game is
+     * open. A kill mid-swap can leave no active folder, after which peanuts.c's own fallback runs the host from the parked ".old"; if the game is then
+     * started from that state and the user opens CompanionSection or the Versions sheet, repair() would rename ".old" to active (or archive it) right
+     * out from under the running host. Skip entirely while a game is running, same as install()/activateLocalVersion()/remove() refuse outright - the
+     * fallback in peanuts.c is enough until the game closes and repair() can run safely.</li>
+     * </ul> */
+    public static void repair(File root, String packageName, Context ctx) {
         ReentrantLock lock = lockFor(packageName);
         if (!lock.tryLock()) return;
         try {
+            if (gameRunning(ctx)) return;
             repairLocked(root, packageName);
         } finally {
             lock.unlock();

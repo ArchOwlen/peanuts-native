@@ -202,12 +202,17 @@ final class CompanionPort {
     }
 
     /** Installer.repair(root, package): completes or rolls back a swap a killed process left half-done. Called before any install/switch already, and also
-     * from CompanionVersions.load()/CompanionSection so a half-done swap self-heals as soon as either screen is opened */
-    static void repair(File root, String packageName) {
+     * from CompanionVersions.load()/CompanionSection so a half-done swap self-heals as soon as either screen is opened. Kept for callers with no Context
+     * (never skips for a running game). */
+    static void repair(File root, String packageName) { repair(root, packageName, null); }
+
+    /** As above, plus ctx (nullable): skips entirely while this app's own game process is running - the lock alone does not stop repair() from touching a
+     * package the host currently has open from a parked ".old" (peanuts.c's fallback). */
+    static void repair(File root, String packageName, Context ctx) {
         if (root == null) return;
         try {
-            Method m = Class.forName(INSTALLER).getDeclaredMethod("repair", File.class, String.class); m.setAccessible(true);
-            m.invoke(null, root, packageName);
+            Method m = Class.forName(INSTALLER).getDeclaredMethod("repair", File.class, String.class, Context.class); m.setAccessible(true);
+            m.invoke(null, root, packageName, ctx);
         } catch (Throwable t) { Log.w("peanuts", "repair: " + cause(t)); }
     }
 
