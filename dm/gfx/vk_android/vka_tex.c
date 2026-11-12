@@ -2523,6 +2523,7 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     // texture viewed through a registration whose target was overridden to 2D for one Z slice: it read as unbound instead of that slice)
     if (vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY) return VK_NULL_HANDLE;   // no 1D images (img_create)
     if (img3d ? (vt != VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) : vt == VK_IMAGE_VIEW_TYPE_3D) return VK_NULL_HANDLE;
+    if (img3d && vt != VK_IMAGE_VIEW_TYPE_3D) nl = 1;   // PEANUTS: a slice view of a 3D image is one level (Vulkan: levelCount 1 for a 2D/2D-array view of a 3D image)
     if (vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
         if (im->w != im->h || im->layers < 6 || im->layers % 6 || im->samples > 1 || na < 6) return VK_NULL_HANDLE;
         if (vt == VK_IMAGE_VIEW_TYPE_CUBE) na = 6; else na -= na % 6;

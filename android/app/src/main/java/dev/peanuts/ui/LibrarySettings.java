@@ -217,5 +217,5 @@ public final class LibrarySettings {
         }, "peanuts-fonts").start();
     }
 
-    private static void error(Activity a, String msg) { new AlertDialog.Builder(a).setTitle("Library").setMessage(msg).setPositiveButton("OK", null).show(); }
+    private static void error(Activity a, String msg) { if (a.isFinishing() || a.isDestroyed()) return; new AlertDialog.Builder(a).setTitle("Library").setMessage(msg).setPositiveButton("OK", null).show(); }
 }

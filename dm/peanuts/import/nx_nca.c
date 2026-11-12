@@ -251,7 +251,7 @@ static int sparse_load(NxNca *n, int s, const uint8_t *fh) {
         uint8_t tmpl[16]; memcpy(tmpl, S->ctr, 16); uint32_t g = (uint32_t)gen << 16; for (int j = 0; j < 4; j++) { tmpl[7 - j] = (uint8_t)g; g >>= 8; }
         if (S->crypt_type == 1 ? nx_pread_all(n->fd, tb, (size_t)tsize, n->base_off + pbase + toff) : ctr_read(n, tmpl, pbase + toff, tb, (size_t)tsize)) goto fail;
         uint32_t nb = u32(tb + 4); uint64_t total = u64(tb + 8);
-        if (nb == 0 || (uint64_t)0x4000 * (nb + 1) > tsize) NX_FAIL("%s: section %d: bad sparse table (%u entry sets; wrong key or counter?)", n->id, s, nb);
+        if (nb == 0 || 0x4000 * ((uint64_t)nb + 1) > tsize) NX_FAIL("%s: section %d: bad sparse table (%u entry sets; wrong key or counter?)", n->id, s, nb);
         for (uint32_t i = 0; i < nb; i++) {
             const uint8_t *bk = tb + 0x4000 * (i + 1); uint32_t ne = u32(bk + 4); uint64_t vend = u64(bk + 8);
             if (ne > 0x3FF0 / 0x14) NX_FAIL("%s: section %d: bad sparse entry set %u", n->id, s, i);
@@ -297,7 +297,7 @@ int nx_nca_set_base(NxNca *p, int s, NxNca *base, int base_sec) {
     if (getenv("NX_DEBUG")) { fprintf(stderr, "nximport: %s BKTR reloc @%#llx+%#llx:", p->id, (unsigned long long)roff, (unsigned long long)rsize); for (int i = 0; i < 0x20; i++) fprintf(stderr, " %02x", rb[i]); fprintf(stderr, "\n  subsec @%#llx+%#llx:", (unsigned long long)soff, (unsigned long long)ssize); for (int i = 0; i < 0x20; i++) fprintf(stderr, " %02x", sb[i]); fprintf(stderr, "\n"); }
     // relocation block: header 0x4000 (num_buckets @4, total_size @8, bucket virtual offsets @0x10), buckets 0x4000 each (num_entries @4, virtual_offset_end @8, entries @0x10, 0x14 each)
     uint32_t nb = u32(rb + 4); b->total = u64(rb + 8);
-    if (nb == 0 || (uint64_t)0x4000 * (nb + 1) > rsize) NX_FAIL("%s: bad relocation block", p->id);
+    if (nb == 0 || 0x4000 * ((uint64_t)nb + 1) > rsize) NX_FAIL("%s: bad relocation block", p->id);
     for (uint32_t i = 0; i < nb; i++) {
         const uint8_t *bk = rb + 0x4000 * (i + 1); uint32_t ne = u32(bk + 4); uint64_t vend = u64(bk + 8);
         if (ne > 0x3FF0 / 0x14) NX_FAIL("%s: bad relocation bucket", p->id);
@@ -309,7 +309,7 @@ int nx_nca_set_base(NxNca *p, int s, NxNca *base, int base_sec) {
     if (b->nr) b->r[b->nr - 1].end = b->total;
     // subsection block: same shape, entries 0x10 each (offset @0, ctr_val @0xC); the region after the data (the tables) uses the section's own counter
     nb = u32(sb + 4);
-    if (nb == 0 || (uint64_t)0x4000 * (nb + 1) > ssize) NX_FAIL("%s: bad subsection block", p->id);
+    if (nb == 0 || 0x4000 * ((uint64_t)nb + 1) > ssize) NX_FAIL("%s: bad subsection block", p->id);
     uint64_t data_end = u64(sb + 8);   // the patch data's end: the relocation table's offset (newer NCAs) or the subsection's (hactool's check)
     if (data_end != roff && data_end != soff) NX_FAIL("%s: the subsection block's size does not match the tables", p->id);
     for (uint32_t i = 0; i < nb; i++) {
@@ -544,7 +544,7 @@ int nx_nca_open(NxNca *n, const NxContainer *c, const NxEntry *e) {
         static const uint8_t zero48[0x58];
         if (memcmp(fh + 0x148, zero48, 0x30) && sparse_load(n, i, fh)) { nx_nca_close(n); return -1; }   // PEANUTS: a sparse section (sparse_load; was "not supported")
         if (memcmp(fh + 0x178, zero48, 0x28)) {   // CompressionInfo: the table is read on the first read of the section (comp_load)
-            if (memcmp(fh + 0x188, "BKTR", 4) || u32(fh + 0x18C) != 1) { nx_err("%s: section %d: bad compression table header", n->id, i); return -1; }
+            if (memcmp(fh + 0x188, "BKTR", 4) || u32(fh + 0x18C) != 1) { nx_err("%s: section %d: bad compression table header", n->id, i); nx_nca_close(n); return -1; }
             S->compressed = 1;
         }
         if (S->fs_type == NX_FS_PFS0) S->data_off = u64(fh + 0x40);               // PFS0 superblock (at +8): master hash 0x20, block size, 2, hash table offset/size, pfs0_offset @+0x38
@@ -624,19 +624,19 @@ fail:
 typedef struct { NxNca *n; int s; uint8_t *dm, *fm; uint64_t dms, fms, data; } RomCtx;
 static int romfs_walk(RomCtx *c, NxNode *dir, uint32_t d, int depth) {
     if (depth > 64) { nx_err("RomFS too deep"); return -1; }
-    if (d + 0x18 > c->dms) { nx_err("RomFS directory entry out of range"); return -1; }
+    if ((uint64_t)d + 0x18 > c->dms) { nx_err("RomFS directory entry out of range"); return -1; }
     const uint8_t *e = c->dm + d; uint32_t child = u32(e + 8), file = u32(e + 12);
     while (file != 0xFFFFFFFFu) {
-        if (file + 0x20 > c->fms) { nx_err("RomFS file entry out of range"); return -1; }
-        const uint8_t *f = c->fm + file; uint32_t nl = u32(f + 0x1C); if (file + 0x20 + nl > c->fms) { nx_err("RomFS file name out of range"); return -1; }
+        if ((uint64_t)file + 0x20 > c->fms) { nx_err("RomFS file entry out of range"); return -1; }
+        const uint8_t *f = c->fm + file; uint32_t nl = u32(f + 0x1C); if ((uint64_t)file + 0x20 + nl > c->fms) { nx_err("RomFS file name out of range"); return -1; }
         NxNode *k = nx_node_new((const char *)f + 0x20, nl, 0); if (!k) { nx_err("out of memory"); return -1; }
         k->nca = c->n; k->sec = c->s; k->off = c->data + u64(f + 8); k->size = u64(f + 16);
         if (!nx_node_add(dir, k)) { nx_node_free(k); return -1; }
         file = u32(f + 4);
     }
     while (child != 0xFFFFFFFFu) {
-        if (child + 0x18 > c->dms) { nx_err("RomFS directory entry out of range"); return -1; }
-        const uint8_t *s = c->dm + child; uint32_t nl = u32(s + 0x14); if (child + 0x18 + nl > c->dms) { nx_err("RomFS directory name out of range"); return -1; }
+        if ((uint64_t)child + 0x18 > c->dms) { nx_err("RomFS directory entry out of range"); return -1; }
+        const uint8_t *s = c->dm + child; uint32_t nl = u32(s + 0x14); if ((uint64_t)child + 0x18 + nl > c->dms) { nx_err("RomFS directory name out of range"); return -1; }
         NxNode *k = nx_node_new((const char *)s + 0x18, nl, 1); if (!k) { nx_err("out of memory"); return -1; }
         if (!nx_node_add(dir, k)) { nx_node_free(k); return -1; }
         if (romfs_walk(c, k, child, depth + 1)) return -1;

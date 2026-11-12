@@ -59,7 +59,7 @@ public final class GenericProfile {
         // copied on every start: a few KB, and dev builds share one versionCode, so any "already copied" key could keep a stale profile after a reinstall
         File dest = new File(dir, name);
         new File(dir, name + ".ver").delete();   // the key file of an earlier build of this class
-        File tmp = new File(dir, name + ".tmp");
+        File tmp = new File(dir, name + "." + android.os.Process.myPid() + ".tmp");   // per process: the build service and the game may both copy it at once
         try (InputStream in = am.open(assetPath); OutputStream o = new FileOutputStream(tmp)) {
             byte[] buf = new byte[65536]; int n;
             while ((n = in.read(buf)) > 0) o.write(buf, 0, n);

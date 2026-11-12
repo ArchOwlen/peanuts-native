@@ -185,9 +185,18 @@ public final class CompanionSection {
         void remove(String pkg) {
             new AlertDialog.Builder(c).setTitle("Remove the companion?").setMessage(pkg + " is deleted from the game's folder. The catalog can install it again.")
                     .setPositiveButton("Remove", (d, w) -> {
-                        try { Companions.remove(root, pkg, c); Toast.makeText(c, "Removed", Toast.LENGTH_SHORT).show(); } catch (IOException e) { Toast.makeText(c, "Remove failed: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
-                        installedKnown = false;
-                        render();
+                        // off the UI thread: the delete walks shared storage and waits for the package's lock (an install of it may be downloading)
+                        Handler mainUi = new Handler(Looper.getMainLooper());
+                        new Thread(() -> {
+                            String err = null;
+                            try { Companions.remove(root, pkg, c); } catch (IOException | RuntimeException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
+                            final String ferr = err;
+                            mainUi.post(() -> {
+                                Toast.makeText(c, ferr == null ? "Removed" : "Remove failed: " + ferr, ferr == null ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+                                installedKnown = false;
+                                render();
+                            });
+                        }, "peanuts-companion-remove").start();
                     }).setNegativeButton("Cancel", null).show();
         }
     }

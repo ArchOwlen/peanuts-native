@@ -95,9 +95,17 @@ public final class CatalogActivity extends Activity {
             b.setOnClickListener(v -> {
                 if ("Remove".contentEquals(b.getText())) {
                     PUi.confirmDanger(this, "Remove the companion?", name + "'s companion is deleted from " + froot + ". The game and its saves stay.", "Remove", () -> {
-                        try { Installer.remove(froot, item.packageName, this); Toast.makeText(this, "Removed", Toast.LENGTH_SHORT).show(); }   // ctx = this: refuses while the game is running (CRITIQUE-phase2c.md §B)
-                        catch (java.io.IOException e) { Toast.makeText(this, "Remove failed: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
-                        render();
+                        new Thread(() -> {   // off the UI thread: the delete walks shared storage and waits for the package's lock
+                            String err = null;
+                            try { Installer.remove(froot, item.packageName, this); }   // ctx = this: refuses while the game is running (CRITIQUE-phase2c.md §B)
+                            catch (java.io.IOException | RuntimeException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
+                            final String ferr = err;
+                            ui.post(() -> {
+                                if (isFinishing() || isDestroyed()) return;
+                                Toast.makeText(this, ferr == null ? "Removed" : "Remove failed: " + ferr, ferr == null ? Toast.LENGTH_SHORT : Toast.LENGTH_LONG).show();
+                                render();
+                            });
+                        }, "peanuts-companion-remove").start();
                     });
                     return;
                 }
@@ -119,6 +127,7 @@ public final class CatalogActivity extends Activity {
             } catch (Exception e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
             final String ferr = err;
             ui.post(() -> {
+                if (isFinishing() || isDestroyed()) return;   // the screen closed during the download: no dialog on a gone window
                 if (ferr == null) { status.setText("Installed " + item.packageName + " " + item.version + " into " + root); Toast.makeText(this, "Start the game to use it", Toast.LENGTH_LONG).show(); }
                 else new AlertDialog.Builder(this).setTitle("Install failed").setMessage(ferr).setPositiveButton("OK", null).show();
                 render();

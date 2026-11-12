@@ -237,6 +237,7 @@ public final class CompanionVersions {
             } catch (IOException | RuntimeException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
             final String ferr = err; final String fwarning = warning;
             main.post(() -> {
+                if (act.isFinishing() || act.isDestroyed()) { busy = false; return; }   // the screen closed during the work: no dialog on a gone window
                 busy = false;
                 refreshLocalState();
                 if (ferr != null) Toast.makeText(act, "Failed: " + ferr, Toast.LENGTH_LONG).show();

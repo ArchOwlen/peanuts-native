@@ -88,6 +88,8 @@ final class RuntimeShaders {
         File dir = captureDir(work);
         if (captured(dir) >= need) return true;
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("Cannot make " + dir);
+        // A game already running (the player's, perhaps another title) would count as this capture's start, and endGame() would then end it, unsaved
+        if (gameAlive()) throw new IOException("A game is running. Close it, then tap Build again: the build starts " + game.getName() + " once to capture its shaders.");
         String line = ENV + "=" + dir.getPath();
         String before;
         try {

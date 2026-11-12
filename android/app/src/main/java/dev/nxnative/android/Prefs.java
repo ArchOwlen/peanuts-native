@@ -74,6 +74,8 @@ final class Prefs {
     /** PEANUTS: the Peanuts app's default Button mapping: the face buttons by name (A=A, B=B, X=X, Y=Y), i.e. A/B and X/Y swapped from the positional default; the editor changes it */
     static final String PEANUTS_PAD_MAP = "BUTTON_A=A,BUTTON_B=B,BUTTON_X=X,BUTTON_Y=Y";
     static void padMapDefault(Context c, String spec) { of(c).edit().putString("pad_map", spec == null ? "" : spec).commit(); }
+    /** PEANUTS: "Reset to default" forgets the saved mapping, so the app's own default applies again (the Peanuts app's named map; "" elsewhere, as before) */
+    static void padMapReset(Context c) { of(c).edit().remove("pad_map").commit(); }
     static String padMap(Context c, String titleId) { return of(c).getString(gameKey("pad_map", titleId), padMap(c)); }
     static boolean ownPadMap(Context c, String titleId) { return of(c).contains(gameKey("pad_map", titleId)); }
     /** null: back to Default (follows Settings) */

@@ -324,7 +324,7 @@ static void rt_ranges_refresh(void) {
 static int rt_range_has(uint64_t addr, size_t len) {   // [addr, addr+len) inside one cached readable range
     pthread_mutex_lock(&g_rd_mu);
     int lo = 0, hi = g_nrd - 1, ok = 0;
-    while (lo <= hi) { int mid = (lo + hi) / 2; if (g_rd[mid].a > addr) hi = mid - 1; else if (g_rd[mid].b <= addr) lo = mid + 1; else { ok = addr + len <= g_rd[mid].b; break; } }
+    while (lo <= hi) { int mid = (lo + hi) / 2; if (g_rd[mid].a > addr) hi = mid - 1; else if (g_rd[mid].b <= addr) lo = mid + 1; else { ok = len <= g_rd[mid].b - addr; break; } }
     pthread_mutex_unlock(&g_rd_mu);
     return ok;
 }
@@ -346,6 +346,7 @@ static uint8_t *rt_mem_pointer(void *u, uint64_t addr, size_t len) {
     if (!len) return NULL;
     if (time(NULL) - g_rd_at > 2) rt_ranges_refresh();
     if (rt_range_has(addr, len)) return (uint8_t *)(uintptr_t)addr;
+    if (addr + (len - 1) < addr) return NULL;   // the span wraps
     if (plat_mem_read(addr, &b, 1) || plat_mem_read(addr + len - 1, &b, 1)) return NULL;   // both ends read: the guest block is contiguous between
     return (uint8_t *)(uintptr_t)addr;
 }
@@ -572,15 +573,18 @@ static void *rt_thread(void *arg) {
         for (;;) {
             struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m);
             int64_t since = (int64_t)m.tv_sec * 1000000000 + m.tv_nsec - last;
-            if ((g_tick_signalled != g_tick_done && since >= 25000000) || since >= 50000000) break;
-            int64_t wait = 50000000 - since;
-            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += wait; while (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            int pending = g_tick_signalled != g_tick_done;
+            if ((pending && since >= 25000000) || since >= 50000000) break;
+            int64_t wait = (pending ? 25000000 : 50000000) - since;   // a present already waiting ticks at 25 ms, not at the stall timeout
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ts.tv_nsec += wait; while (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
             pthread_cond_timedwait(&g_tick_cv, &g_tick_mu, &ts);
         }
         { struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m); last = (int64_t)m.tv_sec * 1000000000 + m.tv_nsec; }
         g_tick_done = g_tick_signalled;
         pthread_mutex_unlock(&g_tick_mu);
         rt_tick_once();
+        // a tick longer than the interval: the next one 25 ms after this one ends, not at once (back-to-back ticks would pin a core)
+        { struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m); int64_t end = (int64_t)m.tv_sec * 1000000000 + m.tv_nsec; if (end - last > 25000000) last = end; }
     }
     return NULL;
 }
@@ -590,6 +594,7 @@ static void rt_tick(void) {
         if (g_rt_tried || g_nmod <= 0) return;
         rt_start();
         if (!g_rt) return;
+        { pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC); pthread_cond_init(&g_tick_cv, &ca); pthread_condattr_destroy(&ca); }   // the tick's waits on the monotonic clock: a wall-clock step cannot stall the page (unused until the thread below starts)
         pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&th, &at, rt_thread, NULL)) __android_log_print(ANDROID_LOG_ERROR, "peanuts", "tick thread failed");
         pthread_attr_destroy(&at);

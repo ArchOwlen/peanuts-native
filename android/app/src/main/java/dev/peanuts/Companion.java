@@ -27,6 +27,7 @@ public final class Companion {
     private static final int DECIDE_POLL_MS = 200;
     private static CompanionPresentation shown;
     private static DisplayManager.DisplayListener listener;
+    private static DisplayManager listenerDm;   // where the listener is registered: DisplayManager's listeners are process-wide, stop() must unregister it
     private static android.content.Context held;   // the game hold's context while it runs (GameHold)
     private static final Handler ui = new Handler(Looper.getMainLooper());
     private static Activity decidingGame;
@@ -49,6 +50,7 @@ public final class Companion {
             @Override public void onDisplayChanged(int id) {}
         };
         dm.registerDisplayListener(listener, null);
+        listenerDm = dm;
         decidingGame = game; decidingGameName = gameName;
         decide(dm);
         GameHold.start(game, gameName);
@@ -61,7 +63,8 @@ public final class Companion {
         ui.removeCallbacksAndMessages(null);
         if (held != null) { GameHold.stop(held); held = null; }
         if (shown != null) { try { shown.dismiss(); } catch (RuntimeException ignored) {} shown = null; }
-        listener = null;   // the DisplayManager drops it with the activity's context
+        if (listenerDm != null && listener != null) { try { listenerDm.unregisterDisplayListener(listener); } catch (RuntimeException ignored) {} }
+        listener = null; listenerDm = null;   // unregistered: the listener holds the game activity, and DisplayManager's listeners outlive it
     }
 
     /** Polls Bridge.rtState() until it leaves RT_PENDING, then decides once whether to take the display. A title update/reinstall never changes this mid-run,

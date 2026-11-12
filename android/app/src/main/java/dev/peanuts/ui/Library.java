@@ -273,7 +273,8 @@ public final class Library {
     }
 
     /**
-     * Round 4 (critique-phase2c §A-1, a blocker on round 3's version): HIDE-ONLY, never remove. Round 3 deleted the upstream list entry itself
+     * Now (owner's choice, 2026-11-13): an entry confirmed gone is removed (removeEntry), behind the gates below; an unmounted volume's entries are only hidden.
+     * History, round 4 (critique-phase2c §A-1, a blocker on round 3's version): HIDE-ONLY, never remove. Round 3 deleted the upstream list entry itself
      * whenever {@code !File.exists()} on a mounted volume — but {@code File.exists()} is not a reliable "the file is gone" test in this app:
      * <ul>
      * <li>every SAF-picked .nup's {@code gameDir} is a stand-in path whose file is never created ({@code PickedNup}/{@code PickedPath}: only the
@@ -342,10 +343,12 @@ public final class Library {
                 java.lang.reflect.Method load = g.getDeclaredMethod("load", Context.class), save = g.getDeclaredMethod("save", Context.class, List.class);
                 java.lang.reflect.Field dir = g.getDeclaredField("gameDir");
                 load.setAccessible(true); save.setAccessible(true); dir.setAccessible(true);
-                @SuppressWarnings("unchecked") List<Object> games = (List<Object>) load.invoke(null, act);
-                boolean gone = games.removeIf(x -> { try { return gameDir.equals(dir.get(x)); } catch (IllegalAccessException e) { return false; } });
-                if (!gone) return;
-                save.invoke(null, act, games);
+                synchronized (g) {   // Game's own lock (its put/load/save take Game.class): a scan thread adding a game between our load and save would be lost
+                    @SuppressWarnings("unchecked") List<Object> games = (List<Object>) load.invoke(null, act);
+                    boolean gone = games.removeIf(x -> { try { return gameDir.equals(dir.get(x)); } catch (IllegalAccessException e) { return false; } });
+                    if (!gone) return;
+                    save.invoke(null, act, games);
+                }
                 Log.i("peanuts", "[library] removed the entry of a missing game: " + gameDir);
                 rescan(act);
             } catch (ReflectiveOperationException | RuntimeException e) {

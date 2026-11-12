@@ -72,6 +72,7 @@ public final class Catalog {
                     String title = m.group(1).toUpperCase(Locale.ROOT);
                     String pkg = m.group(2) != null ? m.group(2) : "DualScreen-" + title;
                     String ver = m.group(3) != null ? m.group(3) : r.optString("tag_name").replaceAll(".*-(\\d[\\d.]*)$", "$1");
+                    if (!ver.matches("[0-9A-Za-z.\\-]{1,32}") || ver.contains("..")) continue;   // the version names a folder (Installer.versionDir): nothing but a plain version string
                     String sha256 = digestOf(as);
                     String sha256Url = null;
                     if (sha256 == null) {

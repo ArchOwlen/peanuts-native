@@ -49,8 +49,9 @@ static void *yield_watch(void *arg) {
             for (long c = 0; c < ncpu && c < CPU_SETSIZE; c++) if (!g || (c >= lo && c <= hi)) CPU_SET(c, &set);
             sched_setaffinity(0, sizeof set, &set);   // the whole process: every thread (pid 0 = this thread; the others follow below)
             DIR *t = opendir("/proc/self/task");
-            if (t) { struct dirent *te; while ((te = readdir(t))) if (te->d_name[0] >= '0' && te->d_name[0] <= '9') sched_setaffinity(atoi(te->d_name), sizeof set, &set); closedir(t); }
-            setpriority(PRIO_PROCESS, 0, g ? 19 : 0);
+            // the nice value is per thread on Linux, so each thread gets it too; an app cannot go back below its nice later (the restore to 0 may fail:
+            // the affinity is what matters, and it does come back)
+            if (t) { struct dirent *te; while ((te = readdir(t))) if (te->d_name[0] >= '0' && te->d_name[0] <= '9') { sched_setaffinity(atoi(te->d_name), sizeof set, &set); setpriority(PRIO_PROCESS, atoi(te->d_name), g ? 19 : 0); } closedir(t); }
             yielded = g;
         }
         sleep(2);

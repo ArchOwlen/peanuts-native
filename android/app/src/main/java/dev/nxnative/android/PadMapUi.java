@@ -22,7 +22,7 @@ final class PadMapUi {
     /** Settings › Button mapping: the default of every game */
     static void forDefault(Activity a, Runnable done) {
         edit(a, "Button mapping", "For every game without its own mapping, from its next start.", Prefs.padMap(a), Prefs.xboxButtons(a) == 2 ? 2 : 0,
-                spec -> { Prefs.padMapDefault(a, spec); done.run(); }, "Reset to default", () -> { Prefs.padMapDefault(a, ""); done.run(); });
+                spec -> { Prefs.padMapDefault(a, spec); done.run(); }, "Reset to default", () -> { Prefs.padMapReset(a); done.run(); });   // PEANUTS: padMapReset (was padMapDefault(a, ""))
     }
 
     /** Game settings › Button mapping: this game's own; Reset follows Settings again */

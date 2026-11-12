@@ -62,6 +62,17 @@ const char *profile_rt_load(const char *path) {
         g_profile.nmesh_vegetation_cut > DM_PROFILE_MESH_VEGETATION_CUT_CAP || g_profile.nmesh_prepass_cut > DM_PROFILE_MESH_PREPASS_CUT_CAP ||
         g_profile.nfps_steps > DM_PROFILE_FPS_STEPS_CAP || g_profile.ndrs_ctl > DM_PROFILE_DRS_CTL_CAP || g_profile.nres_levels > DM_PROFILE_RES_LEVELS_CAP)
         return "profile: a table row count is past this host's fixed capacity (corrupt or hostile profile.bin)";
+    // Inside the rows: the list and dereference counts index fixed arrays, and offsets/sizes stay far below 2^63 so loader.c's and hle_fpslock.c's
+    // "offset + size > module size" checks cannot wrap (a module is well under 4 GiB)
+    for (unsigned i = 0; i < g_profile.nres_levels; i++) {
+        const dm_pf_res_levels_t *r = &g_profile.res_levels[i];
+        if (r->nl > DM_PROFILE_RES_LEVELS_LISTS || r->n > (1u << 16) || r->table > (1ull << 32)) return "profile: a res_levels row is out of range (corrupt or hostile profile.bin)";
+        for (unsigned k = 0; k < r->nl; k++) if (r->l[k].off > (1ull << 32)) return "profile: a res_levels list offset is out of range (corrupt or hostile profile.bin)";
+    }
+    for (unsigned i = 0; i < g_profile.nfps_steps; i++) {
+        const dm_pf_fps_steps_t *f = &g_profile.fps_steps[i];
+        if (f->nderef > sizeof f->deref / sizeof f->deref[0] || f->ptr_off > (1ull << 32)) return "profile: a fps_steps row is out of range (corrupt or hostile profile.bin)";
+    }
     { const char *se = check_strings(&g_profile); if (se) return se; }
     return NULL;
 }
