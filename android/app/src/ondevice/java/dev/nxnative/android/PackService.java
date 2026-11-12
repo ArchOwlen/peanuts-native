@@ -656,12 +656,18 @@ public final class PackService extends Service {
      * null when the split found the shaders the app's profile lists (its shader_map.tsv byte for byte, as a Mac split of the same dump does), else what to do.
      * vk_android_build.py builds the keys of the profile's map from the split's package: another map means a dump with other shaders (modified, or incomplete).
      */
+    private static java.util.List<String> tableRows(byte[] b) {   // PEANUTS: a table's rows without its comment lines
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (String l : new String(b, StandardCharsets.UTF_8).split("\n")) if (!l.startsWith("#")) out.add(l);
+        return out;
+    }
+
     private String splitMatchesProfile(Job j, File split) {
         if (engine.simulated()) return null;
         File have = new File(split, "shader_map.tsv");
         try {
             File want = new File(PackNative.repo(), "dm/games/" + j.titleId() + "/shader_map.tsv");
-            if (java.util.Arrays.equals(Files.readAllBytes(want.toPath()), Files.readAllBytes(have.toPath()))) return null;
+            if (tableRows(Files.readAllBytes(want.toPath())).equals(tableRows(Files.readAllBytes(have.toPath())))) return null;   // PEANUTS: without the comment lines (shader_split.py table_rows: the header prose changed with the tool's wording on 2026-10-28, and 86 profiles carry the older prose)
             if (ShaderLibs.absentOptional(want.getParentFile(), have) != null) return null;   // a registered build that lacks only the profile's optional shaders (the shaders step leaves them out)
         } catch (IOException | RuntimeException | UnsatisfiedLinkError e) {
             // the app's own list is missing (work() refuses a game this APK does not include, so this is an app built without the profile's tables) or the split's

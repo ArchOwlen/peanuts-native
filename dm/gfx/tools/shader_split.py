@@ -3426,7 +3426,7 @@ def profile_differs(t, pairsout, psopairsout):
         p = GAME.table(name)
         if text is None or not os.path.isfile(p): continue
         with open(p, encoding='utf-8', newline='') as f: want = absent_tables(name, f.read(), absent)
-        if want != text: return f'made a {name} that differs from the profile\'s'
+        if table_rows(want.encode()) != table_rows(text.encode()): return f'made a {name} that differs from the profile\'s'   # PEANUTS: by rows, not comment lines (table_rows)
     if absent: print(f'targeted split: compared with the profile\'s tables less the {len(absent)} shader(s) of shader_optional.tsv this dump does not have ({", ".join(sorted(absent)[:3])})', flush=True)
     return None
 
@@ -3454,6 +3454,11 @@ def absent_tables(name, text, absent):
             c[1] = str(idx[c[0]]); idx[c[0]] += 1; out.append('\t'.join(c) + '\n')
         elif not absent.intersection(c): out.append(ln)
     return ''.join(out)
+
+def table_rows(b):
+    """A table's rows without its comment lines: the header prose changes with the tool's wording (2026-10-28: "no PC shader pairing supplied"), and a profile written before
+    such a change must still match a scan of the same build (PackService.splitMatchesProfile compares the same way)"""
+    return [l for l in b.split(b'\n') if not l.startswith(b'#')]
 
 def scan_jobs(files, want=None):
     """The scan's jobs: (archive ranges, the other files). Each archive kind's index sees every file (a PAK's newest copy of a path, an index beside its data); with
