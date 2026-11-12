@@ -54,6 +54,25 @@ final class RuntimeShaders {
         }
     }
 
+    /**
+     * Whether the title compiles shaders at run time at all: its profile's shader_map.tsv (in the packer's unpacked repository, PackEngine.repo()) names GLSLC run-time
+     * sources ("_runtime" packages, dm/games/README.md). A pack can miss shaders for other reasons (a game version the map was not made from: Mario Kart 8 Deluxe's 135),
+     * and those no game run can capture
+     */
+    static boolean compilesAtRunTime(Context c, String titleId) {
+        try {
+            File repo = (File) Upstream.call(Upstream.k("PackEngine"), null, "repo", new Class<?>[0]);
+            File map = new File(repo, "dm/games/" + titleId + "/shader_map.tsv");
+            if (!map.isFile()) return false;
+            try (java.io.BufferedReader r = Files.newBufferedReader(map.toPath(), StandardCharsets.UTF_8)) {
+                for (String l; (l = r.readLine()) != null; ) if (!l.startsWith("#") && l.contains("_runtime")) return true;
+            }
+        } catch (ReflectiveOperationException | IOException | RuntimeException e) {
+            Log.w(TAG, "runtime shaders: profile map: " + e);
+        }
+        return false;
+    }
+
     static File captureDir(File work) { return new File(work, "glslc_capture"); }
 
     static int captured(File dir) {

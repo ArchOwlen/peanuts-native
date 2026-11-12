@@ -225,6 +225,7 @@ public final class BuildService extends Service {
         }
         int need = RuntimeShaders.missing(jobFile);
         if (need <= 0 || !jobFile.isFile()) return pack;
+        if (!RuntimeShaders.compilesAtRunTime(this, r.titleId)) { Log.i(TAG, "runtime shaders: " + need + " missing from the pack of " + name + ", but the title compiles none at run time: nothing to capture"); return pack; }
         Log.i(TAG, "runtime shaders: " + need + " missing from the pack of " + name + ": capturing");
         boolean enough = new RuntimeShaders(this).capture(r.titleId, work, dump, pack, need, (pct, detail) -> progress("prepare", PREPARE_END - 5 + pct * 5 / 100, detail), () -> cancelled);
         if (cancelled) throw new IOException("Build cancelled.");
