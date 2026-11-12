@@ -4,11 +4,60 @@
 // the APK's libraries are not extracted). The Python home is the folder above this program's (<home>/bin/nxpack_worker, as build.sh stages it into python/bin,
 // which PackNative unpacks with the rest of the Python home), or NXPACK_PYHOME. Python then parses the arguments itself (isolated, as dm_pack.c starts it) and runs -c.
 // Build: dm/peanuts/pack_worker/build.sh (NDK clang, against the stage's libpython3.14.so); the same source builds on Linux against the system Python for tests.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // sched_setaffinity (the game-yield watch below)
+#endif
 #include <Python.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <dirent.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+// While a game of this app runs (its ":game" process), a worker gives the game the fast cores: it moves itself to the little cores (NXPACK_YIELD_CPUS,
+// default 0-2, the Snapdragon 8 Gen 2's Cortex-A510s) at the lowest priority, and back to every core when the game is gone. Checked every 2 s.
+// Without this a build running beside a game took the four fast cores at ~95 % each (Animal Crossing fell from 30 to 18 fps, the SoC at 95 °C).
+static int game_running(void) {
+    DIR *d = opendir("/proc"); if (!d) return 0;
+    struct dirent *e; char path[64], cmd[128]; int found = 0;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        snprintf(path, sizeof path, "/proc/%s/cmdline", e->d_name);
+        FILE *f = fopen(path, "r"); if (!f) continue;
+        size_t n = fread(cmd, 1, sizeof cmd - 1, f); fclose(f); cmd[n] = 0;
+        size_t l = strlen(cmd);
+        if (l > 5 && !strcmp(cmd + l - 5, ":game") && strstr(cmd, "dev.nxnative.android")) found = 1;
+    }
+    closedir(d);
+    return found;
+}
+static void *yield_watch(void *arg) {
+    (void)arg;
+    int lo = 0, hi = 2, yielded = -1;
+    const char *e = getenv("NXPACK_YIELD_CPUS");
+    if (e && sscanf(e, "%d-%d", &lo, &hi) != 2) { lo = 0; hi = 2; }
+    for (;;) {
+        int g = game_running();
+        if (g != yielded) {
+            cpu_set_t set; CPU_ZERO(&set);
+            long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+            for (long c = 0; c < ncpu && c < CPU_SETSIZE; c++) if (!g || (c >= lo && c <= hi)) CPU_SET(c, &set);
+            sched_setaffinity(0, sizeof set, &set);   // the whole process: every thread (pid 0 = this thread; the others follow below)
+            DIR *t = opendir("/proc/self/task");
+            if (t) { struct dirent *te; while ((te = readdir(t))) if (te->d_name[0] >= '0' && te->d_name[0] <= '9') sched_setaffinity(atoi(te->d_name), sizeof set, &set); closedir(t); }
+            setpriority(PRIO_PROCESS, 0, g ? 19 : 0);
+            yielded = g;
+        }
+        sleep(2);
+    }
+    return NULL;
+}
+#endif
 
 static const char *home_of(const char *argv0, char *buf) {
     const char *env = getenv("NXPACK_PYHOME");
@@ -26,6 +75,9 @@ int main(int argc, char **argv) {
     char buf[PATH_MAX];
     const char *home = home_of(argv[0], buf);
     if (!home) { fprintf(stderr, "[RED] nxpack_worker: no Python home (%s is not <home>/bin/nxpack_worker, and NXPACK_PYHOME is not set)\n", argv[0]); return 1; }
+#ifdef __ANDROID__
+    { pthread_t t; if (!pthread_create(&t, NULL, yield_watch, NULL)) pthread_detach(t); }   // give a running game the fast cores
+#endif
     PyConfig c; PyStatus st;
     PyConfig_InitIsolatedConfig(&c);   // no PYTHON* variables, no user site, no current folder on sys.path: as the packer's own interpreter (dm_pack.c)
     c.site_import = 1;                 // site-packages (capstone, lz4)
