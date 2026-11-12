@@ -2847,7 +2847,7 @@ def scan_file(args):
     archive used to end the whole split with nothing written (PR #282: one of Mario Strikers: Battle League's 879 Next Level Games archives). main reports them.
     A file of DIRECT (DM_SPLIT_DIRECT) is read at its recorded containers (direct_file), whole when that cannot be done"""
     try:
-        if DIRECT and len(args) == 2 and (t := DIRECT.get(args[1])) and (r := direct_file(args, t)) is not None: return r
+        if DIRECT and len(args) == 2 and (t := DIRECT.get(args[1])) and (r := direct_file(args, *t)) is not None: return r
         return scan_file_in(args)
     except (Exception, SystemExit) as e:   # red() is a SystemExit
         why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
@@ -2995,43 +2995,45 @@ def plain_blob(path, rel, head):
 # earlier, and is left out (its variations could pair those copies anew, as a file of shader_files.tsv can: then the tables differ from the profile's, and main() falls back to the targeted
 # scan, then the full one). A file with any other source form, no source (shader_files.tsv's), an archive reader's head, a member the archive lacks or a container not at its offset is
 # scanned whole, as today. The results (scan_file's tuple) are interchangeable with a scan job's: ScanCache keeps them in their own folder (<DM_SPLIT_RESUME>/direct)
-DIRECT = None   # {relative path: [(member path, kind, offset)]} of the files the direct scan reads (direct_targets), given when the pool starts
+DIRECT = None   # {relative path: ([(member path, kind, offset)], (the map's keys of the file))} of the files the direct scan reads (direct_targets), given when the pool starts
 DIRECT_FORMS = re.compile(r'#BNSH@(0x[0-9a-f]+)#var[0-9]+$|#BAHS@(0x[0-9a-f]+)$|#IDRK@(0x[0-9a-f]+)#GLSLC@0x[0-9a-f]+(#var)?$')
 
 def source_file(s, rels):
     """The RomFS file of a map source (without its leading '/'): the shortest prefix ending at a '/' or '#' or the end that is a file of the dump (rels), or None"""
     return next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#'] + [len(s)] if s[:i] in rels), None)
 
-def map_sources():
-    """The RomFS sources of the profile's shader_map.tsv, without their leading '/' (main's and the captures' are not RomFS files: NOT_ROMFS)"""
+def map_sources(keys=False):
+    """The RomFS sources of the profile's shader_map.tsv, without their leading '/' (main's and the captures' are not RomFS files: NOT_ROMFS); with keys, {(source, key)}"""
     srcs = set()
     with open(GAME.table('shader_map.tsv'), encoding='utf-8') as f:
         for ln in f:
             c = ln.rstrip('\n').split('\t')
-            if len(c) > 4 and c[0].endswith('.bin') and c[4].startswith('/') and not c[4].startswith(NOT_ROMFS): srcs.add(c[4][1:])
+            if len(c) > 4 and c[0].endswith('.bin') and c[4].startswith('/') and not c[4].startswith(NOT_ROMFS): srcs.add((c[4][1:], c[3]) if keys else c[4][1:])
     return srcs
 
 def direct_targets(files):
-    """DM_SPLIT_DIRECT=1: {relative path: [(member path, kind, offset)]} of the files among files ((path, rel) of the targeted scan's plain jobs) whose every map source is a recorded container
-    (DIRECT_FORMS); kind 'BNSH' with the container's offset, 'BAHS' with 0 (the member is the BAHS file, parsed whole), 'IDRK' with the entry's data offset. The member path is '' for the
-    file itself, else '/<member>[/<member>]' inside its SARCs, as scan_blob labels them"""
+    """DM_SPLIT_DIRECT=1: {relative path: ([(member path, kind, offset)], (the map's keys of the file, sorted))} of the files among files ((path, rel) of the targeted scan's plain jobs) whose
+    every map source is a recorded container (DIRECT_FORMS); kind 'BNSH' with the container's offset, 'BAHS' with 0 (the member is the BAHS file, parsed whole), 'IDRK' with the entry's data
+    offset. The member path is '' for the file itself, else '/<member>[/<member>]' inside its SARCs, as scan_blob labels them. The keys are direct_file's self-check"""
     rels = {r for _, r in files}
-    out, plain = collections.defaultdict(set), set()
-    for s in map_sources():
+    out, keys, plain = collections.defaultdict(set), collections.defaultdict(set), set()
+    for s, k in map_sources(keys=True):
         r = source_file(s, rels)
         if r is None: continue
-        m = DIRECT_FORMS.search(s[len(r):])
+        m = DIRECT_FORMS.search(s, len(r))
         if not m: plain.add(r); continue
         member = s[len(r):m.start()]
         if m.group(1): out[r].add((member, 'BNSH', int(m.group(1), 16)))
         elif m.group(2): out[r].add((member, 'BAHS', 0))
         elif not member: out[r].add((member, 'IDRK', int(m.group(3), 16)))
-        else: plain.add(r)
-    return {r: sorted(t) for r, t in out.items() if r not in plain}
+        else: plain.add(r); continue
+        keys[r].add(k)
+    return {r: (sorted(t), tuple(sorted(keys[r]))) for r, t in out.items() if r not in plain}
 
-def direct_file(args, targets):
+def direct_file(args, targets, keys):
     """scan_file's result for a file of DIRECT: its recorded containers only; None when the file is to be scanned whole (another reader's head, a member or container not where the
-    map says, a reader's error: the whole scan then says what is wrong, as before)"""
+    map says, a reader's error: the whole scan then says what is wrong, as before). keys: the map's keys of this file; a result without every one of them (a container that moved,
+    a variation the reader files elsewhere) is dropped and the file scanned whole, so a mismatch costs that file's whole scan and never the tables' comparison"""
     path, rel = args
     try:
         with open(path, 'rb') as f: head = f.read(16)
@@ -3041,12 +3043,17 @@ def direct_file(args, targets):
         if head[:8] in (IDRK, PDRK):
             if any(k != 'IDRK' for _, k, _ in targets): return None
             idrk_shaders(path, '/' + rel, found, only={o for _, _, o in targets})
-            return rel, uniq_keys(found), var_pairs(found), {}
-        if any(k == 'IDRK' for _, k, _ in targets): return None
-        if head[:4] in (BND2, SPKG, RFRM, b'BERG', MTARC, SCNE, b'BMSG', b'SRYK') or head[:3] == b'PAK' or head[:8] == GFPAK or ue3_package(head) or head[:4] == b'\0\0\1\0' and path.endswith('.gz'): return None
-        d, kind = plain_blob(path, rel, head)
-        if kind or d[:3] == b'XNB' or d[:8] == b'UnityFS\0' or (d[8:11] == b'\0\0\0' and __import__('unityfs').is_serialized(d)): return None
-        if not direct_blob(d, '/' + rel, {m: [(k, o) for _, k, o in g] for m, g in __import__('itertools').groupby(targets, key=lambda t: t[0])}, found): return None
+        else:
+            if any(k == 'IDRK' for _, k, _ in targets): return None
+            if head[:4] in (BND2, SPKG, RFRM, b'BERG', MTARC, SCNE, b'BMSG', b'SRYK') or head[:3] == b'PAK' or head[:8] == GFPAK or ue3_package(head) or head[:4] == b'\0\0\1\0' and path.endswith('.gz'): return None
+            d, kind = plain_blob(path, rel, head)
+            if kind or d[:3] == b'XNB' or d[:8] == b'UnityFS\0' or (d[8:11] == b'\0\0\0' and __import__('unityfs').is_serialized(d)): return None
+            if not direct_blob(d, '/' + rel, {m: [(k, o) for _, k, o in g] for m, g in __import__('itertools').groupby(targets, key=lambda t: t[0])}, found):
+                print(f'direct: /{rel}: a recorded member or container is not where the map says; the file is scanned whole', flush=True); return None
+        missing = [k for k in keys if k not in found.uniq]
+        if missing:
+            print(f'direct: /{rel}: its recorded containers lack {len(missing)} of the map\'s {len(keys)} keys of this file (first: {missing[0]}); the file is scanned whole', flush=True)
+            return None
         return rel, uniq_keys(found), var_pairs(found), {}
     except (Exception, SystemExit) as e:
         print(f'direct: /{rel}: {str(e).removeprefix("[RED] ")}; the file is scanned whole', flush=True)
@@ -3345,7 +3352,7 @@ def main():
             for mode, direct, mdg in modes:
                 failed = os.path.join(rd, mode + '.failed') if rd else None
                 if failed and os.path.isfile(failed) and open(failed).read().strip() == mdg: why = f'the {mode} scan\'s tables were found to differ from the profile\'s by an earlier run on these inputs'; continue
-                if direct: print(f'direct split: {len(direct):,} of {len(todo):,} file jobs read only their recorded containers ({sum(len(t) for t in direct.values()):,} containers, DM_SPLIT_DIRECT); the other {len(todo) - len(direct):,} and the {len(big):,} archive jobs are scanned whole', flush=True)
+                if direct: print(f'direct split: {len(direct):,} of {len(todo):,} file jobs read only their recorded containers ({sum(len(t) for t, _ in direct.values()):,} containers, DM_SPLIT_DIRECT); the other {len(todo) - len(direct):,} and the {len(big):,} archive jobs are scanned whole', flush=True)
                 stage(f'reading the {len(want):,} files that hold shaders')
                 try:
                     out = split_tables(list(results), big, todo, dumps, J, common, zdicts, ScanCache(os.path.join(rd, mode), mdg) if rd else None, targeted=True, direct=direct)
