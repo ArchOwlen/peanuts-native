@@ -281,7 +281,10 @@ public final class MainActivity extends Activity {
         about.addView(tag, Ui.wrap());
         StringBuilder ids = new StringBuilder();   // the games this build includes, so a player can tell whether it has theirs (Profile.missing points here)
         for (Profile p : Profile.all()) ids.append("\n· ").append(p.name).append(" (").append(p.titleId).append(")");
-        TextView t = Ui.small(this, "Games in this app:" + ids + "\n\nBased on nxnative by seedds. LSFG from Eden (GPL-3.0)." + (BuildConfig.NX_LSFG ? "" : " Built without LSFG."));
+        String basedOn = BuildConfig.APPLICATION_ID.endsWith(".peanuts")   // PEANUTS: the fork credits Banana Native and its maker first
+                ? "Peanuts Native is a fork of Banana Native by moceure (GPL-3.0), which is based on nxnative by seedds. Companions run on the Eden Duo runtime. LSFG from Eden (GPL-3.0)."
+                : "Based on nxnative by seedds. LSFG from Eden (GPL-3.0).";
+        TextView t = Ui.small(this, "Games in this app:" + ids + "\n\n" + basedOn + (BuildConfig.NX_LSFG ? "" : " Built without LSFG."));   // PEANUTS: basedOn above
         t.setTextIsSelectable(true);
         Ui.add(about, t, 10);
         refreshSettings();
