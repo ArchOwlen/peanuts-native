@@ -11,4 +11,5 @@ public final class Native {
     public static native int    writeNup(String out, String[] inputs, String baseTitleId, Progress cb);
     public static native int    firmwareFonts(String firmwareDir, String outDir);     // writes <outDir>/standard.ttf and nintendo_ext.ttf
     public static native String lastError();
+    public static native void   setThreads(int n);                                   // worker threads for writeNup (0 = online CPUs capped at 6)
 }
