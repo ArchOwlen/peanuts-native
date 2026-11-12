@@ -1,115 +1,113 @@
-<p align="center"><img src="android/images/logo.svg" alt="Banana Native logo" width="128"></p>
+<h1 align="center">Peanuts Native</h1>
 
-# Banana Native
+<p align="center">
+  Nintendo Switch games running natively on Android dual-screen handhelds, with a live companion on the second screen.
+</p>
 
-Banana Native runs Switch 2 games from your own dumps on Android phones. Like Wine, it emulates no hardware: the
-game's own ARM64 code runs on the phone's CPU, Banana Native supplies the system services it calls and translates its
-graphics to Vulkan. It is an Android port of [nxnative](https://github.com/seedds/nxnative) by seedds.
+<p align="center">
+  <img alt="status" src="https://img.shields.io/badge/status-pre--release-lightgrey">
+  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Android%2013%2B-green">
+</p>
 
 > [!NOTE]
-> Unofficial and experimental. Not affiliated with Nintendo, nxnative or Eden. The project contains no Nintendo code,
-> firmware or keys and decrypts nothing: it reads only a dump of a game you own, made from your own console. Most of the
-> code was written with an AI coding assistant (Claude) and tested by hand. [More](docs/players/about.md).
+> Peanuts Native is in development and has no public release yet. It is not affiliated with Nintendo.
 
-## Games
+## What it is
 
-| Game | Version | Status | Notes |
-|---|---|---|---|
-| Donkey Kong Bananza (`040074A01BF12000`) | update 458752 | Supported | 30 fps |
-| Mario Kart World (`0400C3F00006E000`) | 1.8.0 | Supported | a phone cooler is recommended |
-| Pokémon Pokopia (`0400A3A01EE4C000`) | update 655360 (Ver. 2.0.1) | Supported | about 60 fps |
-| The Legend of Zelda: Ocarina of Time (`0400486024DEC000`) | 2.0 | Experimental | plays, with visual glitches (too bright, mesh foliage missing); system driver only |
-| Splatoon Raiders (`0400380020056000`) | update 65536 | Experimental | boots and runs, but not playable yet (very low frame rate) |
+Peanuts Native turns a dump of a Switch 1 game you own into an Android app on your phone. It is not an emulator. The
+game's own ARM64 code is rewritten to run directly on the phone's CPU, its graphics are replayed on Vulkan, and its
+shaders are translated on the device. Everything happens on the phone: you pick the game file, tap Build, and play.
 
-The app tells you if your dump is another version. Splatoon Raiders is not playable yet: it boots and runs at a very low
-frame rate, and ships so that people can test it and help. Ocarina of Time: only version 2.0 is tested; the first starts are slow
-(minutes of loading, then low fps and black frames) until the GPU driver's pipeline cache fills. [Experimental games](docs/guides/experimental-games.md) has their known problems and how to help.
+On a dual-screen handheld such as the AYN Thor, the game plays on the top screen and the bottom screen shows a
+companion for that game: a map, your party, items or quests, read live from the running game and touchable. Companions
+use the same package format as [Eden Duo](https://github.com/igawa6/eden-duo), so every Eden Duo companion works here
+too.
+
+## Screenshots
+
+*(to come: the top screen and the companion on the bottom screen for each supported game)*
+
+## Supported games
+
+These Switch 1 games build and play on an AYN Thor with their companion. Use the game update listed. The app shows
+which update you have and which one a game supports, and asks before building any other.
+
+| Game | Title ID | Game update | Companion | Runs at |
+|---|---|---|---|---|
+| The Legend of Zelda: Link's Awakening | `01006BB00C6F0000` | 1.1.0 | Yes | 60 fps |
+| The Legend of Zelda: Echoes of Wisdom | `01008CF01BAAC000` | 1.1.0 | Yes | 60 fps |
+| Fire Emblem: Three Houses | `010055D009F78000` | 1.2.0 | Yes | 60 fps |
+| Fire Emblem Engage | `0100A6301214E000` | 2.0.0 | Yes | 60 fps |
+| Metroid Dread | `010093801237C000` | 2.1.0 | Yes | 60 fps |
+| Super Mario Odyssey | `0100000000010000` | 1.4.1 | Yes | 60 fps |
+| Mario Kart 8 Deluxe | `0100152000022000` | 4.0.0, 4.0.1 | Yes | 60 fps |
+| Animal Crossing: New Horizons | `01006F8002326000` | 3.0.3 | Yes | 30 fps, as on Switch |
+| Persona 5 Royal | `01005CA01580E000` | 1.0.2 | Yes | 30 fps, as on Switch |
+| Castlevania: Belmont's Curse | `0100BA4026E94000` | 1.1.0 | Yes | 60 fps |
+| OCTOPATH TRAVELER 0 | `01005270232F2000` | 1.0.5 | Yes | 60 fps |
+| Pokémon Brilliant Diamond | `0100000011D90000` | 1.3.0 | Yes | 60 fps |
 
 ## What you need
 
-- An Android 13+ phone with a Snapdragon (Adreno) GPU and at least 12 GB of RAM, 16 GB for Mario Kart World
-  (`0400C3F00006E000`). Tested on a Snapdragon 8 Elite Gen 5 with 16 GB, with the phone's own Qualcomm (system) driver
-  and Turnip.
-- Your own dump of the game, as a folder (or a `.nup` file of one): `base/`, and `updates/<version>/` and `dlc/` if you
-  have them, each with `exefs/` and `romfs/`. NSP and XCI files don't work.
-- Recommended: a Windows PC or a Mac, and a phone cooler.
+- A dual-screen Android handheld. Peanuts Native is developed and tested on the AYN Thor. On a single-screen phone the
+  game still runs, without the companion.
+- Android 13 or later, a Snapdragon GPU with Vulkan 1.3, and 12 GB of RAM or more. A Turnip Vulkan driver is
+  recommended; the app can download one.
+- Free storage for the game and its build. Plan for the size of the game plus a few GB.
+- Your own `prod.keys` and your own game dump (NSP, XCI or a dump folder), with its update.
 
-## Setup
+## Your keys and games
 
-Each game is prepared once into a **pack** (its code rewritten for Android, its shaders translated for Vulkan). A
-computer does this much faster than the phone.
+Peanuts Native only runs games you dumped from your own console, with keys from that console. It contains no Nintendo
+code, firmware or keys, never asks you for any, and does not link to places that offer them. Nobody from this project
+will ever ask you for money, keys or game files.
 
-First install the APK from [Releases](https://github.com/moceure/BananaNative/releases) (or the mirror on [git.eden-emu.dev](https://git.eden-emu.dev/moceure/BananaNative/releases)) and allow **All files access**.
+## Getting started
 
-**PC (Windows) or Mac** ([guide](docs/guides/pc-mac-packing.md)). Mac: tested. Windows: new and not yet tested on a
-real PC — please report how it goes.
+1. Install the APK and allow All files access when asked.
+2. In Settings, choose your game folder, your update folder and your `prod.keys`.
+3. Open a game from the library and tap **Build**. The app imports the game, rewrites its code, translates its
+   shaders and installs its companion. Most games take 5 to 40 minutes on the Thor.
+4. Tap the game to play. The companion starts on the bottom screen.
 
-1. Download this repository and double-click `scripts\bananative.bat` (Windows) or `scripts/bananative.command`
-   (Mac). The first time, it installs its tools (about 400 MB) into a folder you pick.
-2. Pick the game (its folder or `.nup` file) and click **Prepare**.
-3. Copy the game folder to the phone, and the pack next to it: `<title ID>-work/android-pack`.
-4. In the app, tap **Add game** and pick the game folder. It finds the pack. (Or use **Import pack…** with the pack
-   folder.)
+## Companions
 
-**Phone only** ([guide](docs/guides/getting-started.md)): copy the game folder to the phone, tap **Add game**, then
-**Prepare**. It runs in the background and can be paused; keep the phone on the charger. The first Prepare takes
-about 20–45 minutes (mostly translating shaders). Prepare is incremental: later runs reuse existing shaders and
-only rewrite code when its key changes (a few minutes). A computer is recommended for Mario Kart World (`0400C3F00006E000`).
+Open Settings, then Companions, to see every companion and every release of it. You can install, update, remove or
+roll back to an earlier release, and each download is checked against its published checksum before it is used. A
+game without a companion leaves the bottom screen free for Android. Companion screens give haptic feedback when you
+tap them.
 
-## Problems
+The companions themselves are published in
+[eden-duo-companions](https://github.com/igawa6/eden-duo-companions), with screenshots and what each one shows.
 
-- Settings › **Readiness check** says what your phone is missing and fixes most items.
-- A game's ⋯ button › **Share log** shares its log.
-- Open an [issue](https://github.com/moceure/BananaNative/issues/new/choose) with the form; questions go to
-  [Discussions](https://github.com/moceure/BananaNative/discussions). More: [Troubleshooting](docs/guides/troubleshooting.md).
+## FAQ
 
-> [!IMPORTANT]
-> The official places for Banana Native are this GitHub repository and its mirror on
-> [git.eden-emu.dev](https://git.eden-emu.dev/moceure/BananaNative): download the APK only from their releases. Nobody
-> from the project will ask you for money, keys or game files.
+**Is this piracy?** No. It runs only a dump of a game you own, made from your own console, and ships no game code,
+firmware or keys.
 
-## Guides
+**My game update is different from the table. Will it work?** The game's page tells you. Some games support more than
+one update; others need the exact one listed. For an unsupported update the app asks before building, and the result
+may not start.
 
-[Getting started](docs/guides/getting-started.md) ·
-[PC or Mac](docs/guides/pc-mac-packing.md) ·
-[Storage access](docs/guides/storage-access.md) ·
-[Saves](docs/guides/saves.md) ·
-[Packs and app updates](docs/guides/packs-and-updates.md) ·
-[GPU drivers](docs/guides/gpu-drivers.md) ·
-[Troubleshooting](docs/guides/troubleshooting.md) ·
-[Experimental games](docs/guides/experimental-games.md)
+**Can I share my built game or its shaders?** No. Both are made from your own game's files. Share nothing derived
+from a game, and point other players to their own dump instead.
 
-## More
-
-[Features](docs/players/features.md) ·
-[Performance](docs/players/performance.md) ·
-[How it works](docs/players/how-it-works.md) ·
-[About the project](docs/players/about.md) ·
-[Videos and device reports](docs/players/videos.md) ·
-[History](docs/players/history.md)
+**Does the companion slow the game down?** Very little. The games above hold their frame rate with the companion
+running.
 
 ## Contributing
 
-Each game's note says what is known and what is open ([games table](dm/games/README.md#games)); working on the code:
-[docs/agents](docs/agents/README.md), [android/README.md](android/README.md). The experimental games need the
-most help: see the issues marked
-[help wanted](https://github.com/moceure/BananaNative/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+See [CONTRIBUTING.md](peanuts/docs/CONTRIBUTING.md) for adding a game, fixing a bug and testing on a device. Run
+`sh peanuts/scripts/install-hooks.sh` once after cloning.
 
-## Licence and credits
+## Credits and license
 
-The Android app is **GPL-3.0-or-later** as a whole ([android/NOTICE.md](android/NOTICE.md)), because it includes frame
-generation ported from [Eden](https://git.eden-emu.dev/eden-emu/eden) / [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk)
-and task and mesh shader lowering from [switch2mac](https://github.com/azmasm/switch2mac) /
-[Eglantine](https://github.com/djihads80/eglantine). Each release is built from its tagged commit. nxnative's own files
-keep their MIT licence ([LICENSE](LICENSE)); third-party code keeps its own ([dm/third_party](dm/third_party/README.md)),
-and the shader translator built from it is GPL-3.0-or-later ([dm/third_party/ryujinx](dm/third_party/ryujinx/README.md)).
-A few shader translator fixes are adapted from [nx2android](https://github.com/shirai91/nx2android) (MIT), credited in
-[android/NOTICE.md](android/NOTICE.md).
+Peanuts Native is a fork of [Banana Native](https://git.eden-emu.dev/moceure/BananaNative) by moceure, which does the
+real work of running Switch games natively on Android and is built on [nxnative](https://github.com/seedds/nxnative)
+by seedds (MIT). Some fixes are adapted from [nx2android](https://github.com/shirai91/nx2android) (MIT).
 
-Built on **[nxnative](https://github.com/seedds/nxnative)** by seedds (MIT) and everything it credits in its
-[acknowledgements](docs/nxnative.md#acknowledgements), among them [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)
-and [Ryujinx](https://github.com/Ryujinx/Ryujinx)'s shader translator. Mario Kart World (`0400C3F00006E000`) findings
-from [kartnative](https://github.com/pahorema/kartnative) (pahorema) and switch2mac (azmasm). Thanks to all of them and
-to everyone who reported issues or sent pull requests.
+The companion runtime and package format come from [Eden Duo](https://github.com/igawa6/eden-duo).
 
-Only use games you own. Don't ask for games, keys or dumps.
+The project as a whole is licensed GPL-3.0-or-later. Frame generation (ported from Eden and lsfg-vk) and other
+components carry their own licenses; see `android/NOTICE.md` and `dm/third_party/README.md`.
