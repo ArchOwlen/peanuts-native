@@ -554,6 +554,7 @@ public final class PackService extends Service {
         // J=1 in env.txt puts the scan back in this process
         String pyLib = engine.simulated() ? null : ((dalvik.system.BaseDexClassLoader) getClassLoader()).findLibrary("python3.14");   // PEANUTS: …/base.apk!/lib/arm64-v8a/libpython3.14.so
         PackEngine.setenv("J", s.equals("split") ? String.valueOf(pyLib == null ? 1 : CpuCores.shaderWorkers()) : String.valueOf(workers));   // PEANUTS
+        if (s.equals("split")) Log.i(TAG, "split workers: libpython " + pyLib + ", J " + (pyLib == null ? 1 : CpuCores.shaderWorkers()));   // PEANUTS
         PackEngine.setenv("DM_SPLIT_WORKER", pyLib == null ? "" : "/system/bin/linker64 " + new File(PackNative.repo().getParentFile(), "python/bin/nxpack_worker").getPath());   // PEANUTS
         PackEngine.setenv("LD_LIBRARY_PATH", pyLib == null ? "" : new File(pyLib).getParent());   // PEANUTS: read by the workers' linker only (this process's read it at its start)
         PackEngine.setenv("DM_SPLIT_RESUME", splitScan.getPath());   // the split's kept scan results (only shader_split.py reads it)

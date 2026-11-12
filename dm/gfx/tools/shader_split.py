@@ -3114,6 +3114,7 @@ def pool(J, *initargs):
     """The scan's workers: J processes, or this process when J is 1 (InProcess). DM_SPLIT_WORKER=<command> (the phone's split, PackService): the workers are
     processes of that command, which runs Python as `python3 -c` does, over pipes (split_pool.py: the phone's Python has no python executable and no
     _multiprocessing); workers that do not come up leave the scan in this process, with one line saying why"""
+    print(f"split: J={J}, workers {os.environ.get('DM_SPLIT_WORKER') or 'in this process'}", flush=True)
     if J > 1 and (cmd := os.environ.get('DM_SPLIT_WORKER')):
         import shlex, split_pool
         try:
