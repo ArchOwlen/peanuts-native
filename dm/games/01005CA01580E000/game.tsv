@@ -38,3 +38,7 @@ shader_note	Persona 5 Royal shaders
 # ---- After the rewrite ----
 # The rewritten modules require 76 MB, more than the default 64 MB deducted from the pool.
 mem_used	0x4c00000
+
+# PEANUTS: hold the present-interval field at 60 (hle_fpslock.c, the "Persona 5 Royal present interval" row for main d4b150b2...)
+# ---- Frame rate ----
+fps_target	60

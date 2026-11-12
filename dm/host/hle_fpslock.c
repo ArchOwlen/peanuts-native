@@ -70,6 +70,28 @@ static const lock_t k_locks[] = {
     // the Thor the game saw 1.3 ms of CPU and 4.4 ms of GPU yet sat at 30: a frame once over 1/60 s puts it there, and at interval 2 every frame measures over 1/60 s, so the hold
     // renews itself for good. Found 2026-11-12 from main 9f221e1a (ptr_off 0: the field is at main + field)
     { "9f221e1afa65ba5443e955158ab97da8", "Grezzo frame governor enable", 0, 0x34bd894, EXTRA_VSYNCS_U8, 1 },
+    // PEANUTS: per-game lock row (Persona 5 Royal VSYNCS_I32)
+    // Persona 5 Royal 1.0.2 (main d4b150b29a931cd3): a present-interval field at the end of a pointer chain from a global in main's
+    // bss, [main+0x2327b90] -> +0x10 -> +0x60 -> +0x8, field +0xf14 (an int32, 1 = 60 fps, 2 = 30 fps). Found from a build-ID-matched
+    // community cheat for this exact build (ChanseyIsTheBest/NX-60FPS-RES-GFX-Cheats, titles/01005CA01580E000/cheats/D4B150B29A931CD3.txt,
+    // credited in the game's README), decoded instruction by instruction against Atmosphere's own cheat VM opcode reference (four
+    // "Load Register with Memory Value" loads chaining the offsets above, a "Legacy Arithmetic" add of 0xf14, then a "Store Static
+    // Value to Register Memory Address" of 1 or 2) rather than taken on faith; the earlier cheats database write-up ("[60 FPS LIMIT]"
+    // at main+0x29f24) was checked against this main and found to land inside .text, i.e. a code patch, not a usable memory field, so
+    // it is not the row used here. [main+0x2327b90] itself was confirmed to sit in main's own .bss (past the data segment's end, inside
+    // its declared bss size), consistent with a runtime object pointer; the exact function that constructs or re-asserts the chain was
+    // not located by a linear adrp/ldr sweep of main's text in the time available, so this row is unconfirmed beyond the chain's shape
+    // and its location in bss — the Thor test must check both the frame rate and that nothing else broke. A second, independently
+    // build-ID-matched lead for the same fix lives in the "sdk" module (357efc198e728cb5d55265aff304f03c, StevensND/switch-port-mods,
+    // credited in the game's README): at sdk+0x486da0 the original code is `csel w8, w9, w8, gt; str w8, [x0, #0xf24]` (confirmed by
+    // disassembling the extracted sdk), and the community's two patches replace the csel with a plain `movz w8, #1` (60 fps) or
+    // `movz w8, #0` ("Uncap"). That is a static code patch (not a k_locks row): it cannot be toggled at runtime the way fps_target is
+    // elsewhere, and this project does not carry a code-patch mechanism for arbitrary "sdk"-module cuts, so it is not implemented;
+    // it corroborates that this SDK build has its own present-interval choice to make, independent of main's chain. No side effects
+    // (dialogue/animation speed, physics) are documented for either community fix: multiple reports describe "no game-breaking bugs",
+    // "performance... mostly the same", consistent with Persona 5 Royal's engine stepping by real time rather than by the frame, unlike
+    // Animal Crossing: New Horizons (see dm/games/01006F8002326000/README.md and IMPL-FPS60.md, which found the opposite for that game).
+    { "d4b150b29a931cd381e2a30318fc299f", "Persona 5 Royal present interval", 0x2327b90, 0xf14, VSYNCS_I32, 1, 0, 3, {0x10, 0x60, 0x8} },
     // Pokemon Brilliant Diamond 1.3.0: Unity's Application.targetFrameRate. Its icall registration (main+0xe34e60) resolves to main+0xdc8e70 -> +0x5fa640,
     // which stores w0 at main+0x4afc868; the getter at +0x5fa630 reads the same int32. The game sets 30 when entering the field; display pacing alone does not remove that cap.
     { "94ceae325c205c4b9d6f7235552f28fd", "Unity targetFrameRate", 0, 0x4afc868, FPS_I32, 1 },
