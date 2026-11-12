@@ -187,27 +187,96 @@ static void ctr_for(uint8_t ctr[16], const uint8_t tmpl[16], uint64_t abs_off) {
     for (int j = 0; j < 8; j++) { ctr[15 - j] = (uint8_t)o; o >>= 8; }
 }
 
-// Plain CTR bytes of the NCA at absolute offset abs (whole file positions), counter template tmpl, into buf
-static int ctr_read(NxNca *n, const uint8_t tmpl[16], uint64_t abs, uint8_t *buf, size_t len) {
+// Plain CTR bytes of the NCA at absolute offset abs (whole file positions), counter template tmpl, into buf; ctr_read_at: the bytes at file position abs decrypted with the
+// counter of position cabs (PEANUTS: a sparse section's data lies elsewhere in the body than the virtual position its counter counts; the two differ by a multiple of 16)
+static int ctr_read_at(NxNca *n, const uint8_t tmpl[16], uint64_t abs, uint64_t cabs, uint8_t *buf, size_t len) {
+    if ((abs ^ cabs) & 15) { nx_err("%s: data at %#llx with the counter of %#llx: not 16-byte aligned to each other", n->id, (unsigned long long)abs, (unsigned long long)cabs); return -1; }
     while (len) {
-        uint64_t blk = abs & ~15ull; size_t in = (size_t)(abs - blk);
+        uint64_t blk = abs & ~15ull, cblk = cabs & ~15ull; size_t in = (size_t)(abs - blk);
         if (in || len < 16) {
             uint8_t t[16], ctr[16]; if (nx_pread_all(n->fd, t, 16, n->base_off + blk)) return -1;
-            ctr_for(ctr, tmpl, blk); nx_aes_ctr(&n->key, ctr, t, t, 16);
-            size_t k = 16 - in; if (k > len) k = len; memcpy(buf, t + in, k); buf += k; abs += k; len -= k;
+            ctr_for(ctr, tmpl, cblk); nx_aes_ctr(&n->key, ctr, t, t, 16);
+            size_t k = 16 - in; if (k > len) k = len; memcpy(buf, t + in, k); buf += k; abs += k; cabs += k; len -= k;
         } else {
             size_t k = len & ~15ull; uint8_t ctr[16];
             if (nx_pread_all(n->fd, buf, k, n->base_off + abs)) return -1;
-            ctr_for(ctr, tmpl, abs); nx_aes_ctr(&n->key, ctr, buf, buf, k);
-            buf += k; abs += k; len -= k;
+            ctr_for(ctr, tmpl, cabs); nx_aes_ctr(&n->key, ctr, buf, buf, k);
+            buf += k; abs += k; cabs += k; len -= k;
         }
     }
     return 0;
+}
+static int ctr_read(NxNca *n, const uint8_t tmpl[16], uint64_t abs, uint8_t *buf, size_t len) { return ctr_read_at(n, tmpl, abs, abs, buf, len); }
+
+static int cmp_reloc(const void *a, const void *b);
+static const NxReloc *find_reloc_in(const NxReloc *r, uint32_t nr, uint64_t v) {
+    uint32_t lo = 0, hi = nr;
+    while (lo < hi) { uint32_t m = (lo + hi) / 2; if (r[m].virt <= v) lo = m + 1; else hi = m; }
+    return lo ? &r[lo - 1] : NULL;
+}
+
+// PEANUTS: a sparse section's bytes (NxSparse): each entry's range from the body (encrypted as the section, with its virtual position's counter) or zeros
+static int sparse_read(NxNca *n, int s, uint64_t off, uint8_t *buf, size_t len) {
+    NxSection *S = &n->sec[s]; const NxSparse *sp = S->sparse;
+    while (len) {
+        const NxReloc *r = sp->nr ? find_reloc_in(sp->r, sp->nr, off) : NULL;
+        if (!sp->nr) { memset(buf, 0, len); return 0; }
+        if (!r || off >= r->end) { nx_err("%s: offset %llu is outside section %d's sparse table", n->id, (unsigned long long)off, s); return -1; }
+        size_t k = len; if (off + k > r->end) k = (size_t)(r->end - off);
+        if (r->patch) memset(buf, 0, k);   // storage 1: zeros (the update supplies these bytes)
+        else {
+            uint64_t abs = sp->phys_base + r->phys + (off - r->virt);
+            if (S->crypt_type == 1) { if (nx_pread_all(n->fd, buf, k, n->base_off + abs)) return -1; }
+            else if (S->crypt_type == 3) { if (!n->key_ok) { nx_err("%s: %s", n->id, n->key_why); return -1; } if (ctr_read_at(n, S->ctr, abs, S->off + off, buf, k)) return -1; }
+            else { nx_err("%s: sparse section %d uses encryption type %d (not supported)", n->id, s, S->crypt_type); return -1; }
+        }
+        buf += k; off += k; len -= k;
+    }
+    return 0;
+}
+
+// PEANUTS: the sparse table (SparseInfo @0x148: table offset (8) and size (8) from physical_offset, BucketTree header (0x10), physical_offset (8) @0x168, generation (2) @0x170).
+// The table is AES-CTR with the section's counter whose generation half is the sparse generation << 16, at its own body position; its layout is the BKTR relocation
+// table's (a 0x4000 header node: set count @4, end offset @8; then 0x4000 entry sets: count @4, end @8, entries @0x10 of 0x14: virtual (8), physical (8), storage index (4))
+static int sparse_load(NxNca *n, int s, const uint8_t *fh) {
+    NxSection *S = &n->sec[s]; uint8_t *tb = NULL; NxSparse *sp = NULL;
+    uint64_t toff = u64(fh + 0x148), tsize = u64(fh + 0x150), pbase = u64(fh + 0x168); uint32_t cnt = u32(fh + 0x158 + 8); uint16_t gen = (uint16_t)(fh[0x170] | fh[0x171] << 8);
+    if (memcmp(fh + 0x158, "BKTR", 4) || u32(fh + 0x15C) != 1) NX_FAIL("%s: section %d: bad sparse table header", n->id, s);
+    if (!(sp = calloc(1, sizeof *sp))) NX_FAIL("out of memory");
+    sp->phys_base = pbase;
+    if (cnt) {
+        if (!n->key_ok && S->crypt_type != 1) NX_FAIL("%s: %s", n->id, n->key_why);
+        if (tsize < 0x8000 || tsize > (256u << 20) || pbase + toff + tsize > n->size) NX_FAIL("%s: section %d: sparse table out of bounds", n->id, s);
+        if (!(tb = malloc((size_t)tsize))) NX_FAIL("out of memory");
+        uint8_t tmpl[16]; memcpy(tmpl, S->ctr, 16); uint32_t g = (uint32_t)gen << 16; for (int j = 0; j < 4; j++) { tmpl[7 - j] = (uint8_t)g; g >>= 8; }
+        if (S->crypt_type == 1 ? nx_pread_all(n->fd, tb, (size_t)tsize, n->base_off + pbase + toff) : ctr_read(n, tmpl, pbase + toff, tb, (size_t)tsize)) goto fail;
+        uint32_t nb = u32(tb + 4); uint64_t total = u64(tb + 8);
+        if (nb == 0 || (uint64_t)0x4000 * (nb + 1) > tsize) NX_FAIL("%s: section %d: bad sparse table (%u entry sets; wrong key or counter?)", n->id, s, nb);
+        for (uint32_t i = 0; i < nb; i++) {
+            const uint8_t *bk = tb + 0x4000 * (i + 1); uint32_t ne = u32(bk + 4); uint64_t vend = u64(bk + 8);
+            if (ne > 0x3FF0 / 0x14) NX_FAIL("%s: section %d: bad sparse entry set %u", n->id, s, i);
+            NxReloc *nr = realloc(sp->r, sizeof *nr * (sp->nr + ne)); if (!nr) NX_FAIL("out of memory"); sp->r = nr;
+            for (uint32_t j = 0; j < ne; j++) { const uint8_t *e = bk + 0x10 + 0x14 * j; NxReloc *x = &sp->r[sp->nr++]; x->virt = u64(e); x->phys = u64(e + 8); x->patch = u32(e + 16); x->end = j + 1 < ne ? u64(e + 0x14) : vend; }
+        }
+        if (sp->nr != cnt) NX_FAIL("%s: section %d: the sparse table has %u entries, its header %u", n->id, s, sp->nr, cnt);
+        qsort(sp->r, sp->nr, sizeof *sp->r, cmp_reloc);
+        for (uint32_t i = 0; i + 1 < sp->nr; i++) if (sp->r[i].end > sp->r[i + 1].virt) sp->r[i].end = sp->r[i + 1].virt;
+        sp->r[sp->nr - 1].end = total;
+        for (uint32_t i = 0; i < sp->nr; i++) if (sp->r[i].patch > 1) NX_FAIL("%s: section %d: sparse entry %u has storage index %u", n->id, s, i, sp->r[i].patch);
+        if (getenv("NX_DEBUG")) fprintf(stderr, "nximport: %s section %d: sparse, %u entries, table @%#llx+%#llx, data from %#llx, generation %u, virtual end %#llx\n", n->id, s, sp->nr,
+                                        (unsigned long long)(pbase + toff), (unsigned long long)tsize, (unsigned long long)pbase, gen, (unsigned long long)total);
+        free(tb);
+    }
+    S->sparse = sp;
+    return 0;
+fail:
+    free(tb); if (sp) { free(sp->r); free(sp); } return -1;
 }
 
 static int sec_read_plain(NxNca *n, int s, uint64_t off, uint8_t *buf, size_t len) {   // non-BKTR section bytes
     NxSection *S = &n->sec[s];
     if (off + len > S->size) { nx_err("%s: read past section %d (%llu + %zu > %llu)", n->id, s, (unsigned long long)off, len, (unsigned long long)S->size); return -1; }
+    if (S->sparse) return sparse_read(n, s, off, buf, len);   // PEANUTS
     if (S->crypt_type == 1) return nx_pread_all(n->fd, buf, len, n->base_off + S->off + off);
     if (S->crypt_type == 3 || S->crypt_type == 4) { if (!n->key_ok) { nx_err("%s: %s", n->id, n->key_why); return -1; } return ctr_read(n, S->ctr, S->off + off, buf, len); }
     nx_err("%s: section %d uses encryption type %d (not supported)", n->id, s, S->crypt_type); return -1;
@@ -473,7 +542,7 @@ int nx_nca_open(NxNca *n, const NxContainer *c, const NxEntry *e) {
         S->fs_type = fh[2]; S->hash_type = fh[3]; S->crypt_type = fh[4];
         for (int j = 0; j < 8; j++) S->ctr[j] = fh[0x140 + 7 - j];
         static const uint8_t zero48[0x58];
-        if (memcmp(fh + 0x148, zero48, 0x30)) { nx_err("%s: section %d is sparse (not supported)", n->id, i); return -1; }
+        if (memcmp(fh + 0x148, zero48, 0x30) && sparse_load(n, i, fh)) { nx_nca_close(n); return -1; }   // PEANUTS: a sparse section (sparse_load; was "not supported")
         if (memcmp(fh + 0x178, zero48, 0x28)) {   // CompressionInfo: the table is read on the first read of the section (comp_load)
             if (memcmp(fh + 0x188, "BKTR", 4) || u32(fh + 0x18C) != 1) { nx_err("%s: section %d: bad compression table header", n->id, i); return -1; }
             S->compressed = 1;
@@ -484,9 +553,10 @@ int nx_nca_open(NxNca *n, const NxContainer *c, const NxEntry *e) {
     return 0;
 }
 
-void nx_nca_close(NxNca *n) { for (int i = 0; i < 4; i++) { if (n->sec[i].bktr) { free(n->sec[i].bktr->r); free(n->sec[i].bktr->s); free(n->sec[i].bktr); n->sec[i].bktr = NULL; } comp_free(n->sec[i].comp); n->sec[i].comp = NULL; } }
+void nx_nca_close(NxNca *n) { for (int i = 0; i < 4; i++) { if (n->sec[i].bktr) { free(n->sec[i].bktr->r); free(n->sec[i].bktr->s); free(n->sec[i].bktr); n->sec[i].bktr = NULL; } comp_free(n->sec[i].comp); n->sec[i].comp = NULL; if (n->sec[i].sparse) { free(n->sec[i].sparse->r); free(n->sec[i].sparse); n->sec[i].sparse = NULL; } } }
 
-int nx_nca_find_section(const NxNca *n, int fs_type) { for (int i = 0; i < 4; i++) if (n->sec[i].present && n->sec[i].fs_type == fs_type) return i; return -1; }
+// PEANUTS: a sparse section with no entries holds no data (Castlevania: Belmont's Curse's base: its ExeFS is in the update only) and counts as absent
+int nx_nca_find_section(const NxNca *n, int fs_type) { for (int i = 0; i < 4; i++) if (n->sec[i].present && n->sec[i].fs_type == fs_type && !(n->sec[i].sparse && !n->sec[i].sparse->nr)) return i; return -1; }
 
 // ---------------------------------------------------------------- trees
 NxNode *nx_node_new(const char *name, size_t nlen, int is_dir) {

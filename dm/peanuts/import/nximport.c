@@ -404,7 +404,10 @@ int nximport_write_nup(const char *out_nup, const char **inputs, int n_inputs, c
         if (!(base_prog = job_nca(j, base->c, base->program))) goto out;
         int ex = nx_nca_find_section(base_prog, NX_FS_PFS0); base_rom = nx_nca_find_section(base_prog, NX_FS_ROMFS);
         NxNode *exefs = ex >= 0 ? nx_pfs0_tree(base_prog, ex) : NULL; if (ex >= 0 && !exefs) goto out;
-        NxNode *romfs = base_rom >= 0 ? nx_romfs_tree(base_prog, base_rom) : NULL; if (base_rom >= 0 && !romfs) { nx_node_free(exefs); goto out; }
+        // PEANUTS: a sparse base RomFS (Castlevania: Belmont's Curse) holds only the ranges its update reads from it, its own header included only in the update: it is the
+        // update's base (nx_nca_set_base below), not a tree of its own
+        int rom_tree = base_rom >= 0 && !base_prog->sec[base_rom].sparse;
+        NxNode *romfs = rom_tree ? nx_romfs_tree(base_prog, base_rom) : NULL; if (rom_tree && !romfs) { nx_node_free(exefs); goto out; }
         if (add_pkg(j, 0, base->title_id, base->version, exefs, romfs)) goto out;
         j->base_rom = base_prog; j->base_rom_sec = base_rom;
     }

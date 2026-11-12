@@ -37,6 +37,9 @@ struct NxNca;
 typedef struct NxReloc { uint64_t virt, phys, end; uint32_t patch; } NxReloc;
 typedef struct NxSubsec { uint64_t off, end; uint32_t ctr_val; } NxSubsec;
 typedef struct NxBktr { NxReloc *r; uint32_t nr; NxSubsec *s; uint32_t ns; uint64_t total; uint64_t tables_off; } NxBktr;
+// PEANUTS: a sparse section (the fs header's SparseInfo @0x148, Atmosphère SparseStorage): virtual ranges of the section read from the NCA body at phys_base + phys (patch = 0)
+// or as zeros (patch = 1, the storage index), each decrypted with the counter of its virtual position; no entries: the whole section is zeros
+typedef struct NxSparse { NxReloc *r; uint32_t nr; uint64_t phys_base; } NxSparse;
 // a compressed section (the fs header's CompressionInfo @0x178, LibHac/Atmosphère CompressedStorage): entries of the data level, sorted by virtual offset
 typedef struct NxCompEntry { uint64_t virt, end, phys; uint32_t psize; uint8_t type; /* 0 none 1 zeros 3 LZ4 */ } NxCompEntry;
 // a reader's scratch for compressed sections: the last decompressed LZ4 entry (cached = its index in comp->e) and the compressed bytes' buffer.
@@ -52,6 +55,7 @@ typedef struct NxSection {
     NxBktr *bktr; struct NxNca *base; int base_sec;
     int compressed;              // the header has a compression table (loaded on the first read: for a BKTR section it lives in the patched bytes)
     NxComp *comp;
+    NxSparse *sparse;            // PEANUTS: the sparse layer's table (nx_nca_open), below everything else
 } NxSection;
 typedef struct NxNca {
     int fd; uint64_t base_off, size; char id[0x41];
