@@ -14,7 +14,7 @@ nxGames.each { g ->
 }
 // PEANUTS: -PnxGenericHost=true builds one libnxhost.so/libnxlaunch.so for nxGames instead of one compiled-in pair per title (design/platform/IMPL-GENERIC.md).
 // Each title still needs its own runtime profile data (dm/peanuts/profile/gen_runtime_profile.py), packed into assets below, not a compiled header.
-def nxGenericHost = providers.gradleProperty('nxGenericHost').getOrElse('false') == 'true'
+def nxGenericHost = providers.gradleProperty('nxGenericHost').getOrElse(providers.gradleProperty('nxApp').getOrElse('') == 'peanuts' ? 'true' : 'false') == 'true'   // PEANUTS: on by default for the Peanuts app; -PnxGenericHost=false gives one host per title
 // -PnxPlay=true builds a second app (dev.nxnative.android.play, "Banana Native") that installs beside the test app, so test installs leave it alone
 def nxPlay = providers.gradleProperty('nxPlay').getOrElse('false') == 'true'
 // -PnxApp=<suffix> builds another test app, dev.nxnative.android.<suffix> ("Banana Native <suffix>", or -PnxLabel), beside the test app: one game's bring-up (-PnxApp=mkw) installs
