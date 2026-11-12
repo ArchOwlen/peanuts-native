@@ -660,6 +660,9 @@ def key_int(k): return int(k, 16)
 
 
 ZSTD_LEVEL = 19   # SPIR-V of this translator compresses about 5:1 at 19 (3.5:1 at 3); a trained dictionary gained 1-7 % more and is not used
+# DMSH_VK_ZSTD_LEVEL: the phone's packer sets a low level. Measured on 2,000 of Link's Awakening's modules (64 MB): level 19 4.39:1 in 12.0 s, level 6 3.68:1 in 0.53 s,
+# level 3 3.52:1 in 0.18 s; on the AYN Thor level 19 was 51 % of the shaders step (the translator itself 4 %)
+ZSTD_LEVEL = int(os.environ.get('DMSH_VK_ZSTD_LEVEL', ZSTD_LEVEL))
 
 
 def pack_module(data):

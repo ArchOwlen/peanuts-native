@@ -590,6 +590,7 @@ public final class PackService extends Service {
         PackEngine.setenv("SPIRV_VAL", "libSPIRV-Tools-shared.so");
         // a library without every shader is a failed step, never a finished one; with Try anyway (the player's choice, warned that parts may not show) it is written
         PackEngine.setenv("DMSH_VK_REQUIRE_ALL", j.tryAnyway() ? "0" : "1");
+        PackEngine.setenv("DMSH_VK_ZSTD_LEVEL", "6");   // PEANUTS: the library's modules at zstd 6, not 19: 23x faster for a library 19 % larger (vk_android_build.py ZSTD_LEVEL); level 19 was half of the shaders step
         PackEngine.setenv("DMSH_VK_XLATE_J", "2");       // two translator calls at once: more threads of one process add little on the phone (android/ONDEVICE.md, The translator on the phone); the env file below can change it
         // worker interpreters (sub-interpreters of this process, each with its own GIL: the Python half no longer runs on one core), one a big or mid core, at most 4
         // (CpuCores; android/SHADERS.md#build); the library is the same for any count. J above is then the threads of all the workers together
