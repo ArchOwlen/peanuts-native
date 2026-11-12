@@ -19,7 +19,29 @@ public final class GameEnv {
 
     private GameEnv() {}
 
+    /**
+     * Peanuts' own per-title defaults, each a line the player can override in the game's settings. The Legend of Zelda: Link's Awakening: handheld mode (DM_OPMODE=0, the
+     * Switch's own 1280x720 for this game) — in console mode its 1920x1080 frame takes the Thor's GPU 7.5 ms median and 15 ms at the 90th percentile for ~830 draws, so
+     * play dipped to 50 fps; handheld holds 60 at 4.3 / 8.6 ms, and the picture is what the Switch shows on its own screen
+     */
+    private static final String[][] DEFAULTS = {{"01006BB00C6F0000", "DM_OPMODE", "0"}};
+
+    public static void ensureDefaults(Context c, String titleId) {
+        if (titleId == null) return;
+        for (String[] d : DEFAULTS) {
+            if (!d[0].equalsIgnoreCase(titleId)) continue;
+            try {
+                String env = Upstream.gameEnv(c, titleId);
+                String out = withDefault(env, d[1], d[2]);
+                if (!out.equals(env == null ? "" : env)) { Upstream.gameEnv(c, titleId, out); Log.i(TAG, "env " + titleId + ": " + d[1] + "=" + d[2] + " (Peanuts default)"); }
+            } catch (ReflectiveOperationException e) {
+                Log.w(TAG, "env " + titleId + ": " + e);
+            }
+        }
+    }
+
     public static void ensureFonts(Context c, String titleId) {
+        ensureDefaults(c, titleId);
         if (titleId == null || titleId.isEmpty()) return;
         File dir = PeanutsPrefs.fontsDir(c);
         File std = new File(dir, "standard.ttf"), ext = new File(dir, "nintendo_ext.ttf");
