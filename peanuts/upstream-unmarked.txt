@@ -1,0 +1,2 @@
+dm/gfx/tools/vk_android_build.py	feeds DMSH_VK_CHAIN (dmsh_chain.py / vk_android_build.py VK_FILES); any edit, including a comment, forces re-translating every installed game's shader library -- listed in peanuts/UPSTREAM-EDITS.md's "Shader-chain exceptions" table instead of marked, per CRITIQUE-phase1.md UPSTREAM section
+dm/gfx/tools/vk_android_same.tsv	feeds DMSH_VK_CHAIN as a byte-sensitive tools-digest-to-library-version comparison table; listed in peanuts/UPSTREAM-EDITS.md's "Shader-chain exceptions" table instead of marked, same reason as vk_android_build.py above
