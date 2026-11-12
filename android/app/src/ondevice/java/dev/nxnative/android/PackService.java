@@ -557,6 +557,7 @@ public final class PackService extends Service {
         // the split reads only the files the profile's shader_map.tsv names when the dump's build is the profile's, and keeps that result only when its tables are the
         // profile's; otherwise it scans every file (android/SHADERS.md, Targeted split)
         PackEngine.setenv("DM_SPLIT_TARGETED", "1");
+        PackEngine.setenv("DM_SPLIT_DIRECT", "1");   // a targeted file whose map sources name their containers (#BNSH@ / #BAHS@ / #IDRK@ offsets) is read at those containers only, not whole // PEANUTS
         PackEngine.setenv("DM_PACKER_COMMIT", BuildConfig.NX_COMMIT);   // pack.tsv's packer: no repository on the phone to ask
         PackEngine.setenv("NX_PACK_WORK", od.getPath());
         PackEngine.setenv("NX_PACK_VERSION", v);

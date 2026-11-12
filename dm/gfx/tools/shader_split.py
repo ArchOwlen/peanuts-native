@@ -64,6 +64,8 @@
 #   Environment DM_SPLIT_FILES=<file>: also write the RomFS files any shader was found in, first appearances or not (a profile's shader_files.tsv, from a full split)
 #   Environment DM_SPLIT_SELECTED=1 (the phone's split of a profile with a selected set, PackService): the package keeps the code of only the profile's shader_seen.tsv keys and the pixel
 #   shaders paired with them (what vk_android_build.py builds from a key list); every other shader's record is empty (KEEP, Shaders). The tables (shader_map.tsv ...) are those of a full split
+#   Environment DM_SPLIT_DIRECT=1 (with DM_SPLIT_TARGETED=1; the phone's split): a file whose map sources all name a container with its offset (#BNSH@, #BAHS@, #IDRK@) is read at those
+#   containers only, not whole (direct_targets, direct_file); its tables must still be the profile's, else the targeted scan of the whole files follows (log: 'direct split: ...')
 # Memory: the shaders are deduplicated by key as they are found (Shaders), and a large compressed container is inflated into a temporary file rather than memory (idrk_shaders); a file of
 #   RomFS over LARGE bytes prints 'progress: <done>/<total> <n>%' as it is read, when the scan runs in this process (J=1)
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
@@ -655,18 +657,20 @@ def idrk_data(d, a, b, flags, head=None, sink=None):
         a += cs
     return None if sink is not None else b''.join(out)
 
-def idrk_shaders(path, label, out):
+def idrk_shaders(path, label, out, only=None):
     """Koei Tecmo's KTGL keeps its shaders in G2S containers ('_S2G3000', type KTID 0x7bcd279f in Age of Calamity: 23,108 entries in three RDB files, 2.3 GB inflated), each a material's variations
     as GLSLC compiler outputs (glslc_shaders). One '_DOK0000' container (type KTID 0x20a6a0bb, the engine's system resources; once in system.rdb.bin and once in the update's .bin1) holds 151 bare
     GLSLC outputs without a G2S wrapper, among them 21 shaders the first battle draws. No other entry type holds any. The RDB files are up to 3.8 GB, so they are mapped rather than read,
     and only entries whose data starts with one of those two magics are inflated. A container that inflates to more than SPOOL bytes (Pokémon Pokopia's 2.38 GiB .fdata) is
-    inflated into a temporary file, read through a mapping, instead of joined in memory; its outputs go to out as they are found (a Shaders keeps one copy of each key)"""
+    inflated into a temporary file, read through a mapping, instead of joined in memory; its outputs go to out as they are found (a Shaders keeps one copy of each key).
+    only: the data offsets of the entries to read (the direct scan, direct_file); the others are passed over without a look at their data"""
     from romfs import mmap
     import tempfile
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
         at = InFile(label, len(d))
         for a, b, flags, n in idrk_entries(d):
             at.now(a)
+            if only is not None and a not in only: continue
             if idrk_data(d, a, b, flags, 4) not in (b'_S2G', b'_DOK'): continue
             where = f'{label}#IDRK@{a:#x}'
             if n > SPOOL and flags & 0x500000:
@@ -2392,9 +2396,9 @@ NV_STAGES = ['vs', 'ps', 'gs', 'hs', 'ds', 'cs']   # NVN stage order
 COMMON, TREES = None, {}   # Unity common strings and borrowed type trees (given when the pool starts)
 ZDICTS, _ZD = {}, {}       # zstd dictionaries by ID (given when the pool starts) and their digested form in this process
 
-def _pool_init(common, trees, zdicts={}):
-    global COMMON, TREES, ZDICTS
-    COMMON, TREES, ZDICTS = common, trees, zdicts
+def _pool_init(common, trees, zdicts={}, direct=None):
+    global COMMON, TREES, ZDICTS, DIRECT
+    COMMON, TREES, ZDICTS, DIRECT = common, trees, zdicts, direct
 
 def zs_dicts(romfs):
     """Tears of the Kingdom compresses its RomFS files with zstd dictionaries (the frame header names one, ID 1 for the shader packages). They ship as Pack/ZsDic.pack.zs:
@@ -2838,8 +2842,11 @@ def var_pairs(found):
 def scan_file(args):
     """→ (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, 'defer' (no type tree, scanned again in the second pass), or ('unreadable', why).
     A file no reader can read (a format revision the reader does not know: its red line, or the exception it raised) is left out, and the split goes on: one such
-    archive used to end the whole split with nothing written (PR #282: one of Mario Strikers: Battle League's 879 Next Level Games archives). main reports them"""
-    try: return scan_file_in(args)
+    archive used to end the whole split with nothing written (PR #282: one of Mario Strikers: Battle League's 879 Next Level Games archives). main reports them.
+    A file of DIRECT (DM_SPLIT_DIRECT) is read at its recorded containers (direct_file), whole when that cannot be done"""
+    try:
+        if DIRECT and len(args) == 2 and (t := DIRECT.get(args[1])) and (r := direct_file(args, t)) is not None: return r
+        return scan_file_in(args)
     except (Exception, SystemExit) as e:   # red() is a SystemExit
         why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
         if not why.lstrip('/').startswith(args[1]): why = f'{args[1]}: {why}'   # most red lines name the file already
@@ -2932,23 +2939,13 @@ def scan_file_in(args):
                 if '.fx' in entry[0] or '/shaders/' in entry[0] or entry[0].endswith(('.vs.bin', '.ps.bin', '.fs.bin')):
                     found += phyre_shaders(vbf.read(f, entry), f'/{rel}/{entry[0]}')
         return rel, uniq_keys(found), var_pairs(found), trees
-    if head[:4] == ZSTD_MAGIC: d = unzs(path)   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
-    else:
-        with open(path, 'rb') as f: d = f.read()
-    if d[:3] == b'\x1f\x8b\x08':   # standard gzip: Skyward Sword HD's Shaders.arc.gz wraps paired GLSLC outputs
-        d = ungzip(d, '/' + rel); head = d[:16]   # later format probes inspect decoded bytes, not the gzip timestamp
-    if head[4:5] == b'\x78' and path.endswith('.gz') and (z := gust_gz(d)) is not None: d = z   # Gust's chunked zlib (gust_gz)
-    # Monolith also ships these containers loose, without an ARH/ARD archive
-    # (Xenoblade DE). The generic prefilter below otherwise drops even HCPS.
-    # DRSM model streams contain several embedded XBC1 resources.
-    if d[:4] in (b'HCPS', b'xbc1', b'DRSM') or d[:8] == b'cmp\0zlib':
+    d, kind = plain_blob(path, rel, head)
+    if kind == 'monolith':
         scan_blob(d, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
-    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC:
+    if kind == 'phyre':
         found += phyre_shaders(d, '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
-    if head[:4] != ZSTD_MAGIC and head[4:8] in (ZSTD_MAGIC, LZ4_FRAME_MAGIC): d = unsized(d, '/' + rel)   # HAL's .cmp containers (Kirby and the Forgotten Land: 7,201 of them, 5,121 zstd frames with 19,364 BNSH inside and 2,080 LZ4 frames). Read raw, the split found 121 shaders and the game asked for 900 it did not have ("[RED] shader ... is not in the shader map")
-    if d[:4] == b'Yaz0': d = yaz0(d, '/' + rel)
     if d[:3] == b'XNB' and d[4] == 5 and d[5] & 0xC0 and len(d) > 14:   # a compressed XNB (Stardew Valley: 3,535 LZ4 files, 8 LZX): only effects (EffectReader) carry MGFX shaders, and for LZX the reader names sit in the first block, so it decides whether the rest is worth decoding
         if d[5] & 0x80:
             head_d = xnb_decompress(d, first_block=True)
@@ -2968,6 +2965,115 @@ def scan_file_in(args):
         # main's 49). Metroid Dread's MSHD files hold GLSLC outputs too, which mshd_shaders already reads; no other profile's loose files hold any
         if not found and d[:4] != b'MSHD' and b'\x91\x68\x86\x19' in d: found += glslc_shaders(d, '/' + rel, need=False)
     return rel, uniq_keys(found), var_pairs(found), trees
+
+def plain_blob(path, rel, head):
+    """A file of no archive reader's, read as scan_file_in's last branch reads it: zstd by its magic (Paper Mario: The Thousand-Year Door names its zstd files .zst: 8,726, its shaders
+    among them), standard gzip (Skyward Sword HD's Shaders.arc.gz wraps paired GLSLC outputs; the later probes see the decoded bytes, not the gzip timestamp), Gust's chunked zlib (gust_gz),
+    HAL's .cmp containers (Kirby and the Forgotten Land: 7,201 of them, 5,121 zstd frames with 19,364 BNSH inside and 2,080 LZ4 frames; read raw, the split found 121 shaders and the game
+    asked for 900 it did not have), Yaz0. → (the bytes, kind): kind 'monolith' for a loose Monolith container (HCPS / XBC1 / DRSM / cmp-zlib, which Xenoblade DE ships without an ARH/ARD
+    archive; the generic prefilter would drop even HCPS), 'phyre' for a Phyre program, else None (the bytes then unsized and Yaz0-decoded, for the probes that follow)"""
+    if head[:4] == ZSTD_MAGIC: d = unzs(path)
+    else:
+        with open(path, 'rb') as f: d = f.read()
+    if d[:3] == b'\x1f\x8b\x08': d = ungzip(d, '/' + rel); head = d[:16]
+    if head[4:5] == b'\x78' and path.endswith('.gz') and (z := gust_gz(d)) is not None: d = z
+    if d[:4] in (b'HCPS', b'xbc1', b'DRSM') or d[:8] == b'cmp\0zlib': return d, 'monolith'
+    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC: return d, 'phyre'
+    if head[:4] != ZSTD_MAGIC and head[4:8] in (ZSTD_MAGIC, LZ4_FRAME_MAGIC): d = unsized(d, '/' + rel)
+    if d[:4] == b'Yaz0': d = yaz0(d, '/' + rel)
+    return d, None
+
+# ---- Direct scan (DM_SPLIT_DIRECT=1, with DM_SPLIT_TARGETED=1): the recorded containers of a file instead of the whole file ----
+# The map's source column names where each key first appears, down to its container: '/Common/Effect/common.ptcl#BNSH@0x1140000#var43' is the BNSH container at 0x1140000 of that file,
+# '/ShaderData/alCloudShader.szs/alCloudShader.sharcb#BAHS@0x10198' an entry of the BAHS file that is a member of that SARC, '/motor_asset_re/0x.fdata#IDRK@0x1234#GLSLC@0x56' a GLSLC output in the
+# G2S container of the IDRK entry whose data starts at 0x1234. The full scan of a file reads all of it (every container, every variation, and the substring probes over the whole file:
+# Mario Kart 8 Deluxe's 6,597 files took the phone two hours). A file whose sources all have one of these three forms is read at those containers only: the file is loaded as the full scan
+# loads it (plain_blob, the SARC members on the way), each recorded container is parsed whole (bnsh_shaders / bahs_shaders / idrk_shaders, the same readers, in the full scan's order), and
+# nothing else is looked at. The shaders of the recorded containers are the full scan's, with the same labels; a container the map does not name holds only copies of shaders found
+# earlier, and is left out (its variations could pair those copies anew, as a file of shader_files.tsv can: then the tables differ from the profile's, and main() falls back to the targeted
+# scan, then the full one). A file with any other source form, no source (shader_files.tsv's), an archive reader's head, a member the archive lacks or a container not at its offset is
+# scanned whole, as today. The results (scan_file's tuple) are interchangeable with a scan job's: ScanCache keeps them in their own folder (<DM_SPLIT_RESUME>/direct)
+DIRECT = None   # {relative path: [(member path, kind, offset)]} of the files the direct scan reads (direct_targets), given when the pool starts
+DIRECT_FORMS = re.compile(r'#BNSH@(0x[0-9a-f]+)#var[0-9]+$|#BAHS@(0x[0-9a-f]+)$|#IDRK@(0x[0-9a-f]+)#GLSLC@0x[0-9a-f]+(#var)?$')
+
+def source_file(s, rels):
+    """The RomFS file of a map source (without its leading '/'): the shortest prefix ending at a '/' or '#' or the end that is a file of the dump (rels), or None"""
+    return next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#'] + [len(s)] if s[:i] in rels), None)
+
+def map_sources():
+    """The RomFS sources of the profile's shader_map.tsv, without their leading '/' (main's and the captures' are not RomFS files: NOT_ROMFS)"""
+    srcs = set()
+    with open(GAME.table('shader_map.tsv'), encoding='utf-8') as f:
+        for ln in f:
+            c = ln.rstrip('\n').split('\t')
+            if len(c) > 4 and c[0].endswith('.bin') and c[4].startswith('/') and not c[4].startswith(NOT_ROMFS): srcs.add(c[4][1:])
+    return srcs
+
+def direct_targets(files):
+    """DM_SPLIT_DIRECT=1: {relative path: [(member path, kind, offset)]} of the files among files ((path, rel) of the targeted scan's plain jobs) whose every map source is a recorded container
+    (DIRECT_FORMS); kind 'BNSH' with the container's offset, 'BAHS' with 0 (the member is the BAHS file, parsed whole), 'IDRK' with the entry's data offset. The member path is '' for the
+    file itself, else '/<member>[/<member>]' inside its SARCs, as scan_blob labels them"""
+    rels = {r for _, r in files}
+    out, plain = collections.defaultdict(set), set()
+    for s in map_sources():
+        r = source_file(s, rels)
+        if r is None: continue
+        m = DIRECT_FORMS.search(s[len(r):])
+        if not m: plain.add(r); continue
+        member = s[len(r):m.start()]
+        if m.group(1): out[r].add((member, 'BNSH', int(m.group(1), 16)))
+        elif m.group(2): out[r].add((member, 'BAHS', 0))
+        elif not member: out[r].add((member, 'IDRK', int(m.group(3), 16)))
+        else: plain.add(r)
+    return {r: sorted(t) for r, t in out.items() if r not in plain}
+
+def direct_file(args, targets):
+    """scan_file's result for a file of DIRECT: its recorded containers only; None when the file is to be scanned whole (another reader's head, a member or container not where the
+    map says, a reader's error: the whole scan then says what is wrong, as before)"""
+    path, rel = args
+    try:
+        with open(path, 'rb') as f: head = f.read(16)
+        found = Shaders()
+        stem, ext = os.path.splitext(path)
+        if ext in ('.data', '.patch', '.debug', '.nxpc') and os.path.exists(stem + '.dict') or head[:4] == NLG_DICT: return None
+        if head[:8] in (IDRK, PDRK):
+            if any(k != 'IDRK' for _, k, _ in targets): return None
+            idrk_shaders(path, '/' + rel, found, only={o for _, _, o in targets})
+            return rel, uniq_keys(found), var_pairs(found), {}
+        if any(k == 'IDRK' for _, k, _ in targets): return None
+        if head[:4] in (BND2, SPKG, RFRM, b'BERG', MTARC, SCNE, b'BMSG', b'SRYK') or head[:3] == b'PAK' or head[:8] == GFPAK or ue3_package(head) or head[:4] == b'\0\0\1\0' and path.endswith('.gz'): return None
+        d, kind = plain_blob(path, rel, head)
+        if kind or d[:3] == b'XNB' or d[:8] == b'UnityFS\0' or (d[8:11] == b'\0\0\0' and __import__('unityfs').is_serialized(d)): return None
+        if not direct_blob(d, '/' + rel, {m: [(k, o) for _, k, o in g] for m, g in __import__('itertools').groupby(targets, key=lambda t: t[0])}, found): return None
+        return rel, uniq_keys(found), var_pairs(found), {}
+    except (Exception, SystemExit) as e:
+        print(f'direct: /{rel}: {str(e).removeprefix("[RED] ")}; the file is scanned whole', flush=True)
+        return None
+
+def direct_blob(d, label, targets, found):
+    """The recorded containers of a blob into found: targets = {member path: [(kind, offset)]}, '' the blob itself. A Yaz0 blob is decoded; the members are those of a SARC, taken in its
+    order (the full scan's: the first copy of a key keeps its label). False when a member or container is not where the map says"""
+    if d[:4] == b'Yaz0': d = yaz0(d, label)
+    own = targets.get('')
+    if own is not None:
+        if len(targets) > 1 or d[:4] == b'SARC': return False   # scan_blob reads a SARC's members, never the archive itself
+        for kind, off in sorted(own, key=lambda t: t[1]):
+            if kind == 'BAHS':
+                if d[:4] != b'BAHS': return False
+                found += bahs_shaders(d, label)
+            else:
+                if off + 0x64 > len(d) or d[off:off + 8] != b'BNSH\0\0\0\0' or off + struct.unpack_from('<I', d, off + 0x1c)[0] > len(d) or d[off + 0x60:off + 0x64] != b'grsc': return False
+                found += bnsh_shaders(d, off, label)
+        return True
+    if d[:4] != b'SARC': return False
+    left = dict(targets)
+    for nm, m in sarc_members(d, label):
+        sub = {k[len(nm) + 1:]: v for k, v in left.items() if k == '/' + nm or k.startswith('/' + nm + '/')}
+        if not sub: continue
+        if not direct_blob(m, f'{label}/{nm}', sub, found): return False
+        for k in list(left):
+            if k == '/' + nm or k.startswith('/' + nm + '/'): del left[k]
+    return not left
 
 def uniq_keys(found):
     """{key: entry} of the first copy of each key (a Shaders, or a list of (where, stage, control, code))"""
@@ -3210,28 +3316,34 @@ def main():
     out = None
     if targeted:
         want, why = profile_files(files, main_v)
-        if rd:   # the targeted and the full scan keep their results apart, so a full scan the targeted one fell back to resumes as the full scan
+        if rd:   # the direct, the targeted and the full scan keep their results apart, so a scan the one before fell back to resumes as that scan
             os.makedirs(rd, exist_ok=True)
             for f in os.listdir(rd):
-                if f not in ('targeted', 'full', 'targeted.failed'): _remove(os.path.join(rd, f))   # an older split's results, kept in the folder itself
+                if f not in ('direct', 'targeted', 'full', 'direct.failed', 'targeted.failed'): _remove(os.path.join(rd, f))   # an older split's results, kept in the folder itself
         if want is not None:
             big, todo = scan_jobs(files, want)
             dg = scan_digest(inputs, big + todo + mains)
-            failed = os.path.join(rd, 'targeted.failed') if rd else None
-            if failed and os.path.isfile(failed) and open(failed).read().strip() == dg: why = 'an earlier run on these inputs found the targeted scan\'s tables differ from the profile\'s'
-            else:
-                print(f'targeted split: {len(want):,} of {len(files):,} RomFS files hold the shaders of the profile\'s shader_map.tsv (main build {", ".join(build_id(m) for m in main_v)}); only these are scanned', flush=True)
+            print(f'targeted split: {len(want):,} of {len(files):,} RomFS files hold the shaders of the profile\'s shader_map.tsv (main build {", ".join(build_id(m) for m in main_v)}); only these are scanned', flush=True)
+            # the direct scan first (DM_SPLIT_DIRECT: the recorded containers of each file, direct_targets), the targeted scan of the whole files when its tables differ; each keeps its
+            # own results and its own 'failed' digest (ScanCache's digest with the containers, as the results hold other shaders)
+            modes = [('targeted', None, dg)]
+            if os.environ.get('DM_SPLIT_DIRECT') == '1' and (dt := direct_targets(todo)):
+                modes.insert(0, ('direct', dt, hashlib.sha256((dg + repr(sorted(dt.items()))).encode()).hexdigest()))
+            for mode, direct, mdg in modes:
+                failed = os.path.join(rd, mode + '.failed') if rd else None
+                if failed and os.path.isfile(failed) and open(failed).read().strip() == mdg: why = f'the {mode} scan\'s tables were found to differ from the profile\'s by an earlier run on these inputs'; continue
+                if direct: print(f'direct split: {len(direct):,} of {len(todo):,} file jobs read only their recorded containers ({sum(len(t) for t in direct.values()):,} containers, DM_SPLIT_DIRECT); the other {len(todo) - len(direct):,} and the {len(big):,} archive jobs are scanned whole', flush=True)
                 stage(f'reading the {len(want):,} files that hold shaders')
                 try:
-                    out = split_tables(list(results), big, todo, dumps, J, common, zdicts, ScanCache(os.path.join(rd, 'targeted'), dg) if rd else None, targeted=True)
+                    out = split_tables(list(results), big, todo, dumps, J, common, zdicts, ScanCache(os.path.join(rd, mode), mdg) if rd else None, targeted=True, direct=direct)
                     stage('comparing the shaders found with the app\'s list')
                     why = profile_differs(out, pairsout, psopairsout)
                 except Fallback as e: why = str(e)
-                if why:
-                    out = None; why = 'the targeted scan ' + why
-                    if failed:
-                        with open(failed, 'w') as f: f.write(dg + '\n')
-                else: print('targeted split: its tables are the profile\'s, byte for byte', flush=True)
+                if not why: print(f'{mode} split: its tables are the profile\'s, byte for byte', flush=True); break
+                out = None; why = f'the {mode} scan ' + why
+                if failed:
+                    with open(failed, 'w') as f: f.write(mdg + '\n')
+                if mode != modes[-1][0]: print(f'{mode} split: not taken, {why}: the whole files are scanned', flush=True)
         if out is None: print(f'targeted split: not taken, {why}: every file is scanned', flush=True)
     if out is None:
         print(f'split: looking for archives among {len(files):,} RomFS files', flush=True)   # each file is opened (zip_jobs): a minute or more on a large RomFS, before the first progress line
@@ -3344,12 +3456,12 @@ def scan_jobs(files, want=None):
     if want is not None: big, files = [j for j in big if j[1] in want], [f for f in files if f[1] in want]
     return big, files
 
-def split_tables(results, big, files, dumps, J, common, zdicts, cache, targeted=False):
+def split_tables(results, big, files, dumps, J, common, zdicts, cache, targeted=False, direct=None):
     """Scans the jobs (results: main's, which come first) → the split's outputs, the tables as text: {'keys', 'order', 'rows', 'map', 'facts', 'pairs', 'pso', 'files', 'npairs', 'bad', 'summary'}.
-    targeted: Fallback when a Unity serialized file wants a type tree, which a bundle the scan left out may lend"""
+    targeted: Fallback when a Unity serialized file wants a type tree, which a bundle the scan left out may lend. direct: the files read at their recorded containers (direct_targets, DIRECT)"""
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
-    with pool(J, common, {}, zdicts) as ex:
+    with pool(J, common, {}, zdicts, direct) as ex:
         n = len(big) + len(files)
         results += pooled(ex, big, n, cache=cache) + pooled(ex, files, n, len(big), chunk=16, cache=cache)
     stage('sorting the shaders found')
