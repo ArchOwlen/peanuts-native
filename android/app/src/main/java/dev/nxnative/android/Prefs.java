@@ -70,7 +70,9 @@ final class Prefs {
     static void padFirst(Context c, String key) { of(c).edit().putString("pad_first", key == null ? "" : key).commit(); }
 
     /** Button mapping (PadMap, DM_PAD_MAP): Settings' default ("" = none: the host's default), then each game's own (unset = Settings'; "" = none for this game) */
-    static String padMap(Context c) { return of(c).getString("pad_map", ""); }
+    static String padMap(Context c) { return of(c).getString("pad_map", BuildConfig.APPLICATION_ID.endsWith(".peanuts") ? PEANUTS_PAD_MAP : ""); }
+    /** PEANUTS: the Peanuts app's default Button mapping: the face buttons by name (A=A, B=B, X=X, Y=Y), i.e. A/B and X/Y swapped from the positional default; the editor changes it */
+    static final String PEANUTS_PAD_MAP = "BUTTON_A=A,BUTTON_B=B,BUTTON_X=X,BUTTON_Y=Y";
     static void padMapDefault(Context c, String spec) { of(c).edit().putString("pad_map", spec == null ? "" : spec).commit(); }
     static String padMap(Context c, String titleId) { return of(c).getString(gameKey("pad_map", titleId), padMap(c)); }
     static boolean ownPadMap(Context c, String titleId) { return of(c).contains(gameKey("pad_map", titleId)); }
