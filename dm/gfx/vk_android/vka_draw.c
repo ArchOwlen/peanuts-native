@@ -1998,7 +1998,11 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
 // Lower vegetation detail removes only the profile's reviewed mesh draws.
 static int vegetation_cut(const vka_dstate *d, vka_shader *const *sh) {
     if (!DM_GAME_NMESH_VEGETATION_CUT || VKA_ENV("DM_VK_VEGETATION", 1) || d->tf_on) return 0;
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own key list instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    const uint64_t *keys = g_profile.mesh_vegetation_cut;
+#else
     static const uint64_t keys[] = DM_GAME_MESH_VEGETATION_CUT;
+#endif
     unsigned i = 0;
     while (i < DM_GAME_NMESH_VEGETATION_CUT && keys[i] != sh[7]->key) i++;
     if (i == DM_GAME_NMESH_VEGETATION_CUT) return 0;
@@ -2084,8 +2088,12 @@ static vkpp_pair g_pp_dep[64];
 static struct { uint64_t key, ind, dep, frame, fs; } g_dom[16]; static int g_dom_next;
 static uint64_t g_unlisted[64][2]; static int g_unlisted_n;
 static int prepass_listed(uint64_t prepass, uint64_t colour) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    const uint64_t (*cut)[4] = g_profile.mesh_prepass_cut;
+#else
     static const uint64_t cut[][4] = DM_GAME_MESH_PREPASS_CUT;
-    for (int i = 0; i < DM_GAME_NMESH_PREPASS_CUT; i++) if (cut[i][0] == prepass && cut[i][1] == colour) return 1;
+#endif
+    for (int i = 0; i < (int)DM_GAME_NMESH_PREPASS_CUT; i++) if (cut[i][0] == prepass && cut[i][1] == colour) return 1;
     return 0;
 }
 // A depth-only mesh draw is remembered; an EQUAL mesh draw from the indirect record of one in this frame or the one before, into the same depth image, whose pair no row
@@ -2114,7 +2122,11 @@ static void prepass_unlisted(const vka_dstate *d, const p_set_rt *rt, int has_rt
 }
 // -1: a prepass draw, not drawn; 1: a colour draw to test LEQUAL for EQUAL; 2 + i: a colour draw that prepass_draw gives its depth first (pair i); 0: neither
 static int mesh_cut(const vka_dstate *d, const p_set_rt *rt, int has_rt, uint64_t key, uint64_t ind, vka_shader *fs) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    const uint64_t (*cut)[4] = g_profile.mesh_prepass_cut;
+#else
     static const uint64_t cut[][4] = DM_GAME_MESH_PREPASS_CUT;
+#endif
     if (g_fs_sub || g_pp_side) return 0;
     int m = VKA_ENV("DM_VK_MESH_PREPASS_SKIP", -1);
     if (m < 0 ? V.memu || V.driver_id != VK_DRIVER_ID_QUALCOMM_PROPRIETARY : !m) return 0;   // (through compute the driver's mesh stage, whose fault this is, is not used)
@@ -2139,7 +2151,11 @@ static int mesh_cut(const vka_dstate *d, const p_set_rt *rt, int has_rt, uint64_
 // inputs), pixel bindings and depth / stencil / rasterizer state, no colour channel written. 0 = not drawn (the pixel shader refused the move, or the draw stopped
 // before its draw command): the caller tests LEQUAL
 static int prepass_draw(const vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, int i) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    const uint64_t (*cut)[4] = g_profile.mesh_prepass_cut;
+#else
     static const uint64_t cut[][4] = DM_GAME_MESH_PREPASS_CUT;
+#endif
     const prepass_snap *s = prepass_find(i, dw->ind);
     vka_shader *fs = s ? vka_shader_remap(s->fs, cut[i][2]) : NULL;
     if (!fs) return 0;

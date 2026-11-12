@@ -12,6 +12,9 @@ if (!nxGames) throw new GradleException('nxGames: no game (gradle.properties nam
 nxGames.each { g ->
     if (!(g ==~ /[0-9A-F]{16}/)) throw new GradleException("nxGames: each game must be a title ID (16 upper-case hex digits), not $g")
 }
+// PEANUTS: -PnxGenericHost=true builds one libnxhost.so/libnxlaunch.so for nxGames instead of one compiled-in pair per title (design/platform/IMPL-GENERIC.md).
+// Each title still needs its own runtime profile data (dm/peanuts/profile/gen_runtime_profile.py), packed into assets below, not a compiled header.
+def nxGenericHost = providers.gradleProperty('nxGenericHost').getOrElse('false') == 'true'
 // -PnxPlay=true builds a second app (dev.nxnative.android.play, "Banana Native") that installs beside the test app, so test installs leave it alone
 def nxPlay = providers.gradleProperty('nxPlay').getOrElse('false') == 'true'
 // -PnxApp=<suffix> builds another test app, dev.nxnative.android.<suffix> ("Banana Native <suffix>", or -PnxLabel), beside the test app: one game's bring-up (-PnxApp=mkw) installs
@@ -233,11 +236,19 @@ android {
         buildConfigField 'String', 'NX_XLATE_SOURCE', "\"${lockOf('xlate_source')}\""
         // The rewriter's files in pack_android.py's rewrite key (its REWRITER tuple): the launcher computes the key a pack's code must have (PackCheck)
         buildConfigField 'String', 'NX_REWRITER', "\"$nxRewriter\""
+        buildConfigField 'boolean', 'NX_GENERIC_HOST', "$nxGenericHost"   // PEANUTS: Native.java/PackService.java branch on this instead of the per-title libnxhost_<id>.so name
         externalNativeBuild {
             cmake {
-                arguments "-DNX_GAMES=${nxGames.join(',')}", '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON', "-DNX_LSFG=${nxLsfg ? 'ON' : 'OFF'}"
-                // a host and its shim per game, then the custom GPU drivers' loader and hooks (DM_VK_DRIVER)
-                targets(*(nxGames.collectMany { ["nxhost_$it".toString(), "nxlaunch_$it".toString()] } + ['nxadreno', 'hook_impl', 'main_hook'] + (nxApp == 'peanuts' ? ['nximport'] : [])))   // PEANUTS: the importer library
+                // PEANUTS: -PnxGenericHost=true (design/platform/IMPL-GENERIC.md) builds one libnxhost.so/libnxlaunch.so that loads any of nxGames' profiles at
+                // run time, instead of a compiled-in pair per title - gated here, not on by default, so the per-title path (today's APK) stays available.
+                if (nxGenericHost) {
+                    arguments '-DNX_GENERIC_HOST=ON', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON', "-DNX_LSFG=${nxLsfg ? 'ON' : 'OFF'}"
+                    targets(*(['nxhost', 'nxlaunch', 'nxadreno', 'hook_impl', 'main_hook'] + (nxApp == 'peanuts' ? ['nximport'] : [])))
+                } else {
+                    arguments "-DNX_GAMES=${nxGames.join(',')}", '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON', "-DNX_LSFG=${nxLsfg ? 'ON' : 'OFF'}"
+                    // a host and its shim per game, then the custom GPU drivers' loader and hooks (DM_VK_DRIVER)
+                    targets(*(nxGames.collectMany { ["nxhost_$it".toString(), "nxlaunch_$it".toString()] } + ['nxadreno', 'hook_impl', 'main_hook'] + (nxApp == 'peanuts' ? ['nximport'] : [])))   // PEANUTS: the importer library
+                }
             }
         }
     }
@@ -380,4 +391,40 @@ if (nxPackEngine == 'native') {
     android.sourceSets.main.assets.srcDir(nxPack.map { it.dir('assets') })
     android.androidResources.noCompress.add('zip')   // the zips are deflated already; stored, they are read from the APK as they are
     tasks.named('preBuild') { dependsOn jni, assets }
+}
+
+// PEANUTS: -PnxGenericHost=true (design/platform/IMPL-GENERIC.md): each nxGames title's runtime profile (dm/peanuts/profile/gen_runtime_profile.py) and prewarm
+// seed, generated at build time (never compiled into libnxhost.so) into assets/profiles/<title ID>.profile.bin and .seed. dev.peanuts.build.GenericProfile copies
+// them to app-private storage and sets DM_PROFILE_PATH/DM_PROFILE_SEED (GameActivity.start()); PackService does the same for the on-device Unreal Oodle worker.
+if (nxGenericHost) {
+    // The assets srcDir is the *parent* of profiles/ (an assets srcDir's own contents land at the assets root, not under a directory named after it) -
+    // so the generator's output goes to <srcDir>/profiles/<title ID>.profile.bin, landing in the APK at assets/profiles/<title ID>.profile.bin as intended.
+    def genRoot = layout.buildDirectory.dir('generated/nxgenericprofile/assets')
+    def genDir = genRoot.map { it.dir('profiles') }
+    def genProfiles = tasks.register('nxGenericProfiles') {
+        def script = new File(repo, 'dm/peanuts/profile/gen_runtime_profile.py')
+        inputs.file(script)
+        inputs.file(new File(repo, 'dm/games/game.py'))
+        nxGames.each { inputs.file(new File(repo, "dm/games/$it/game.tsv")) }
+        outputs.dir(genDir)
+        doLast {
+            def run = { List<String> args ->
+                def p = new ProcessBuilder(['python3', script.path] + args).directory(repo).redirectErrorStream(true).start()
+                def text = p.inputStream.text
+                if (p.waitFor() != 0) throw new GradleException("gen_runtime_profile.py ${args.join(' ')} failed:\n$text")
+                text
+            }
+            // The build guard (design/platform/IMPL-GENERIC.md §1): fails the whole build loudly if game.py's header() ever emits a macro this generator
+            // does not know, before any per-title file is written - never a silently wrong or missing profile for one title discovered only on a device.
+            logger.lifecycle(run(['check-all']).trim())
+            def o = genDir.get().asFile
+            project.delete(o); o.mkdirs()
+            nxGames.each { g ->
+                run(['profile', g, new File(o, "${g}.profile.bin").path])
+                run(['seed', g, new File(o, "${g}.seed").path])
+            }
+        }
+    }
+    android.sourceSets.main.assets.srcDir(genRoot)
+    tasks.named('preBuild') { dependsOn genProfiles }
 }

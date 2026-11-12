@@ -331,11 +331,16 @@ static void one_lane_env(void) {
     else if (g_one_nenv) VLOG("subgroup_one_lane: %d shader key%s from DM_VK_ONE_LANE", g_one_nenv, g_one_nenv == 1 ? "" : "s");
 }
 static int one_lane_forced(uint64_t key) {
-    static const uint64_t prof[] = DM_GAME_SUBGROUP_ONE_LANE; static pthread_once_t once = PTHREAD_ONCE_INIT;
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own key list instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    const uint64_t *prof = g_profile.subgroup_one_lane;
+#else
+    static const uint64_t prof[] = DM_GAME_SUBGROUP_ONE_LANE;
+#endif
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, one_lane_env);
     for (int i = 0; i < g_one_nenv; i++) if (g_one_env[i] == key) return 1;
     if (g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY))
-        for (int i = 0; i < DM_GAME_NSUBGROUP_ONE_LANE; i++) if (prof[i] == key) return 1;
+        for (int i = 0; i < (int)DM_GAME_NSUBGROUP_ONE_LANE; i++) if (prof[i] == key) return 1;
     return 0;
 }
 static void single_lane(uint64_t key, int stage, uint32_t **w, size_t *nb) {

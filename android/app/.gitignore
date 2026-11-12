@@ -5,4 +5,5 @@ out/
 local.properties
 *.iml
 .idea/
-!src/main/java/dev/peanuts/build/   # PEANUTS: a source package, not a build dir
+# PEANUTS: dev/peanuts/build is a source package, not a build dir
+!src/main/java/dev/peanuts/build/

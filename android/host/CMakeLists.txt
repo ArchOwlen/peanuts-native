@@ -13,10 +13,13 @@ project(nxhost C ASM)
 if(NOT ANDROID OR NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
   message(FATAL_ERROR "libnxhost is built for Android arm64-v8a only: use the NDK toolchain file with -DANDROID_ABI=arm64-v8a")
 endif()
-if(NX_GAMES)
+option(NX_GENERIC_HOST "PEANUTS: one libnxhost.so that loads any title's profile at run time (-PnxGenericHost=true), instead of one host per title" OFF)
+if(NX_GENERIC_HOST)
+  # no GAME / NX_GAMES needed: the generic host is not built for any one title
+elseif(NX_GAMES)
   string(REPLACE "," ";" NX_GAME_LIST "${NX_GAMES}")
 elseif(NOT GAME)
-  message(FATAL_ERROR "GAME is not set: -DGAME=<base game title ID> (the profiles are in dm/games), or -DNX_GAMES=<title ID>,… for one host per game")
+  message(FATAL_ERROR "GAME is not set: -DGAME=<base game title ID> (the profiles are in dm/games), -DNX_GAMES=<title ID>,… for one host per game, or -DNX_GENERIC_HOST=ON")
 endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -110,7 +113,38 @@ function(nxhost_add tgt game)
   target_link_libraries(${tgt} PRIVATE vpx dav1d zstddec aaudio mediandk android log m dl z)   # libvulkan.so is opened at run time (vka_dev.c)
 endfunction()
 
-if(NX_GAMES)
+# PEANUTS: one libnxhost.so for every title (-PnxGenericHost=true, design/platform/IMPL-GENERIC.md), no per-title game_profile.h/vk_prewarm_seed.h custom
+# command: the include path points at dm/peanuts/profile's fixed stand-ins instead (game_profile_generic.h, vk_prewarm_seed_generic.h, both named
+# game_profile.h / vk_prewarm_seed.h on that path so dm.h's #include "game_profile.h" and vka_pso.c's #include "vk_prewarm_seed.h" need no edit), and
+# dm/peanuts/profile/profile_rt.c (the runtime loader) plus a schema stamp (one per build, not per title) are compiled in.
+function(nxhost_add_generic tgt)
+  set(PROFILE_DIR ${ROOT}/dm/peanuts/profile)
+  set(GEN_INC ${GEN}/generic)
+  # configure_file (not file(COPY)) re-runs whenever the source changes, even on an incremental build with no reconfigure, so editing
+  # game_profile_generic.h/vk_prewarm_seed_generic.h cannot silently leave a stale copy on the include path (CRITIQUE-generic.md should-fix).
+  configure_file(${PROFILE_DIR}/game_profile_generic.h ${GEN_INC}/game_profile.h COPYONLY)
+  configure_file(${PROFILE_DIR}/vk_prewarm_seed_generic.h ${GEN_INC}/vk_prewarm_seed.h COPYONLY)
+  set(SCHEMA_H ${GEN}/schema_stamp.h)
+  add_custom_command(OUTPUT ${SCHEMA_H}
+    COMMAND ${Python3_EXECUTABLE} ${PROFILE_DIR}/gen_runtime_profile.py schema-stamp ${SCHEMA_H}
+    DEPENDS ${PROFILE_DIR}/gen_runtime_profile.py ${ROOT}/dm/games/game.py
+    COMMENT "generic host schema stamp")
+  add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${PROFILE_DIR}/profile_rt.c ${SCHEMA_H})
+  target_link_libraries(${tgt} PRIVATE peanuts_rt)
+  set_target_properties(${tgt} PROPERTIES LINKER_LANGUAGE CXX)
+  target_include_directories(${tgt} PRIVATE ${GEN_INC} ${GEN} ${PROFILE_DIR} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST})
+  target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
+  target_compile_options(${tgt} PRIVATE -O1 -g -Wall -Wno-unused-function -Wno-format -fvisibility=hidden)
+  file(GLOB VKA_C ${GFX}/vk_android/*.c)
+  set_source_files_properties(${VKA_C} PROPERTIES COMPILE_OPTIONS -O2)
+  target_link_options(${tgt} PRIVATE -Wl,-Bsymbolic -Wl,--no-undefined -Wl,--error-limit=0 -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libnxhost.map)
+  set_target_properties(${tgt} PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/libnxhost.map)
+  target_link_libraries(${tgt} PRIVATE vpx dav1d zstddec aaudio mediandk android log m dl z)
+endfunction()
+
+if(NX_GENERIC_HOST)
+  nxhost_add_generic(nxhost)
+elseif(NX_GAMES)
   foreach(g ${NX_GAME_LIST})
     if(NOT g MATCHES "^[0-9A-F]+$" OR NOT EXISTS ${ROOT}/dm/games/${g}/game.tsv)
       message(FATAL_ERROR "NX_GAMES: ${g} is not a profile in dm/games")

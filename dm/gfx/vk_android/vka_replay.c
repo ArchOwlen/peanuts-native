@@ -197,6 +197,15 @@ extern uint64_t vka_n_rp;
 __attribute__((visibility("default"))) int nxhost_replay(int argc, char **argv) {
     const char *path = NULL, *png = NULL, *maxpx_arg = "0", *dump = NULL, *outdir = NULL; int repeat = 1, warm = 1, index = 1, nopng = 0, list = 0, dump_rt = 0, dump_gpu = 0, flip = -1, sync = 0;
     setvbuf(stdout, NULL, _IOLBF, 0); crash_install();
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host's nxreplay needs a profile too (design/platform/IMPL-GENERIC.md) - the DM_GAME_ID check below reads it
+    { const char *pp = getenv("DM_PROFILE_PATH");
+      if (!pp || !*pp) { fprintf(stderr, "DM_RUNTIME_PROFILE build with no DM_PROFILE_PATH: nxreplay has no game profile to load\n"); return 2; }
+      const char *err = profile_rt_load(pp);
+      if (err) { fprintf(stderr, "profile: %s (%s)\n", err, pp); return 2; }
+      const char *sw = profile_rt_load_seed(getenv("DM_PROFILE_SEED"));
+      if (sw) fprintf(stderr, "[RED] %s\n", sw);
+    }
+#endif
 #define USAGE "usage: %s <capture> [--warm n] [--repeat n] [--max-pixels n] [--png path | --no-png] [--list] [--dump serial,...] [--dump-rt] [--dump-gpu] [--out dir] [--no-flip] [--sync]\n"
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--repeat") && i + 1 < argc) { repeat = atoi(argv[++i]); if (repeat < 1) repeat = 1; }

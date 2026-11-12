@@ -649,6 +649,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                     "DM_ROMFS=" + romfs, "DM_SAVE=" + save, "DM_TEMP=" + temp, "DM_ROOT=" + root, "DM_AOC_DIR=" + aoc,
                     "HOME=" + files, "TMPDIR=" + getCacheDir(), "DM_BUILD_COMMIT=" + BuildConfig.NX_COMMIT,
                     "DM_CTL=" + new File(files, "ctl.txt"), "NX_EXIT_RECORD=" + ExitWatch.record(this)));   // live control lines (android/TESTING.md "Live control", android/tools/nxctl.sh); DM_CTL= in env.txt turns it off
+            env.addAll(dev.peanuts.build.GenericProfile.envLines(this, id));   // PEANUTS: -PnxGenericHost=true DM_PROFILE_PATH/DM_PROFILE_SEED; empty list otherwise
             env.add(0, "NX_BUILD_TAG=" + Prefs.buildTag(this) + " \u00b7 signer " + Prefs.signerId(this));   // nxlaunch.c writes it as the log's first line; the signer says which key signed the APK (Signer)
             String gpuNote = settingsEnv(id, env);
             // The 3D scene (Game settings › Resolution, ResPresets; Advanced › 3D scene, SceneRes): the chosen RomFS overlay in the pack, made by the pack step from the player's files;
@@ -711,7 +712,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             Native.note("[nxlaunch] game: " + game + (nupFd >= 0 ? " (.nup used where it is, descriptor " + nupFd + ")" : Nup.isNup(game) ? " (.nup)" : " (folder)") + ", DM_ROMFS " + romfs
                     + ", pack " + packDir);
             Native.note("[nxlaunch] save: " + save + " (" + saveHow + ")" + (saveNote != null ? "; " + saveNote : ""));
-            Native.note("nxnative " + BuildConfig.VERSION_NAME + " (" + BuildConfig.NX_COMMIT + "), host libnxhost_" + id + ".so; " + name + " " + id + " version " + pack.version);
+            // PEANUTS: -PnxGenericHost=true loads libnxhost.so (one for every title), not libnxhost_<id>.so (design/platform/IMPL-GENERIC.md)
+            Native.note("nxnative " + BuildConfig.VERSION_NAME + " (" + BuildConfig.NX_COMMIT + "), host " + (BuildConfig.NX_GENERIC_HOST ? "libnxhost.so" : "libnxhost_" + id + ".so") + "; " + name + " " + id + " version " + pack.version);
             Native.note("device " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (SDK " + Build.VERSION.SDK_INT + "), " + Build.SUPPORTED_ABIS[0]
                     + "; game " + game + "; pack " + packDir);
             if (envProblem != null) Native.note("[RED] env.txt: " + envProblem);

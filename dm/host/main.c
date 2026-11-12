@@ -71,6 +71,17 @@ static void fastboot_apply(void) {
     free(s);
 }
 static void host_preload(int argc, char **argv) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host (-PnxGenericHost=true, design/platform/IMPL-GENERIC.md): load the title's profile before anything below reads
+    // DM_GAME_* (a profile/schema mismatch is a hard stop, never a silent default). DM_PROFILE_PATH is set by the launcher (GameActivity/PackService) beside DM_ROMFS;
+    // DM_PROFILE_SEED (optional) is the same title's vk_prewarm.bin copy, "" when it has none.
+    { const char *pp = getenv("DM_PROFILE_PATH");
+      if (!pp || !*pp) die("[RED] DM_RUNTIME_PROFILE build with no DM_PROFILE_PATH: the generic host has no game profile to load");
+      const char *err = profile_rt_load(pp);
+      if (err) die("[RED] profile: %s (%s)", err, pp);
+      const char *sw = profile_rt_load_seed(getenv("DM_PROFILE_SEED"));
+      if (sw) LOG("[RED] %s", sw);
+    }
+#endif
     g_t0_ns = proc_start_mono_ns();
     fastboot_apply();
     flags_init();
@@ -110,7 +121,11 @@ static void host_preload(int argc, char **argv) {
     }
     static char pm[512];   // an Android pack names the modules it was made with (pack.tsv "modules"): a game whose registered builds have different module sets loads those of its dump's build
     if (!n) n = pack_modules(argv[1], pm, sizeof pm, names, DM_GAME_NMOD);
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own module list instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    if (!n) { for (int k = 0; k < (int)DM_GAME_NMOD; k++) names[n++] = g_profile.modules[k]; }
+#else
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
+#endif
     load_modules(argv[1], names, n);
     dm_cheats_init();   // the Atmosphère cheat files for this build (hle_cheats.c): picked by first 16 hex digits of main's build ID, which the loader knows now
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)

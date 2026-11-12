@@ -696,8 +696,12 @@ __attribute__((visibility("default"))) void nxhost_drs_set(int min_pct, int max_
 }
 static void drs_install(void) {
     module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    dm_pf_drs_ctl_t *rows = g_profile.drs_ctl;
+#else
     static const struct { const char *build; uint64_t params, pick, budget, preset; } rows[] = DM_GAME_DRS_CTL;
-    int r = -1; for (int k = 0; m && k < DM_GAME_NDRS_CTL; k++) if (!strcmp(rows[k].build, m->build_id)) r = k;
+#endif
+    int r = -1; for (int k = 0; m && k < (int)DM_GAME_NDRS_CTL; k++) if (!strcmp(rows[k].build, m->build_id)) r = k;
     if (r < 0) return;   // no drs_ctl row for this main: the game keeps its own range
     if (*(uint32_t *)(m->base + rows[r].params) != 0xf942e948u) { LOG("[RED] dynamic resolution: main+%#llx (drs_ctl) is not ldr x8, [x10, #0x5d0]: the game keeps its own range", (unsigned long long)rows[r].params); return; }
     probe_add(m, rows[r].params, -1, drs_hit); g_probe[g_nprobe - 1].once = 1;

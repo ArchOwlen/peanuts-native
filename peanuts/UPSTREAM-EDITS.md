@@ -97,6 +97,37 @@ not edited (see table above).
 | `dm/host/plat/plat_android.c` | **fixed this pass** | **yes** — excludes the guard page from the reported stack range, general Bionic-vs-glibc/Darwin correctness fix |
 | `docs/env_switches.tsv` | fixed (drift + new rows, see IMPL-C.md) | n/a (docs) |
 
+## Generic host runtime-profile sites (design/platform/IMPL-GENERIC.md, CRITIQUE-generic.md §4)
+
+Behind `-PnxGenericHost=true` only (`DM_RUNTIME_PROFILE`, defined by `dm/peanuts/profile/game_profile_generic.h`); the default per-title build and the
+Mac/iOS Makefile build take the unchanged `#else` branch at every one of these, byte for byte. Listed here so a person rebasing a conflict at one of
+these lines knows the `#ifdef DM_RUNTIME_PROFILE` branch needs the same fix, not just the `#else` one, and so a *new* `DM_GAME_*` macro's two other
+required edits (a `gen_runtime_profile.py` table entry, and - only for a brace-initializer macro - a converted call site here) are not missed on the
+next sync (CRITIQUE-phase1.md F11: upstream added 6 macros in the 73 commits since the fork point).
+
+| File : site | Macro(s) | What the runtime branch does |
+|---|---|---|
+| `dm/gfx/nvn/hle_nvn.c` `nvn_api()` | `NVN_API_MAJOR`/`MINOR` | reads `g_profile.has_nvn_api` instead of `#ifdef` |
+| `dm/host/hle_sdk16.c` `font_skip()` | `SHARED_FONT_TTF` | reads `g_profile.has_shared_font_ttf` instead of `#ifdef` |
+| `dm/host/hle_sdk16.c` `h_oe_DispVer()` | `DISPLAY_VERSIONS` | reads `g_profile.display_versions[]`/`ndisplay_versions` instead of a `static const` array |
+| `dm/host/hle_cheats.c` `profile_version()` | `DISPLAY_VERSIONS` | same table, second call site (the cheat panel's version line) |
+| `dm/host/main.c` `host_preload()` module list | `MODULES` | reads `g_profile.modules[]` instead of `static const char *def[]` |
+| `dm/host/main.c` `host_preload()` top | - | calls `profile_rt_load()`/`profile_rt_load_seed()`, before any `DM_GAME_*` read in this function |
+| `dm/gfx/vk_android/vka_shader.c` `one_lane_forced()` | `SUBGROUP_ONE_LANE` | reads `g_profile.subgroup_one_lane[]` |
+| `dm/gfx/vk_android/vka_draw.c` `vegetation_cut()` | `MESH_VEGETATION_CUT` | reads `g_profile.mesh_vegetation_cut[]` |
+| `dm/gfx/vk_android/vka_draw.c` `prepass_listed()`/`mesh_cut()`/`prepass_draw()` | `MESH_PREPASS_CUT` | each reads `g_profile.mesh_prepass_cut[i][0..3]` (same `uint64_t[4]` row shape) |
+| `dm/host/loader.c` `window_apply()` | `WINDOW_FN` | reads `g_profile.window_fn[]` |
+| `dm/host/loader.c` `levels_apply()` | `RES_LEVELS` | reads `g_profile.res_levels[]` |
+| `dm/host/probe.c` `drs_install()` | `DRS_CTL` | reads `g_profile.drs_ctl[]` |
+| `dm/host/hle_fpslock.c` `k_steps`/`NSTEPS` | `FPS_STEPS`/`NFPS_STEPS` | `NSTEPS` becomes the profile's fixed row capacity (it also sizes other file-scope arrays); `k_steps` is a lazily-filled, `pthread_once`-guarded copy of `g_profile.fps_steps[]` |
+| `dm/gfx/vk_android/vka_pso.c` | seed (`vk_prewarm_seed.h`) | not edited: `dm/peanuts/profile/vk_prewarm_seed_generic.h` defines the same `dm_vk_prewarm_seed`/`_len` symbols, set by `profile_rt_load_seed()` |
+| `dm/gfx/vk_android/vka_replay.c` `nxhost_replay()` top | - | calls `profile_rt_load()`/`profile_rt_load_seed()` too (nxreplay needs a profile for its `DM_GAME_ID` capture check) |
+
+Also gated, but not `#ifdef`-paired with upstream code (new Peanuts-owned files/functions, not a duplicated site):
+`android/host/CMakeLists.txt` (`nxhost_add_generic()`), `android/app/src/main/cpp/CMakeLists.txt` (one `nxlaunch` target), `android/app/build.gradle`
+(`nxGenericHost` property, `nxGenericProfiles` task), `android/app/src/main/java/dev/nxnative/android/Native.java` (`load()`),
+`android/app/src/ondevice/java/dev/nxnative/android/PackService.java` (`DM_UE_HOST_LIB`, `DM_PROFILE_PATH`/`DM_PROFILE_SEED` for the Oodle worker).
+
 ## Summary of good upstream-contribution candidates (general fixes, not Peanuts-specific)
 
 1. `dm/host/plat/plat_android.c` — stack guard-page exclusion (IL2CPP GC crash fix)

@@ -569,7 +569,12 @@ public final class PackService extends Service {
         // Oodle-compressed shaders by the game's own decoder in this title's host library, loaded by a worker process (the probe on the Thor: Octopath Traveler 0, main+0x4f77e10)
         PackEngine.setenv("DM_UE_DECODE", j.ueShaders(this).getPath());
         PackEngine.setenv("DM_UE_HOST", pyLib == null ? "" : "/system/bin/linker64 " + new File(PackNative.repo().getParentFile(), "python/bin/nxpack_worker").getPath());
-        PackEngine.setenv("DM_UE_HOST_LIB", "libnxhost_" + j.titleId() + ".so");
+        // PEANUTS: -PnxGenericHost=true ships one libnxhost.so for every title (design/platform/IMPL-GENERIC.md), not libnxhost_<title ID>.so; the worker process
+        // (DM_UE_HOST) goes through the same host_preload() that loads the profile, so it needs DM_PROFILE_PATH/DM_PROFILE_SEED too, inherited from this process' env
+        PackEngine.setenv("DM_UE_HOST_LIB", BuildConfig.NX_GENERIC_HOST ? "libnxhost.so" : "libnxhost_" + j.titleId() + ".so");
+        for (String kv : dev.peanuts.build.GenericProfile.envLines(this, j.titleId())) {
+            int eq = kv.indexOf('='); PackEngine.setenv(kv.substring(0, eq), kv.substring(eq + 1));
+        }
         PackEngine.setenv("DM_UE_MODULES", pack.getPath());
         PackEngine.setenv("DM_SPLIT_DIRECT", "1");   // a targeted file whose map sources name their containers (#BNSH@ / #BAHS@ / #IDRK@ offsets) is read at those containers only, not whole // PEANUTS
         PackEngine.setenv("DM_PACKER_COMMIT", BuildConfig.NX_COMMIT);   // pack.tsv's packer: no repository on the phone to ask

@@ -13,10 +13,15 @@
 HLE_FORCE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", "CPU boost mode; the host does not scale clocks", void, h_oe_CpuBoost, int m) { (void)m; }
 // DisplayVersion = char[16] (the application's display version): the value from that version's control data (NACP), chosen by main's build ID (the game profile's build rows); unknown builds get 1.0.0
 HLE_FORCE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", "display version (by the main build ID)", void, h_oe_DispVer, char *v) {
-    static const struct { const char *build, *ver; } k[] = {DM_GAME_DISPLAY_VERSIONS};
     const char *ver = "1.0.0";
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+        for (unsigned j = 0; j < g_profile.ndisplay_versions; j++) if (!strcmp(g_mod[i].build_id, g_profile.display_versions[j].build)) ver = g_profile.display_versions[j].ver;
+#else
+    static const struct { const char *build, *ver; } k[] = {DM_GAME_DISPLAY_VERSIONS};
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
         for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (!strcmp(g_mod[i].build_id, k[j].build)) ver = k[j].ver;
+#endif
     memset(v, 0, 16); strlcpy(v, ver, 16);
 }
 HLE_FORCE("_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", "system / application volume balance; the host always reports 1:1", void, h_oe_GetVolBal, float *sys, float *app) { *sys = 1.0f; *app = 1.0f; }
@@ -148,12 +153,19 @@ HLE_FORCE("_ZN2nn6fontll18ScalableFontEngine8LoadFontEPcPKvjj", "shared font BFT
 static size_t font_skip(void) {
     static int skip = -1;
     if (skip < 0) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: shared_font is a profile.bin presence flag at run time, same semantics as the #else's #ifdef (design/platform/IMPL-GENERIC.md)
+        if (g_profile.has_shared_font_ttf) {
+            skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0; LOG("shared font: %s (game profile shared_font)", skip ? "the TTF itself" : "BFTTF header + TTF");
+            return (size_t)skip;
+        }
+#else
 #ifdef DM_GAME_SHARED_FONT_TTF
         skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0; LOG("shared font: %s (game profile shared_font)", skip ? "the TTF itself" : "BFTTF header + TTF");
-#else
+        return (size_t)skip;
+#endif
+#endif
         int m = dm_sdk_major(), dec = dm_main_imports("_ZN2nn6fontll24ScalableFontEngineHelper6Decode"); skip = DM_SDK_OLD(m) || !dec ? 8 : 0;
         LOG("shared font: %s (SDK %d, main %s ScalableFontEngineHelper::Decode)", skip ? "the TTF itself" : "BFTTF header + TTF", m, dec ? "imports" : "does not import");
-#endif
     }
     return (size_t)skip;
 }

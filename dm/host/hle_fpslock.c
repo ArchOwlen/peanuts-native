@@ -105,13 +105,27 @@ static const lock_t k_locks[] = {
 // three or four players; any other value leaves the count as it is), count +0x214. A cap of 30 writes mode 2, the game's own 30 fps; 20 writes the count 3 and a mode outside
 // 0..2 (STEPS_HOLD), which keeps it; 60 and 0 leave the game's own mode (it runs 2 steps on a frame that overran: full speed at 60 or below). Each step stays 1/60 s, so the race,
 // ghosts, time trials and online races step as at 60. DM_FPS_STEPS_ROWS: the unit tests' own rows
+typedef struct { const char *build; uint64_t ptr_off; uint32_t mode, count; uint8_t nderef; uint16_t deref[3]; } steps_row_t;
+#if defined(DM_RUNTIME_PROFILE) && !defined(DM_FPS_STEPS_ROWS)   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+// NSTEPS also sizes other file-scope static arrays below (NROWS, steps[], g_st[], nlog/over/orig/have_orig[]), which need a compile-time bound: use the
+// profile's fixed row capacity, not the runtime row count. Every slot past the real count has an empty build string (profile_rt.h/gen_runtime_profile.py
+// zero-pad unused rows), and every k_steps[] reader below already checks build[0] first, so the extra always-empty slots are inert, not a behavior change.
+#define NSTEPS DM_PROFILE_FPS_STEPS_CAP
+static steps_row_t k_steps_buf[DM_PROFILE_FPS_STEPS_CAP]; static pthread_once_t k_steps_once = PTHREAD_ONCE_INIT;
+static void k_steps_fill(void) {   // dm_pf_fps_steps_t has the same field names as steps_row_t; only nderef/deref's widths differ, so copy element-wise once
+    for (int i = 0; i < NSTEPS; i++) { dm_pf_fps_steps_t *s = &g_profile.fps_steps[i];
+        k_steps_buf[i] = (steps_row_t){ s->build, s->ptr_off, s->mode, s->count, (uint8_t)s->nderef, {(uint16_t)s->deref[0], (uint16_t)s->deref[1], (uint16_t)s->deref[2]} }; }
+}
+static const steps_row_t *k_steps_get(void) { pthread_once(&k_steps_once, k_steps_fill); return k_steps_buf; }   // CRITIQUE-generic.md hygiene: was an unguarded flag (a benign race in practice)
+#define k_steps k_steps_get()
+#else
 #ifndef DM_FPS_STEPS_ROWS
 #define DM_FPS_STEPS_ROWS DM_GAME_FPS_STEPS
 #define DM_FPS_NSTEPS_ROWS DM_GAME_NFPS_STEPS
 #endif
-typedef struct { const char *build; uint64_t ptr_off; uint32_t mode, count; uint8_t nderef; uint16_t deref[3]; } steps_row_t;
 static const steps_row_t k_steps[] = DM_FPS_STEPS_ROWS;
 #define NSTEPS DM_FPS_NSTEPS_ROWS
+#endif
 #define STEPS_MAX 3    // 20 fps: the most steps a frame offered (each 1/60 s)
 #define STEPS_HOLD 3   // a mode outside the game's 0..2: its pick then leaves the count the host wrote
 static int rd(uint64_t a, void *out, size_t n) { return a >= 0x1000 && !plat_mem_read(a, out, n); }

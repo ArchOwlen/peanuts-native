@@ -662,9 +662,13 @@ static void map_image(module_t *m, const char *dir) {
 // maximum instead broke the terrain: something else assumes the game's own maximum). Rows are checked: the table must grow, every list byte must be a level; read-only data
 // is still writable here (map_image seals the text and the patch area only)
 static int levels_apply(module_t *m, unsigned cw, unsigned ch) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    dm_pf_res_levels_t *rows = g_profile.res_levels;
+#else
     static const struct { const char *build; uint64_t table; unsigned n, nl; struct { uint64_t off; unsigned len; } l[12]; } rows[] = DM_GAME_RES_LEVELS;
+#endif
     int r = -1;
-    for (int i = 0; i < DM_GAME_NRES_LEVELS; i++) if (!strcmp(rows[i].build, m->build_id)) r = i;
+    for (int i = 0; i < (int)DM_GAME_NRES_LEVELS; i++) if (!strcmp(rows[i].build, m->build_id)) r = i;
     if (r < 0) return 0;
     unsigned n = rows[r].n;
     if (rows[r].table + 8ull * n > m->size) { LOG("[RED] res_levels: main+%#llx is outside main; the resolution stays the game's", (unsigned long long)rows[r].table); return 1; }
@@ -694,9 +698,13 @@ static int levels_apply(module_t *m, unsigned cw, unsigned ch) {
 static void window_apply(module_t *m) {
     if (strcmp(m->name, "main") || m->nro) return;
     const char *e = getenv("DM_WINDOW_SIZE");
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+    dm_pf_window_fn_t *rows = g_profile.window_fn;
+#else
     static const struct { const char *build; uint64_t wfn, hfn; unsigned w, h; } rows[] = DM_GAME_WINDOW_FN;
+#endif
     int r = -1, own = !e || !*e || !strcmp(e, "original");
-    for (int i = 0; i < DM_GAME_NWINDOW_FN; i++) if (!strcmp(rows[i].build, m->build_id)) r = i;
+    for (int i = 0; i < (int)DM_GAME_NWINDOW_FN; i++) if (!strcmp(rows[i].build, m->build_id)) r = i;
     if (r < 0) {
         unsigned a, b; char x;
         if (own) return;

@@ -190,16 +190,20 @@ __attribute__((weak)) int dm_glslc_gpu_code(int *major, int *minor) { *major = *
 __attribute__((weak)) void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) { (void)mem; (void)size; (void)kind; }   // vka_mem.c (DM_MEM_FILEBACK); none on Metal
 __attribute__((weak)) int dm_gfx_fileback_line(char *b, size_t n) { (void)b; (void)n; return 0; }   // vka_mem.c: the file-backed pools' totals (0: none moved)
 static void nvn_api(int api[2]) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host (-PnxGenericHost=true, design/platform/IMPL-GENERIC.md): device_api is a profile.bin presence flag, not a #define
+    if (g_profile.has_nvn_api) { api[0] = DM_GAME_NVN_API_MAJOR; api[1] = DM_GAME_NVN_API_MINOR; LOG("[nvn] device API %d.%d (game profile device_api)", api[0], api[1]); return; }
+#else
 #ifdef DM_GAME_NVN_API_MAJOR
     api[0] = DM_GAME_NVN_API_MAJOR; api[1] = DM_GAME_NVN_API_MINOR; LOG("[nvn] device API %d.%d (game profile device_api)", api[0], api[1]);
-#else
+    return;
+#endif
+#endif
     // The Switch 2's NVN2 is API 231, and its minor moves with the SDK: the game's sdk holds the answer of its own driver (dm_sdk_nvn2_item). Games require it and create their graphics system
     // only then: Donkey Kong Bananza (SDK 20.5.19) major == 231 and minor >= 30 (main+0x5c61a4), Splatoon Raiders (SDK 21.4.4) minor >= 39 (main+0x31b86b0)
     int m = dm_sdk_major();
     if (dm_sdk_ounce()) { api[0] = 231; if (!dm_sdk_nvn2_item(1, &api[1])) api[1] = g_devinfo2[1]; }
     else { api[0] = DM_SDK_OLD(m) ? 53 : g_devinfo[0]; api[1] = DM_SDK_OLD(m) ? 313 : g_devinfo[1]; }
     LOG("[nvn] device API %d.%d (SDK %d%s)", api[0], api[1], m, dm_sdk_ounce() ? ", Switch 2" : "");
-#endif
 }
 NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out) {
     (void)d;
