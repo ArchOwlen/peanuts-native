@@ -34,7 +34,7 @@ def nxVersion = providers.gradleProperty('nxVersion').getOrElse('0.1-bringup')
 def nxVersionCode = providers.gradleProperty('nxVersionCode').getOrElse('1') as int
 def signStore = System.getenv('NX_SIGN_STORE'), signAlias = System.getenv('NX_SIGN_ALIAS'), signPass = System.getenv('NX_SIGN_PASS')
 if ((nxLive || nxRelease) && !(signStore && signAlias && signPass && new File(signStore).isFile()))   // PEANUTS: nxRelease too
-    throw new GradleException('nxLive and nxRelease need the release key: NX_SIGN_STORE (an existing keystore), NX_SIGN_ALIAS and NX_SIGN_PASS')
+    throw new GradleException('nxLive and nxRelease need the release key: NX_SIGN_STORE (an existing keystore), NX_SIGN_ALIAS and NX_SIGN_PASS')   // PEANUTS: nxRelease too
 def nxLabel = providers.gradleProperty('nxLabel').getOrElse(nxApp ? "Banana Native $nxApp" : '')
 // The build tag the launcher shows over the game and in its main screen, and writes as the first line of each game log: branch@commit[+dirty] (no build time: the commit and the signer identify a build)
 def gitOut = { List<String> a -> try { providers.exec { commandLine(['git'] + a); ignoreExitValue = true }.standardOutput.asText.get().trim() } catch (Exception e) { '' } }
@@ -306,7 +306,7 @@ tasks.register('apk', Copy) {
     dependsOn 'assembleRelease'
     from(layout.buildDirectory.dir('outputs/apk/release')) { include '*.apk' }
     into layout.projectDirectory.dir('out')
-    rename { nxRelease ? "peanuts-native-${nxVersion}.apk" : nxLive ? "banana-native-${nxVersion}.apk" : nxPlay ? 'nxnative-android-play.apk' : nxApp ? "nxnative-android-${nxApp}.apk" : 'nxnative-android.apk' }
+    rename { nxRelease ? "peanuts-native-${nxVersion}.apk" :   /* PEANUTS: nxRelease */ nxLive ? "banana-native-${nxVersion}.apk" : nxPlay ? 'nxnative-android-play.apk' : nxApp ? "nxnative-android-${nxApp}.apk" : 'nxnative-android.apk' }
 }
 
 // The on-device packer's native side (android/ONDEVICE.md "In the APK"; not with -PnxPackEngine=fake). android/ondevice/build.sh makes its stage on the Mac;
