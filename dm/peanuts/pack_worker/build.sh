@@ -12,13 +12,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 [ -n "${ANDROID_NDK_HOME:-}" ] || { echo "[RED] set ANDROID_NDK_HOME"; exit 1; }
 BIN=$(ls -d "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin | head -1)
 mkdir -p "$S/python/bin"
-"$BIN/clang" --target=aarch64-linux-android33 -O2 -Wall -fPIE -pie -I"$INC" -o "$S/python/bin/nxpack_worker" "$HERE/pack_worker.c" \
+"$BIN/clang" --target=aarch64-linux-android33 -O2 -Wall -ffile-prefix-map="$HERE"/=dm/peanuts/pack_worker/ -ffile-prefix-map="$INC"/=python3.14/ -fPIE -pie -I"$INC" -o "$S/python/bin/nxpack_worker" "$HERE/pack_worker.c" \
   -L"$S/lib" -lpython3.14 -Wl,-rpath,'$ORIGIN/../../lib' -Wl,-z,max-page-size=16384
 "$BIN/llvm-strip" --strip-debug "$S/python/bin/nxpack_worker"
 ls -l "$S/python/bin/nxpack_worker"
 # _nxaes (nxaes.c): AES for uepak.py on the phone (Unreal pak indexes), a module of the Python home's lib-dynload
 DYN="$S/python/lib/python3.14/lib-dynload"
-"$BIN/clang" --target=aarch64-linux-android33 -O2 -Wall -fPIC -shared -I"$INC" -o "$DYN/_nxaes.cpython-314-aarch64-linux-android.so" "$HERE/nxaes.c" \
+"$BIN/clang" --target=aarch64-linux-android33 -O2 -Wall -ffile-prefix-map="$HERE"/=dm/peanuts/pack_worker/ -ffile-prefix-map="$INC"/=python3.14/ -fPIC -shared -I"$INC" -o "$DYN/_nxaes.cpython-314-aarch64-linux-android.so" "$HERE/nxaes.c" \
   -L"$S/lib" -lpython3.14 -Wl,-z,max-page-size=16384
 "$BIN/llvm-strip" --strip-debug "$DYN/_nxaes.cpython-314-aarch64-linux-android.so"
 ls -l "$DYN/_nxaes.cpython-314-aarch64-linux-android.so"

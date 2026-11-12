@@ -7,6 +7,9 @@ if(NOT NX_GAMES AND NOT NX_GENERIC_HOST)   # PEANUTS: or the generic host (-PnxG
   message(FATAL_ERROR "NX_GAMES is not set: -DNX_GAMES=<title ID>,… (build.gradle passes nxGames), or -DNX_GENERIC_HOST=ON (-PnxGenericHost=true)")
 endif()
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
+# PEANUTS: source paths in the libraries (__FILE__ in log lines, debug info) relative to the repository, not the build machine's folders
+get_filename_component(NX_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../.. ABSOLUTE)
+add_compile_options(-ffile-prefix-map=${NX_REPO_ROOT}/=)   # PEANUTS: see above
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../host ${CMAKE_CURRENT_BINARY_DIR}/host)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/import ${CMAKE_CURRENT_BINARY_DIR}/nximport)   # PEANUTS: the importer (libnximport.so, dev.peanuts.importer.Native)
 # PEANUTS: -PnxGenericHost=true (design/platform/IMPL-GENERIC.md) links one libnxlaunch.so against the one libnxhost.so instead of a pair per title
