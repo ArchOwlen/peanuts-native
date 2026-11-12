@@ -44,6 +44,12 @@ public final class PeanutsPrefs {
     public static boolean setupDone(Context c) { return of(c).getBoolean("setup_done", false); }
     public static void setupDone(Context c, boolean on) { of(c).edit().putBoolean("setup_done", on).apply(); }
 
+    /** Off by default: dev.peanuts.Companion only shows the chains/scan developer readout on the second display (instead of leaving it free) when this is on -
+     * a long press on Settings › Library › Companions toggles it (LibrarySettings). A title with no companion package normally gets no second-screen window at
+     * all, so the AYN Thor's own launcher stays on Screen-2, exactly as without Peanuts. */
+    public static boolean developerReadout(Context c) { return of(c).getBoolean("developer_readout", false); }
+    public static void developerReadout(Context c, boolean on) { of(c).edit().putBoolean("developer_readout", on).apply(); }
+
     /** The roots the library scans: the game folder first, then the update and DLC folders when set and different */
     public static List<File> roots(Context c) {
         List<File> out = new ArrayList<>();
@@ -86,9 +92,8 @@ public final class PeanutsPrefs {
     public static boolean installCompanion(Context c, String titleId) { return of(c).getBoolean(key(titleId, "install_companion"), true); }
     public static void installCompanion(Context c, String titleId, boolean on) { of(c).edit().putBoolean(key(titleId, "install_companion"), on).apply(); }
 
-    /** The companion's second-screen mode for a title ("physical" or "off"; agent C's settings section writes it, the Presentation reads it later) */
-    public static String companionScreen(Context c, String titleId) { return of(c).getString(key(titleId, "screen"), "physical"); }
-    public static void companionScreen(Context c, String titleId, String mode) { put(c, key(titleId, "screen"), mode); }
+    // (Removed: a dead, unread duplicate of the "second screen physical/off" pref - dev.peanuts.settings.CompanionSection.secondScreen() is the one
+    // Companion.java actually reads, in its own SharedPreferences file ("peanuts", MODE_MULTI_PROCESS).)
 
     private static void put(Context c, String k, String v) {
         SharedPreferences.Editor e = of(c).edit();

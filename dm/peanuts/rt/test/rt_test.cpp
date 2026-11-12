@@ -218,10 +218,12 @@ struct HapticLog {
     struct Pulse {
         float amplitude;
         uint32_t ms;
+        int respect_system;
+        int kind;
     };
     std::vector<Pulse> pulses;
-    static void Fn(void* user, float amplitude, uint32_t ms) {
-        static_cast<HapticLog*>(user)->pulses.push_back({amplitude, ms});
+    static void Fn(void* user, float amplitude, uint32_t ms, int respect_system, int kind) {
+        static_cast<HapticLog*>(user)->pulses.push_back({amplitude, ms, respect_system, kind});
     }
 };
 

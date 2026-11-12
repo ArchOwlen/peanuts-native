@@ -207,7 +207,7 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
         if (amplitude <= 0.0f || ms == 0) {
             return;
         }
-        haptics->pulse(haptics->user, amplitude, ms);
+        haptics->pulse(haptics->user, amplitude, ms, (e.flags & 1) ? 1 : 0, static_cast<int>(e.kind));
     });
 
     const auto build_id = ParseBuildId(config->build_id_hex);

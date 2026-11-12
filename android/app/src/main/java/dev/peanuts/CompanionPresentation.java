@@ -5,11 +5,18 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.VibrationAttributes;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
+import android.provider.Settings;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
@@ -53,6 +60,7 @@ final class CompanionPresentation extends Presentation {
         page.setScaleType(ImageView.ScaleType.FIT_CENTER);
         page.setVisibility(View.GONE);
         page.setOnTouchListener(this::onPageTouch);
+        page.setHapticFeedbackEnabled(true);
         root.addView(page, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         textRoot = new LinearLayout(getContext());
         textRoot.setOrientation(LinearLayout.VERTICAL);
@@ -84,6 +92,7 @@ final class CompanionPresentation extends Presentation {
             try { fresh = Bridge.frame(pixels, w, h); } catch (UnsatisfiedLinkError e) { fresh = false; }
             if (fresh) { pixels.rewind(); bitmap.copyPixelsFromBuffer(pixels); page.invalidate(); }
             if (page.getVisibility() != View.VISIBLE) { page.setVisibility(View.VISIBLE); textRoot.setVisibility(View.GONE); }
+            pollHaptic();
             ui.postDelayed(this::poll, POLL_MS);
             return;
         }
@@ -112,6 +121,96 @@ final class CompanionPresentation extends Presentation {
             try { Bridge.touch(e.getPointerId(i), (e.getX(i) - ox) / s, (e.getY(i) - oy) / s, down); } catch (UnsatisfiedLinkError ignored) { return false; }
         }
         return true;
+    }
+
+    // --- haptics: one pending pulse from the runtime per poll (Bridge.hapticPulse, dm/peanuts/peanuts.c rt_haptic), played the same way Eden Duo's
+    // AuxScreenHost.performHaptic does on its second screen - the page view's own haptic feedback when the device offers one (follows the system's touch-
+    // feedback setting and tuned effects), the raw vibrator with a predefined effect otherwise. ---
+
+    private Vibrator vibrator;
+    private Vibrator vibrator() {
+        if (vibrator == null) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    VibratorManager m = (VibratorManager) getContext().getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                    vibrator = m != null ? m.getDefaultVibrator() : null;
+                } else {
+                    vibrator = (Vibrator) getContext().getSystemService(Context.VIBRATOR_SERVICE);
+                }
+            } catch (RuntimeException ignored) {}
+        }
+        return vibrator;
+    }
+
+    // Cached, not re-read per pulse (up to 30/s): refreshed at most once a second, which is plenty for a setting the user flips rarely.
+    private static final long HAPTICS_SETTING_REFRESH_MS = 1000;
+    private boolean systemHapticsEnabledCache = true;
+    private long systemHapticsEnabledAt;
+    @SuppressWarnings("deprecation")
+    private boolean systemHapticsEnabled() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - systemHapticsEnabledAt >= HAPTICS_SETTING_REFRESH_MS) {
+            systemHapticsEnabledAt = now;
+            try { systemHapticsEnabledCache = Settings.System.getInt(getContext().getContentResolver(), Settings.System.HAPTIC_FEEDBACK_ENABLED, 1) != 0; }
+            catch (Exception e) { systemHapticsEnabledCache = true; }
+        }
+        return systemHapticsEnabledCache;
+    }
+
+    // At least this long between two vibrator fallback one-shots, independent of how often pollHaptic() is called (up to 30/s): the view path is cheap and
+    // already de-duplicated by the OS, but a raw Vibrator call ignores whatever is still playing and would otherwise retrigger every poll during e.g. a drag.
+    private static final long VIBRATOR_MIN_GAP_MS = 50;
+    private long lastVibrateAt;
+
+    /** The view-level constant for a kind (Bridge.HAPTIC_*), matching Eden Duo's own distinction between a plain tap, a held action and a refusal -
+     * amplitude/ms never reach this path (the platform API takes only a named effect), so the kind is what makes them feel different. */
+    private int viewConstantFor(int kind) {
+        if (kind == Bridge.HAPTIC_HOLD) return HapticFeedbackConstants.LONG_PRESS;
+        if (kind == Bridge.HAPTIC_REFUSED) {
+            return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ? HapticFeedbackConstants.REJECT : HapticFeedbackConstants.VIRTUAL_KEY_RELEASE;
+        }
+        return HapticFeedbackConstants.VIRTUAL_KEY;
+    }
+
+    /** The vibrator-fallback predefined effect for a kind, used when the view declined (a window the system does not vibrate for on its own). */
+    private int predefinedEffectFor(int kind, float amplitude) {
+        if (kind == Bridge.HAPTIC_HOLD) return VibrationEffect.EFFECT_HEAVY_CLICK;
+        if (kind == Bridge.HAPTIC_REFUSED) return VibrationEffect.EFFECT_DOUBLE_CLICK;
+        return amplitude >= 0.4f ? VibrationEffect.EFFECT_CLICK : VibrationEffect.EFFECT_TICK;
+    }
+
+    private void pollHaptic() {
+        Bridge.HapticPulse pulse;
+        try { pulse = Bridge.hapticPulse(); } catch (UnsatisfiedLinkError e) { return; }
+        if (pulse == null) return;
+        if (pulse.respectSystem && !systemHapticsEnabled()) return;
+        int viewFlags = pulse.respectSystem ? 0 : HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING;
+        if (page.isHapticFeedbackEnabled() && page.performHapticFeedback(viewConstantFor(pulse.kind), viewFlags)) {
+            return;   // the view played it with the device's own tuned effect for this kind
+        }
+        vibrateFallback(pulse);
+    }
+
+    private void vibrateFallback(Bridge.HapticPulse pulse) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - lastVibrateAt < VIBRATOR_MIN_GAP_MS) return;   // a view-less window retriggering every poll (e.g. a held drag) would otherwise buzz continuously
+        Vibrator v = vibrator();
+        if (v == null || !v.hasVibrator()) return;
+        int ms = Math.max(1, Math.min(200, pulse.ms));   // defence in depth: the runtime's own table never exceeds ~55 ms, but never trust it blindly here
+        try {
+            VibrationEffect effect;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                effect = VibrationEffect.createPredefined(predefinedEffectFor(pulse.kind, pulse.amplitude));
+            } else {
+                effect = VibrationEffect.createOneShot(ms, Math.max(1, Math.min(255, Math.round(pulse.amplitude * 255))));
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                v.vibrate(effect, VibrationAttributes.createForUsage(VibrationAttributes.USAGE_TOUCH));
+            } else {
+                v.vibrate(effect);
+            }
+            lastVibrateAt = now;
+        } catch (RuntimeException ignored) {}
     }
 
     private TextView text(String s, int sp, int color, Typeface face) {

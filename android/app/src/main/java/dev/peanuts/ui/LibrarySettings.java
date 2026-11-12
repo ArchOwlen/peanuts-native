@@ -30,7 +30,7 @@ public final class LibrarySettings {
     static final int REQ_KEYS = 60, REQ_GAME = 61, REQ_UPDATE_DIR = 62, REQ_DLC_DIR = 63, REQ_FIRMWARE = 64, REQ_SHEET_UPDATE = 65, REQ_SHEET_DLC = 66;
     private static final Handler UI = new Handler(Looper.getMainLooper());
     private static String fontsState;   // "Extracting the fonts…" and what came of it, while the rows show
-    private static PUi.Setting gameRow, updateRow, dlcRow, keysRow, fontsRow;
+    private static PUi.Setting gameRow, updateRow, dlcRow, keysRow, fontsRow, companionsRow;
     private static Activity rowsOf;
 
     private LibrarySettings() {}
@@ -54,9 +54,25 @@ public final class LibrarySettings {
         card.addView(fontsRow.view);
         card.addView(new PUi.Setting(a, "🔄", "Rescan", v -> { Library.rescan(a); Toast.makeText(a, "Looking in the folders again", Toast.LENGTH_SHORT).show(); })
                 .value("Reads the folders again").chevron(a).view);
-        card.addView(new PUi.Setting(a, "🖥️", "Companions", v -> a.startActivity(new Intent().setClassName(a.getPackageName(), "dev.peanuts.CatalogActivity")))
-                .value("The catalog: install, update or remove a game's companion").chevron(a).view);
+        companionsRow = new PUi.Setting(a, "🖥️", "Companions", v -> a.startActivity(new Intent().setClassName(a.getPackageName(), "dev.peanuts.CatalogActivity")))
+                .chevron(a);
+        card.addView(companionsRow.view);
+        // Developer-only, no row of its own (PeanutsPrefs.developerReadout): a long press flips whether a title with no companion package shows the raw
+        // chains/scan readout on the second display instead of leaving it free for Android's own launcher. The row's own value says so when it's on, so
+        // it can't be left on by accident when the device is handed back.
+        companionsRow.view.setOnLongClickListener(v -> {
+            boolean on = !PeanutsPrefs.developerReadout(a);
+            PeanutsPrefs.developerReadout(a, on);
+            Toast.makeText(a, "Developer second-screen readout: " + (on ? "on" : "off"), Toast.LENGTH_SHORT).show();
+            refreshRows();
+            return true;
+        });
         refreshRows();
+    }
+
+    private static String companionsValue(Activity a) {
+        String base = "The catalog: install, update or remove a game's companion";
+        return PeanutsPrefs.developerReadout(a) ? base + " · developer readout on (long press to turn off)" : base;
     }
 
     private static void refreshRows() {
@@ -68,6 +84,7 @@ public final class LibrarySettings {
         dlcRow.value(d != null ? d + " · hold to forget" : "Optional. Another folder with DLC NSPs, matched to their games by title ID.");
         keysRow.value(keysValue(a));
         fontsRow.value(fontsValue(a, "Optional. Lets companions draw the system font."));
+        if (companionsRow != null) companionsRow.value(companionsValue(a));
     }
 
     static String keysValue(Activity a) {

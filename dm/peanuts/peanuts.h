@@ -16,4 +16,16 @@ __attribute__((visibility("default"))) void nxhost_peanuts_frame_size(int *w, in
 __attribute__((visibility("default"))) int nxhost_peanuts_frame(void *out_rgba, int w, int h);
 __attribute__((visibility("default"))) void nxhost_peanuts_touch(int id, float x, float y, int down);
 
+// Whether a companion is on second-screen duty for this run: 0 still deciding (no module loaded yet, or the runtime has not tried pn_rt_create), 1 a package
+// loaded (nxhost_peanuts_frame_size/frame now matter), 2 no companion package beside this title's pack, 3 a package was found but pn_rt_create refused it (see
+// logcat "peanuts" for why). The caller (dev.peanuts.Companion) uses this to decide whether to take the second display at all, so a title with no companion
+// leaves it to Android's own launcher instead of showing a developer readout there.
+__attribute__((visibility("default"))) int nxhost_peanuts_rt_state(void);
+
+// One pending haptic pulse from the runtime (at most one per pn_rt_tick; dropped if not polled before the next one). Returns 1 and consumes it, or 0 when there
+// is none. amplitude is 0..1, ms its duration, respect_system non-zero when the package wants the device's own touch-feedback switch honoured (manifest
+// "haptics":{"respect_system":...}, true by default - mirrors Eden Duo's AuxScreenHost.performHaptic), kind is Core::Mods::HapticKind (0 Tap, 1 Write,
+// 2 Select, 3 Drag, 4 Drop, 5 Marker, 6 Refused, 7 Hold, 8 Swipe) so the caller can play a different effect for e.g. a hold versus a refused tap.
+__attribute__((visibility("default"))) int nxhost_peanuts_haptic(float *amplitude, int *ms, int *respect_system, int *kind);
+
 #endif

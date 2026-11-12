@@ -16,6 +16,41 @@ public final class Bridge {
     public static native boolean frame(ByteBuffer out, int w, int h);
     /** A touch on the page, in page pixels. */
     public static native void touch(int id, float x, float y, boolean down);
+    /** 0 still deciding, 1 a companion package loaded, 2 none for this title, 3 found but refused (logcat "peanuts" says why). */
+    public static native int rtState();
+    /** One pending haptic pulse, packed (see peanuts_jni.c): kind(4 bits) &lt;&lt; 25 | respect_system &lt;&lt; 24 | amplitude(1..255) &lt;&lt; 16 | ms(1..65535); 0 = none to play. */
+    public static native int haptic();
+
+    public static final int RT_PENDING = 0, RT_LOADED = 1, RT_NONE = 2, RT_FAILED = 3;
+
+    /** Core::Mods::HapticKind (dm/peanuts/peanuts.h): what raised a pulse. */
+    public static final int HAPTIC_TAP = 0, HAPTIC_WRITE = 1, HAPTIC_SELECT = 2, HAPTIC_DRAG = 3, HAPTIC_DROP = 4,
+            HAPTIC_MARKER = 5, HAPTIC_REFUSED = 6, HAPTIC_HOLD = 7, HAPTIC_SWIPE = 8;
+
+    /** rtState(), or RT_PENDING when the native library is not loaded yet. */
+    public static int rtStateSafe() { try { return rtState(); } catch (UnsatisfiedLinkError e) { return RT_PENDING; } }
+
+    /** One pending haptic pulse (amplitude, duration and what raised it), or null when there is none (or the call fails). */
+    public static final class HapticPulse {
+        public final float amplitude;   // 0..1
+        public final int ms;
+        public final boolean respectSystem;
+        public final int kind;   // HAPTIC_* above
+        HapticPulse(float amplitude, int ms, boolean respectSystem, int kind) {
+            this.amplitude = amplitude; this.ms = ms; this.respectSystem = respectSystem; this.kind = kind;
+        }
+    }
+
+    public static HapticPulse hapticPulse() {
+        int packed;
+        try { packed = haptic(); } catch (UnsatisfiedLinkError e) { return null; }
+        if (packed == 0) return null;
+        float amplitude = ((packed >> 16) & 0xff) / 255f;
+        int ms = packed & 0xffff;
+        boolean respectSystem = ((packed >> 24) & 1) != 0;
+        int kind = (packed >> 25) & 0xf;
+        return new HapticPulse(amplitude, ms, respectSystem, kind);
+    }
 
     public static Map<String, String> values() {
         Map<String, String> m = new LinkedHashMap<>();

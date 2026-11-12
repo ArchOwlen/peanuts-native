@@ -49,9 +49,17 @@ typedef struct PnRtPad {
 /// Optional haptics: at most one pulse per pn_rt_tick (the runtime's own one-haptic-per-tick
 /// rule), already turned into an amplitude/duration pair (PnRtHaptics::pulse) from the
 /// manifest's HapticStrength/HapticKind. NULL = none (haptics are silently dropped).
+/// `respect_system` mirrors AuxRouting::HapticEvent::flags bit 0 (the manifest's
+/// "haptics":{"respect_system":...}, true by default): non-zero means the host should honour
+/// the device's own touch-feedback switch (Eden Duo's AuxScreenHost does the same), zero means
+/// the package asked to play regardless of it.
+/// `kind` is Core::Mods::HapticKind (0 Tap, 1 Write, 2 Select, 3 Drag, 4 Drop, 5 Marker,
+/// 6 Refused, 7 Hold, 8 Swipe): what raised the pulse, so a host can play a different effect for
+/// e.g. a held action versus a refused tap (amplitude/ms alone collapse into "tap" on a device
+/// whose view-level haptic feedback API ignores both and only takes a named effect).
 typedef struct PnRtHaptics {
     void* user;
-    void (*pulse)(void* user, float amplitude_0_1, uint32_t ms);
+    void (*pulse)(void* user, float amplitude_0_1, uint32_t ms, int respect_system, int kind);
 } PnRtHaptics;
 
 typedef void (*PnRtLogFn)(int level, const char* where, const char* message);

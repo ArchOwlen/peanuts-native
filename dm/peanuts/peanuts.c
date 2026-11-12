@@ -369,6 +369,32 @@ static void rt_log(int level, const char *where, const char *msg) {
     __android_log_print(level >= 4 ? ANDROID_LOG_ERROR : level == 3 ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "peanuts", "[rt] %s: %s", where ? where : "", msg ? msg : "");
 }
 
+// ---- haptics: the runtime's pulse (amplitude/ms/respect_system/kind), polled by dev.peanuts.Bridge.haptic() and played on the second screen's view/vibrator ----
+static pthread_mutex_t g_haptic_mu = PTHREAD_MUTEX_INITIALIZER;
+static float g_haptic_amp; static int g_haptic_ms, g_haptic_respect, g_haptic_kind, g_haptic_pending;
+static void rt_haptic(void *u, float amplitude_0_1, uint32_t ms, int respect_system, int kind) {
+    (void)u;
+    pthread_mutex_lock(&g_haptic_mu);
+    g_haptic_amp = amplitude_0_1; g_haptic_ms = (int)ms; g_haptic_respect = respect_system; g_haptic_kind = kind; g_haptic_pending = 1;   // latest wins: the runtime itself allows at most one per tick
+    pthread_mutex_unlock(&g_haptic_mu);
+}
+int nxhost_peanuts_haptic(float *amplitude, int *ms, int *respect_system, int *kind) {
+    int got;
+    pthread_mutex_lock(&g_haptic_mu);
+    got = g_haptic_pending;
+    if (got) {
+        if (amplitude) *amplitude = g_haptic_amp; if (ms) *ms = g_haptic_ms;
+        if (respect_system) *respect_system = g_haptic_respect; if (kind) *kind = g_haptic_kind;
+        g_haptic_pending = 0;
+    }
+    pthread_mutex_unlock(&g_haptic_mu);
+    return got;
+}
+
+// ---- rt_state: whether a companion is on second-screen duty (dev.peanuts.Companion gates taking the second display on this) ----
+static _Atomic int g_rt_state;   // 0 pending, 1 loaded, 2 no package, 3 pn_rt_create refused
+int nxhost_peanuts_rt_state(void) { return atomic_load(&g_rt_state); }
+
 // The running title, from the pack folder's name: the app's packs/<title ID>, or <title ID>-work/android-pack beside the dump. 0 when neither
 static uint64_t rt_running_title(void) {
     const char *p = dm_module_dir(); if (!p) return 0;
@@ -449,9 +475,13 @@ static int rt_find_package(char *dir, size_t n, uint64_t *title) {
 static void rt_start(void) {
     g_rt_tried = 1;
     module_t *m = module_named("main");
-    if (!m) return;
+    if (!m) { atomic_store(&g_rt_state, 2); return; }   // no "main" module loaded yet when g_nmod turned positive: rt_tick never retries (g_rt_tried), so the state must resolve here too
     char dir[768]; uint64_t title = 0;
-    if (!rt_find_package(dir, sizeof dir, &title)) { __android_log_print(ANDROID_LOG_INFO, "peanuts", "no companion package beside %s", dm_module_dir()); return; }
+    if (!rt_find_package(dir, sizeof dir, &title)) {
+        __android_log_print(ANDROID_LOG_INFO, "peanuts", "no companion package beside %s", dm_module_dir());
+        atomic_store(&g_rt_state, 2);
+        return;
+    }
     // The runtime's romfs root: the game's base RomFS folder (an update's folder is only its overlay: a few changed files). DM_ROMFS names the running version's folder,
     // <game>/updates/<v>/romfs or <game>/base/romfs. For a .nup ("<game>.nup:update/<v>/romfs") the container is read in place through the provider callbacks
     // (peanuts_nup.c): the named package's RomFS, the container's base package under it
@@ -494,8 +524,10 @@ static void rt_start(void) {
     c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer;
     c.pad.set_button = rt_pad_button; c.pad.set_stick = rt_pad_stick;
     c.ui.publish_ui = rt_ui_publish; c.ui.publish_ui_partial = rt_ui_publish_partial;
+    c.haptics.pulse = rt_haptic;
     c.log = rt_log; c.log_level = 2;
     g_rt = pn_rt_create(&c);
+    atomic_store(&g_rt_state, g_rt ? 1 : 3);
     __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion package %s (title %016" PRIx64 ", build %s, romfs %s): %s", dir, title, m->build_id,
                         c.romfs_dir ? c.romfs_dir : g_nup ? pn_nup_describe(g_nup) : "none", g_rt ? "loaded" : "not loaded");
 }

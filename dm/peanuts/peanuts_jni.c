@@ -11,6 +11,10 @@ void nxhost_peanuts_frame_size(int *w, int *h);
 int nxhost_peanuts_frame(void *out_rgba, int w, int h);
 #pragma weak nxhost_peanuts_touch
 void nxhost_peanuts_touch(int id, float x, float y, int down);
+#pragma weak nxhost_peanuts_rt_state
+int nxhost_peanuts_rt_state(void);
+#pragma weak nxhost_peanuts_haptic
+int nxhost_peanuts_haptic(float *amplitude, int *ms, int *respect_system, int *kind);
 
 JNIEXPORT jstring JNICALL Java_dev_peanuts_Bridge_snapshot(JNIEnv *env, jclass cls) {
     (void)cls;
@@ -39,4 +43,22 @@ JNIEXPORT jboolean JNICALL Java_dev_peanuts_Bridge_frame(JNIEnv *env, jclass cls
 JNIEXPORT void JNICALL Java_dev_peanuts_Bridge_touch(JNIEnv *env, jclass cls, jint id, jfloat x, jfloat y, jboolean down) {
     (void)env; (void)cls;
     if (nxhost_peanuts_touch) nxhost_peanuts_touch(id, x, y, down ? 1 : 0);
+}
+
+// 0 pending, 1 a companion package loaded (the page matters), 2 none for this title, 3 found but refused (see peanuts.h)
+JNIEXPORT jint JNICALL Java_dev_peanuts_Bridge_rtState(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    return nxhost_peanuts_rt_state ? nxhost_peanuts_rt_state() : 0;
+}
+
+// One pending haptic pulse packed as kind(4 bits) << 25 | respect_system << 24 | amplitude(8 bits, 1..255) << 16 | ms(16 bits, 1..65535); 0 when there is
+// none to play. kind is Core::Mods::HapticKind (0 Tap .. 8 Swipe, see peanuts.h) so the Java side can pick a different device effect for e.g. Hold/Refused.
+JNIEXPORT jint JNICALL Java_dev_peanuts_Bridge_haptic(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    float amp = 0; int ms = 0, respect = 0, kind = 0;
+    if (!nxhost_peanuts_haptic || !nxhost_peanuts_haptic(&amp, &ms, &respect, &kind)) return 0;
+    int amp8 = (int)(amp * 255.0f + 0.5f); if (amp8 < 1) amp8 = 1; if (amp8 > 255) amp8 = 255;
+    if (ms < 1) ms = 1; if (ms > 65535) ms = 65535;
+    if (kind < 0) kind = 0; if (kind > 15) kind = 15;
+    return (kind << 25) | (respect ? (1 << 24) : 0) | (amp8 << 16) | ms;
 }
