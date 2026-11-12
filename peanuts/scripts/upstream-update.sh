@@ -29,18 +29,25 @@ git rev-parse -q --verify "$target^{commit}" >/dev/null || { echo "no such ref: 
 # The hunk check must compare against the MERGE-BASE, not $target itself, whenever the branch
 # hasn't been rebased onto $target yet -- otherwise it treats every upstream commit we haven't
 # rebased past yet as "a hunk we introduced" and fails on the whole unrelated divergence, not our
-# actual edits. Computed BEFORE a rebase runs (if one does): after a successful rebase, our
-# branch's own history contains $target directly, so diff($target, branch) and
-# diff(merge-base, branch) become the same comparison -- using the pre-rebase merge-base as the
-# fixed "base" throughout keeps --check (never rebases) and the real rebase path consistent.
-base=$(git merge-base HEAD "$target")
-
+# actual edits. That is exactly --check's situation (no rebase happens), so --check always uses
+# the pre-rebase merge-base.
+#
+# In rebase mode, the correct "base" is different: AFTER a successful rebase, our branch's own
+# history contains $target directly as an ancestor, so the right comparison is diff($target,
+# branch) -- not diff(the OLD, pre-rebase merge-base, branch). Using the stale pre-rebase
+# merge-base here would make the post-rebase check flag every upstream commit between that old
+# merge-base and $target as "a hunk we introduced" too, the identical bug class --check was fixed
+# for, just reintroduced on the other side of the rebase. So: compute the pre-rebase merge-base
+# only for the check-mode message/comparison; in rebase mode, reset `base="$target"` once the
+# rebase has actually succeeded.
 if [ "$mode" = "check" ]; then
+    base=$(git merge-base HEAD "$target")
     echo "--check: hunk-marker check only (no rebase) -- $branch vs $target, since merge-base $(git rev-parse --short "$base")"
 else
     [ -z "$(git status --porcelain)" ] || { echo "working tree not clean; commit first"; exit 1; }
     echo "rebasing $branch onto $target ($(git rev-parse --short "$target"))"
     git rebase -q --rebase-merges "$target" || { echo "rebase stopped: resolve, 'git rebase --continue', then re-run"; exit 1; }   # keeps merge commits: other branches base on them
+    base="$target"
 fi
 
 # Files that are entirely Peanuts-owned: upstream never has them (or, for split_pool.py and

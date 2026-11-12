@@ -84,7 +84,7 @@ independent version axes** here, and they don't always match:
 | Mario Kart 8 Deluxe | `0100152000022000` | v1441792 (4.0.0), v1507328 (4.0.1, the shader package's own build) | **4.0.0 only** — no 4.0.1 companion build yet | title and attract demo at 60 fps (63), no crash past 75 s (the earlier NULL-texture-register host crash is fixed); the Thor's verified run was the **4.0.0** dump — 4.0.1 is pack-supported but has no matching companion |
 | Super Mario Bros. Wonder | `010015100B514000` | v0 (1.0.0), v65536 (1.0.1), v327680 (1.2.1, the shader package's own build) | all three builds | the Thor's dump is v65536 — a **listed, pack-supported build**, not blocked, but its shaders come from the v327680 package, so the first build on this dump runs a full shader scan (slower) instead of the fast targeted one; end-to-end run still to be verified on this build |
 | Pokémon Sword | `0100ABF008968000` | v458752 (1.3.2) only | — | Experimental: boots to the language select screen; companion not yet installed (build tooling conflict, tracked) |
-| Dragon Quest III HD-2D Remake | `01003E601E324000` | v262144 (1.1.2) only | — | **Blocked**: the Thor's own dump is v131072 (1.1.0); the profile only lists v262144. The build ran anyway (no pre-build version check yet) and failed deep in shader splitting on the older update's archive layout — don't chase this on an unsupported version, update the dump instead |
+| Dragon Quest III HD-2D Remake | `01003E601E324000` | v262144 (1.1.2) only | — | **Blocked**: the Thor's own dump is v131072 (1.1.0); the profile only lists v262144. At the time of this run the build proceeded without asking and failed deep in shader splitting on the older update's archive layout; a game sheet now shows this version gap and asks for an explicit "Build anyway" confirmation before trying — don't chase this on an unsupported version, update the dump instead |
 | The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | v1114112 (1.9.0) only | — | **Blocked**: the Thor's own dump is v786432; the profile only lists v1114112. Caught before building this time |
 | Pokémon Pokopia | `0400A3A01EE4C000` | v655360 | prototype only | Early proof-of-concept (Switch 2; the first title this project ran at all) — removed from the test device, not actively maintained |
 
@@ -140,10 +140,10 @@ flow in one place:
 
 1. Add your game's NSP/XCI/`.nup`/dump folder — the library finds it automatically if it's in your configured game
    folder, and matches a base game to its update and DLC by title ID.
-2. Open the game's card and tap **Build**. The card shows the dump's build against the profile's listed builds before
-   you commit — not every unlisted build is caught today (Dragon Quest III above is an open gap, see `PEANUTS.md`),
-   but a listed-but-not-the-package build is now flagged as "builds, but with a full shader scan" rather than silently
-   running slow with no explanation.
+2. Open the game's card and tap **Build**. The sheet's Version row shows the dump's build against the profile's
+   listed builds before you commit: an unlisted build (Dragon Quest III above is the example) requires an explicit
+   "Build anyway" confirmation rather than building silently, and a listed-but-not-the-package build is flagged as
+   "builds, but with a full shader scan" instead of just running slow with no explanation.
 3. Build runs, in order: **import** (decrypts NSP/XCI into a `.nup` with your own keys), **Prepare** (Banana Native's
    own pack step: code rewrite + shader translation, which can take from a few minutes to roughly an hour depending on
    the title's shader count), then the matching **companion** install, if the catalog has one for that title *and*
@@ -152,7 +152,9 @@ flow in one place:
    shipping them in any game file; for those, Build also runs a short, automated run-time shader capture pass after
    Prepare, so those draws aren't left black.
 5. Play. The companion, if installed and the current pack build is one it lists, starts automatically on the second
-   screen once gameplay begins; otherwise you get the ordinary second-screen fallback with a notice, not a guess.
+   screen once gameplay begins. What happens instead when the installed companion doesn't list the current pack
+   build (a notice, a fallback view, or something else) hasn't been independently re-verified on the Thor yet — see
+   "Companions" below.
 
 Building entirely on the phone is slower than Banana Native's own Mac/PC packer for very shader-heavy titles (see
 `PEANUTS.md`'s build-speed notes), but needs nothing except the phone and your dump.
@@ -188,11 +190,14 @@ Houses above) with an automated capture pass; an unfamiliar title that does this
 retry.
 
 **Can I use this with a game at a different update version than the table says?** It depends which gate you hit. If
-your dump's build isn't in the profile's `build` rows at all, today the build still runs (no pre-build refusal yet,
-see Dragon Quest III above) and the right move is to update your dump, not to keep retrying. If your build *is*
-listed but isn't the one the shader tables were made on, the build proceeds with a slower full shader scan — that's
-expected, not a bug. Companions go further on their own axis: they refuse to load on a pack build outside their own
-`build_ids`, with a notice, rather than reading memory they don't understand.
+your dump's build isn't in the profile's `build` rows at all, the game's sheet shows a version row explaining that
+up front and requires an explicit "Build anyway" confirmation before it will try (it may not start, or may crash,
+and the first build scans every shader) — it does not build silently on an untested version. Dragon Quest III above
+is the example this caught; the right move there is to update your dump, not to keep forcing a build. If your build
+*is* listed but isn't the one the shader tables were made on, the build proceeds with a slower full shader scan
+without needing that confirmation — that's expected, not a version mismatch. Companions go further on their own
+axis, and are meant to refuse to load on a pack build outside their own `build_ids` rather than reading memory they
+don't understand — see "Companions" above for why that specific behavior isn't yet independently verified on-device.
 
 **Does the companion slow the game down?** A little; it's been profiled and reduced since the first version (direct
 guest reads against cached ranges, ticking every other presented frame rather than every frame — see `PEANUTS.md` for
