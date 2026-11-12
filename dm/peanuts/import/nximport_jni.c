@@ -5,7 +5,8 @@
 //   static native int    writeNup(String out, String[] inputs, String baseTitleId, Progress cb);
 //   static native int    firmwareFonts(String firmwareDir, String outDir);
 //   static native String lastError();
-//   interface Progress { void on(String step, long done, long total); }        // called from the writer's thread
+//   static native void   setThreads(int n);                                     // optional: writeNup's reader threads (0 = automatic: online CPUs, at most 6); the .nup is the same
+//   interface Progress { void on(String step, long done, long total); }        // called from the thread that called writeNup (the readers never call back)
 #include <jni.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,3 +92,5 @@ JNIEXPORT jint JNICALL Java_dev_peanuts_importer_Native_firmwareFonts(JNIEnv *en
 JNIEXPORT jstring JNICALL Java_dev_peanuts_importer_Native_lastError(JNIEnv *env, jclass cls) {
     return (*env)->NewStringUTF(env, nximport_last_error());
 }
+
+JNIEXPORT void JNICALL Java_dev_peanuts_importer_Native_setThreads(JNIEnv *env, jclass cls, jint n) { nximport_set_threads((int)n); }

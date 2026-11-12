@@ -35,12 +35,22 @@ public final class Native {
     public static native int    writeNup(String out, String[] inputs, String baseTitleId, Progress cb);
     public static native int    firmwareFonts(String firmwareDir, String outDir);     // writes <outDir>/standard.ttf and nintendo_ext.ttf
     public static native String lastError();
+    public static native void   setThreads(int n);                                    // optional (2026-11-12): writeNup's reader threads, 0 = automatic; see "Speed"
 }
 ```
 
 `writeNup` blocks for the whole write (minutes for a 6 GB game): call it from a worker thread (the foreground service of the build pipeline);
 `Progress.on` is called on that same thread once per MiB with `step` one of `probe`, `base/exefs`, `base/romfs`, `update/<version>/exefs|romfs`,
 `addon/<title id>/romfs`, `toc`, and `done`/`total` in bytes of the whole job (`total` is 0 during `probe`). A failed write removes the partial file.
+
+## Speed (2026-11-12)
+
+`writeNup` is a pipeline: `n` reader threads decrypt + decompress consecutive chunks (4 MiB, cut at LZ4 entry ends) in parallel, one thread hashes in
+order, the calling thread writes in order and keeps every decision (extent places, equal-file sharing, the BKTR shortcut) in file order — the .nup is
+byte-identical whatever `n`, and at most ~256 MiB of chunks is in flight. SHA-256 uses the CPU's SHA instructions (ARMv8 SHA2 / x86 SHA-NI; the hash
+self-tests against FIPS vectors at start and falls back to the portable one). `n` defaults to the online CPUs capped at 6, or `NXIMPORT_THREADS` from
+the environment; `Native.setThreads(int)` (JNI `Java_dev_peanuts_importer_Native_setThreads`, declare it in the Java class to use it — writeNup's
+signature is unchanged) overrides both; `n <= 0` = automatic. `Progress.on` is still called on the calling thread, once per MiB.
 
 ## Keys
 

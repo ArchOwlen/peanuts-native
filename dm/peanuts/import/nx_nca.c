@@ -1,12 +1,15 @@
 // libnximport: keys, containers, NCA sections (CTR and BKTR, compressed), PFS0/RomFS trees, CNMT titles (nx_internal.h).
 // Formats as documented publicly (switchbrew NCA/NSP/XCI/CNMT pages); hactool (ISC, SciresM) was consulted for the CTR/BKTR counter conventions,
 // Atmosphère's fssystem (as vendored by yuzu/Eden: fssystem_nca_header.h, fssystem_compressed_storage.h, fssystem_nca_file_system_driver.cpp) for the compression layer.
+// Threads: once a section is set up (nx_nca_open, nx_nca_set_base, nx_sec_prepare) its reads only touch read-only state plus the caller's NxCompCache,
+// so nx_sec_read_tc / nx_node_read_tc may run on several threads at once (each with its own cache); the trees and nx_sec_read (built-in cache) are single-threaded.
 #define _FILE_OFFSET_BITS 64
 #define _GNU_SOURCE
 #include "nximport.h"
 #include "nx_internal.h"
 #include <ctype.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -18,7 +21,7 @@
 static _Thread_local char nx_errbuf[512];
 void nx_err(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(nx_errbuf, sizeof nx_errbuf, fmt, ap); va_end(ap);
-    static int dbg = -1; if (dbg < 0) { const char *e = getenv("NX_DEBUG"); dbg = e && *e && *e != '0'; }
+    static _Atomic int dbg = -1; if (dbg < 0) { const char *e = getenv("NX_DEBUG"); dbg = e && *e && *e != '0'; }
     if (dbg) fprintf(stderr, "nximport: %s\n", nx_errbuf);   // NX_DEBUG=1: every error as it is set, even ones a caller goes on from
 }
 const char *nximport_last_error(void) { return nx_errbuf; }
@@ -141,6 +144,7 @@ int nx_container_open(NxContainer *c, const char *path) {
     c->fd = open(path, O_RDONLY | O_CLOEXEC);
     if (c->fd < 0) { nx_err("cannot open %s: %s", path, strerror(errno)); return -1; }
     struct stat st; if (fstat(c->fd, &st) || !S_ISREG(st.st_mode)) { nx_err("%s is not a file", path); goto fail; }
+    (void)posix_fadvise(c->fd, 0, 0, POSIX_FADV_SEQUENTIAL);   // the importer streams: a larger readahead window
     uint8_t h[0x400]; if ((uint64_t)st.st_size < 0x400) { nx_err("%s: too small", path); goto fail; }
     if (nx_pread_all(c->fd, h, sizeof h, 0)) goto fail;
     if (!memcmp(h, "PFS0", 4)) { c->kind = 0; if (read_fs0(c, 0, 0, NULL)) goto fail; }
@@ -318,7 +322,7 @@ static int comp_load(NxNca *n, int s) {
     if (!(tb = malloc((size_t)need)) || !(c = calloc(1, sizeof *c))) NX_FAIL("out of memory");
     if (nx_sec_read_raw(n, s, S->data_off + toff, tb, (size_t)need)) goto fail;
     if (u32(tb + 4) != sets) NX_FAIL("%s: section %d: compression table root has %u entry sets, expected %u", n->id, s, u32(tb + 4), sets);
-    c->total = u64(tb + 8); c->table_off = toff; c->cached = UINT32_MAX;
+    c->total = u64(tb + 8); c->table_off = toff; c->cache.comp = c; c->cache.cached = UINT32_MAX;
     if (!(c->e = malloc(sizeof *c->e * cnt))) NX_FAIL("out of memory");
     for (uint32_t i = 0; i < sets; i++) {
         const uint8_t *bk = tb + 0x4000 * (i + 1); uint32_t ne = u32(bk + 4); uint64_t vend = u64(bk + 8);
@@ -347,7 +351,8 @@ fail:
     free(tb); if (c) { free(c->e); free(c); } return -1;
 }
 
-static void comp_free(NxComp *c) { if (!c) return; free(c->e); free(c->out); free(c->in); free(c); }
+void nx_comp_cache_free(NxCompCache *c) { free(c->out); free(c->in); memset(c, 0, sizeof *c); }
+static void comp_free(NxComp *c) { if (!c) return; free(c->e); nx_comp_cache_free(&c->cache); free(c); }
 
 static const NxCompEntry *find_comp(const NxComp *c, uint64_t v) {
     uint32_t lo = 0, hi = c->n;
@@ -355,33 +360,45 @@ static const NxCompEntry *find_comp(const NxComp *c, uint64_t v) {
     return lo ? &c->e[lo - 1] : NULL;
 }
 
-static int comp_read(NxNca *n, int s, uint64_t voff, uint8_t *buf, size_t len) {   // voff: from the data level's start
+static int comp_read(NxNca *n, int s, uint64_t voff, uint8_t *buf, size_t len, NxCompCache *cc) {   // voff: from the data level's start
     NxSection *S = &n->sec[s]; NxComp *c = S->comp;
+    if (!cc) cc = &c->cache;
+    if (cc->comp != c) { cc->comp = c; cc->cached = UINT32_MAX; }   // a thread's scratch moving to another section
     if (voff + len > c->total) { nx_err("%s: read past the decompressed section %d (%llu + %zu > %llu)", n->id, s, (unsigned long long)voff, len, (unsigned long long)c->total); return -1; }
     while (len) {
         const NxCompEntry *e = find_comp(c, voff); if (!e || voff >= e->end) { nx_err("%s: offset %llu is outside the compression table", n->id, (unsigned long long)voff); return -1; }
         size_t k = len, vs = (size_t)(e->end - e->virt); if (voff + k > e->end) k = (size_t)(e->end - voff);
         if (e->type == 1) memset(buf, 0, k);
         else if (e->type == 0) { if (nx_sec_read_raw(n, s, S->data_off + e->phys + (voff - e->virt), buf, k)) return -1; }   // stored: in place
-        else {   // LZ4: the whole block, kept for the next read
-            uint32_t idx = (uint32_t)(e - c->e);
-            if (c->cached != idx) {
-                c->cached = UINT32_MAX;
-                if (c->outcap < vs) { uint8_t *o = realloc(c->out, vs); if (!o) { nx_err("out of memory"); return -1; } c->out = o; c->outcap = vs; }
-                if (c->incap < e->psize) { uint8_t *i = realloc(c->in, e->psize); if (!i) { nx_err("out of memory"); return -1; } c->in = i; c->incap = e->psize; }
-                if (nx_sec_read_raw(n, s, S->data_off + e->phys, c->in, e->psize)) return -1;
-                long got = nx_lz4_decompress(c->in, e->psize, c->out, vs);
+        else {   // LZ4: the whole block; straight into buf when the read covers it all, else kept for the next read
+            uint32_t idx = (uint32_t)(e - c->e); int whole = voff == e->virt && k == vs;
+            if (whole || cc->cached != idx) {
+                if (cc->incap < e->psize) { uint8_t *i = realloc(cc->in, e->psize); if (!i) { nx_err("out of memory"); return -1; } cc->in = i; cc->incap = e->psize; }
+                if (nx_sec_read_raw(n, s, S->data_off + e->phys, cc->in, e->psize)) return -1;
+                uint8_t *dst = buf;
+                if (!whole) {
+                    cc->cached = UINT32_MAX;
+                    if (cc->outcap < vs) { uint8_t *o = realloc(cc->out, vs); if (!o) { nx_err("out of memory"); return -1; } cc->out = o; cc->outcap = vs; }
+                    dst = cc->out;
+                }
+                long got = nx_lz4_decompress(cc->in, e->psize, dst, vs);
                 if (got != (long)vs) { nx_err("%s: section %d: LZ4 block at %llu does not decompress to %zu bytes", n->id, s, (unsigned long long)e->phys, vs); return -1; }
-                c->cached = idx;
+                if (!whole) cc->cached = idx;
             }
-            memcpy(buf, c->out + (voff - e->virt), k);
+            if (!whole) memcpy(buf, cc->out + (voff - e->virt), k);
         }
         buf += k; voff += k; len -= k;
     }
     return 0;
 }
 
-int nx_sec_read(NxNca *n, int s, uint64_t off, void *buf, size_t len) {
+int nx_sec_prepare(NxNca *n, int s) {
+    if (s < 0 || s > 3 || !n->sec[s].present) { nx_err("%s: no section %d", n->id, s); return -1; }
+    NxSection *S = &n->sec[s];
+    return S->compressed && !S->comp ? comp_load(n, s) : 0;
+}
+
+int nx_sec_read_tc(NxNca *n, int s, uint64_t off, void *buf, size_t len, NxCompCache *cc) {
     if (s < 0 || s > 3 || !n->sec[s].present) { nx_err("%s: no section %d", n->id, s); return -1; }
     NxSection *S = &n->sec[s];
     if (!S->compressed) return nx_sec_read_raw(n, s, off, buf, len);
@@ -391,9 +408,19 @@ int nx_sec_read(NxNca *n, int s, uint64_t off, void *buf, size_t len) {
         if (nx_sec_read_raw(n, s, off, buf, k)) return -1;
         buf = (uint8_t *)buf + k; off += k; len -= k;
     }
-    return len ? comp_read(n, s, off - S->data_off, buf, len) : 0;
+    return len ? comp_read(n, s, off - S->data_off, buf, len, cc) : 0;
 }
+int nx_sec_read(NxNca *n, int s, uint64_t off, void *buf, size_t len) { return nx_sec_read_tc(n, s, off, buf, len, NULL); }
 
+uint64_t nx_sec_chunk_end(NxNca *n, int s, uint64_t off, uint64_t want_end, uint64_t limit) {
+    if (s < 0 || s > 3 || !n->sec[s].present) return want_end;
+    const NxSection *S = &n->sec[s]; const NxComp *c = S->comp;
+    if (!S->compressed || !c || want_end >= limit || want_end <= S->data_off) return want_end;
+    uint64_t v = want_end - S->data_off; if (v >= c->total) return want_end;
+    const NxCompEntry *e = find_comp(c, v); if (!e || e->type != 3 || v == e->virt) return want_end;   // not inside an LZ4 entry: the boundary is free
+    uint64_t end = S->data_off + e->end; (void)off;
+    return end < limit ? end : limit;   // the entry ends past limit: the chunk takes the rest anyway
+}
 int nx_bktr_maps_to_base(const NxNca *n, int s, uint64_t off, uint64_t size, uint64_t *base_off) {
     const NxSection *S = &n->sec[s]; if (S->crypt_type != 4 || !S->bktr || !size) return 0;
     if (S->compressed || S->base->sec[S->base_sec].compressed) return 0;   // the relocations map compressed bytes, not the files' (which the reader decompresses)
@@ -489,11 +516,12 @@ NxNode *nx_node_find(NxNode *root, const char *path) {
     }
     return n;
 }
-int nx_node_read(const NxNode *f, uint64_t off, void *buf, size_t len) {
+int nx_node_read_tc(const NxNode *f, uint64_t off, void *buf, size_t len, NxCompCache *cc) {
     if (f->is_dir) { nx_err("%s is a directory", f->name); return -1; }
     if (off + len > f->size) { nx_err("%s: read past the end", f->name); return -1; }
-    return nx_sec_read(f->nca, f->sec, f->off + off, buf, len);
+    return nx_sec_read_tc(f->nca, f->sec, f->off + off, buf, len, cc);
 }
+int nx_node_read(const NxNode *f, uint64_t off, void *buf, size_t len) { return nx_node_read_tc(f, off, buf, len, NULL); }
 int nx_node_read_whole(const NxNode *f, uint8_t **out, size_t max) {
     if (f->size > max) { nx_err("%s is too large (%llu bytes)", f->name, (unsigned long long)f->size); return -1; }
     uint8_t *b = malloc((size_t)f->size + 1); if (!b) { nx_err("out of memory"); return -1; }

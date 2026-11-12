@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,41 +144,184 @@ static int write_all(int fd, const void *p, size_t n, uint64_t off) {
     const uint8_t *b = p; while (n) { ssize_t w = pwrite(fd, b, n, (off_t)off); if (w < 0) { if (errno == EINTR) continue; nx_err("write failed: %s", strerror(errno)); return -1; } b += w; n -= (size_t)w; off += (uint64_t)w; } return 0;
 }
 
-static void report(Job *j, const char *step) { if (j->progress) { j->cur_step = step; j->progress(j->user, step, j->done, j->total); } }   // once per 1 MiB chunk
+static void report(Job *j, const char *step) { if (j->progress) { j->cur_step = step; j->progress(j->user, step, j->done, j->total); } }   // once per MiB
+static void advance(Job *j, const char *step, uint64_t n) { while (n) { uint64_t k = n > NX_CHUNK ? NX_CHUNK : n; j->done += (long long)k; n -= k; report(j, step); } }
 
-// Streams file f into the .nup at *pos (16-byte aligned), hashing; shares an earlier extent when the bytes are the same. 0 ok
-static int write_file(Job *j, int fd, NxNode *f, uint64_t *pos, uint8_t *buf, const char *step) {
-    f->codec = 0; f->ext_stored = f->size; f->shared = 0; f->written = 1;   // (written: the base-file shortcut below may only share a file that already has its extent)
-    if (!f->size) { f->ext_off = 0; nx_sha256(NULL, 0, f->sha); return 0; }
-    // an update file that is one unbroken run of the base's bytes: the base file at that very place (same size) is the same bytes → share, no read
-    uint64_t boff; const NxSection *S = &f->nca->sec[f->sec];
-    if (S->crypt_type == 4 && j->nbase && S->base == j->base_rom && nx_bktr_maps_to_base(f->nca, f->sec, f->off, f->size, &boff)) {
-        uint32_t lo = 0, hi = j->nbase;
-        while (lo < hi) { uint32_t m = (lo + hi) / 2; if (j->basefiles[m]->off < boff) lo = m + 1; else hi = m; }
-        for (uint32_t k = lo; k < j->nbase && j->basefiles[k]->off == boff; k++) {
-            NxNode *b = j->basefiles[k];
-            if (b->written && b->size == f->size) { f->ext_off = b->ext_off; f->ext_stored = b->ext_stored; f->codec = b->codec; memcpy(f->sha, b->sha, 32); f->shared = 1; j->done += (long long)f->size; report(j, step); return 0; }
+// ---- the blob: a pipeline. The files go in node-id order and every byte of the .nup is decided in that order (an extent's place, sharing an equal
+// earlier extent, the BKTR shortcut), exactly as one thread writing file after file would; what runs in parallel is the reading (decrypt + decompress)
+// of consecutive chunks, by `threads` workers each with its own decompression scratch. A chunk (one ring slot, ~PIPE_CHUNK bytes) is a run of segments:
+// pieces of one big file, or many whole small files back to back (so a worker's cache still serves the LZ4 entry two neighbouring files share), cut
+// where an LZ4 entry ends (nx_sec_chunk_end) so no entry is decompressed by two workers. One hasher thread does the SHA-256 in order (the hash is one
+// serial chain per file), the caller's thread writes in order and keeps the bookkeeping. At most PIPE_BUDGET bytes are in flight.
+#define PIPE_SLOTS 64
+#define PIPE_CHUNK (4u << 20)
+#define PIPE_BUDGET (256u << 20)
+#define PIPE_MAX_SEGS 4096
+enum { SL_FREE, SL_QUEUED, SL_READ, SL_HASHED };
+typedef struct Seg { NxNode *f; uint64_t off; size_t len; NxNode *share; int first, last; } Seg;   // share: the base file to share (the BKTR shortcut); len 0 and no share: an empty file
+typedef struct Slot { Seg *seg; int nseg, segcap; uint8_t *buf; size_t cap, used; int state, rc; char err[256]; } Slot;
+typedef struct Pipe {
+    pthread_mutex_t mu; pthread_cond_t cv_work, cv_hash, cv_main;
+    Slot slot[PIPE_SLOTS];
+    uint64_t q_seq, claim_seq, hash_seq;   // enqueued / claimed by a worker / hashed: the next sequence number of each stage (write_seq lives in the loop)
+    uint64_t write_seq; size_t inflight; int stop, nworkers, hasher_up;
+    pthread_t *th, hasher; NxSha256 h;
+} Pipe;
+
+static int nx_threads_setting;   // nximport_set_threads
+void nximport_set_threads(int n) { nx_threads_setting = n; }
+static int thread_count(void) {
+    int n = nx_threads_setting;
+    if (n <= 0) { const char *e = getenv("NXIMPORT_THREADS"); if (e && *e) n = atoi(e); }
+    if (n <= 0) { long c = sysconf(_SC_NPROCESSORS_ONLN); n = c > 0 ? (int)c : 2; if (n > 6) n = 6; }
+    return n > 64 ? 64 : n;
+}
+
+static void *pipe_worker(void *arg) {
+    Pipe *P = arg; NxCompCache cc; memset(&cc, 0, sizeof cc);
+    pthread_mutex_lock(&P->mu);
+    for (;;) {
+        while (!P->stop && P->claim_seq == P->q_seq) pthread_cond_wait(&P->cv_work, &P->mu);
+        if (P->stop) break;
+        Slot *s = &P->slot[P->claim_seq++ % PIPE_SLOTS];
+        pthread_mutex_unlock(&P->mu);
+        s->rc = 0; uint8_t *at = s->buf;
+        for (int i = 0; i < s->nseg && !s->rc; i++) {
+            Seg *g = &s->seg[i]; if (!g->len || g->share) continue;
+            if (nx_node_read_tc(g->f, g->off, at, g->len, &cc)) { s->rc = -1; snprintf(s->err, sizeof s->err, "%s", nximport_last_error()); }
+            at += g->len;
         }
+        pthread_mutex_lock(&P->mu);
+        s->state = SL_READ; pthread_cond_broadcast(&P->cv_hash);
     }
-    uint64_t start = *pos, at = 0; NxSha256 h; nx_sha256_init(&h);
-    while (at < f->size) {
-        size_t k = f->size - at > NX_CHUNK ? NX_CHUNK : (size_t)(f->size - at);
-        if (nx_node_read(f, at, buf, k)) return -1;
-        nx_sha256_update(&h, buf, k);
-        if (write_all(fd, buf, k, start + at)) return -1;
-        at += k; j->done += (long long)k; report(j, step);
+    pthread_mutex_unlock(&P->mu);
+    nx_comp_cache_free(&cc); return NULL;
+}
+
+static void *pipe_hasher(void *arg) {
+    Pipe *P = arg;
+    pthread_mutex_lock(&P->mu);
+    for (;;) {
+        Slot *s = &P->slot[P->hash_seq % PIPE_SLOTS];
+        while (!P->stop && !(P->hash_seq < P->q_seq && s->state == SL_READ)) pthread_cond_wait(&P->cv_hash, &P->mu);
+        if (P->stop) break;
+        pthread_mutex_unlock(&P->mu);
+        if (!s->rc) {
+            const uint8_t *at = s->buf;
+            for (int i = 0; i < s->nseg; i++) {
+                Seg *g = &s->seg[i]; if (!g->len || g->share) continue;
+                if (g->first) nx_sha256_init(&P->h);
+                nx_sha256_update(&P->h, at, g->len); at += g->len;
+                if (g->last) nx_sha256_final(&P->h, g->f->sha);
+            }
+        }
+        pthread_mutex_lock(&P->mu);
+        s->state = SL_HASHED; P->hash_seq++; pthread_cond_broadcast(&P->cv_main);
     }
-    nx_sha256_final(&h, f->sha);
-    NxNode *same = sha_lookup(j, f);
-    if (same) { f->ext_off = same->ext_off; f->ext_stored = same->ext_stored; f->codec = same->codec; f->shared = 1; if (ftruncate(fd, (off_t)start)) { nx_err("truncate failed: %s", strerror(errno)); return -1; } return 0; }
-    f->ext_off = start; *pos = (start + f->size + 15) & ~15ull; sha_insert(j, f);
-    return 0;
+    pthread_mutex_unlock(&P->mu); return NULL;
+}
+
+static void pipe_stop(Pipe *P) {
+    pthread_mutex_lock(&P->mu); P->stop = 1; pthread_cond_broadcast(&P->cv_work); pthread_cond_broadcast(&P->cv_hash); pthread_mutex_unlock(&P->mu);
+    for (int i = 0; i < P->nworkers; i++) pthread_join(P->th[i], NULL);
+    if (P->hasher_up) pthread_join(P->hasher, NULL);
+    for (int i = 0; i < PIPE_SLOTS; i++) { free(P->slot[i].seg); free(P->slot[i].buf); }
+    free(P->th); pthread_mutex_destroy(&P->mu); pthread_cond_destroy(&P->cv_work); pthread_cond_destroy(&P->cv_hash); pthread_cond_destroy(&P->cv_main);
+}
+
+// the base file an update file f shares (the BKTR shortcut: one unbroken run of the base's bytes, where the base has a file of that very size), else NULL.
+// `written` is order-based (set when a file is dispatched), so the answer is the one a serial writer would give.
+static NxNode *base_share(Job *j, NxNode *f) {
+    uint64_t boff; const NxSection *S = &f->nca->sec[f->sec];
+    if (!(S->crypt_type == 4 && j->nbase && S->base == j->base_rom && nx_bktr_maps_to_base(f->nca, f->sec, f->off, f->size, &boff))) return NULL;
+    uint32_t lo = 0, hi = j->nbase;
+    while (lo < hi) { uint32_t m = (lo + hi) / 2; if (j->basefiles[m]->off < boff) lo = m + 1; else hi = m; }
+    for (uint32_t k = lo; k < j->nbase && j->basefiles[k]->off == boff; k++) { NxNode *b = j->basefiles[k]; if (b->written && b->size == f->size) return b; }
+    return NULL;
+}
+
+static int slot_add(Slot *s, Seg g) {
+    if (s->nseg == s->segcap) { int nc = s->segcap ? s->segcap * 2 : 64; Seg *ns = realloc(s->seg, sizeof *ns * (size_t)nc); if (!ns) { nx_err("out of memory"); return -1; } s->seg = ns; s->segcap = nc; }
+    s->seg[s->nseg++] = g; s->used += g.len; return 0;
+}
+
+// Writes every file's bytes into the .nup from *pos on (16-byte aligned extents), hashing; equal files share one extent. 0 ok
+static int write_blob(Job *j, int fd, uint64_t *pos, const char **steps) {
+    Pipe *P = calloc(1, sizeof *P); if (!P) { nx_err("out of memory"); return -1; }
+    pthread_mutex_init(&P->mu, NULL); pthread_cond_init(&P->cv_work, NULL); pthread_cond_init(&P->cv_hash, NULL); pthread_cond_init(&P->cv_main, NULL);
+    int rc = -1, want = thread_count(), built = 0; uint32_t fi = 0; uint64_t fo = 0, start = 0;   // fi/fo: the next file and offset to dispatch; built: the slot at q_seq is ready
+    for (uint32_t i = 0; i < j->nf; i++) if (nx_sec_prepare(j->files[i]->nca, j->files[i]->sec)) goto out;   // the compression tables are loaded before the threads start
+    if (!(P->th = calloc((size_t)want, sizeof *P->th))) NX_FAIL("out of memory");
+    for (int i = 0; i < want; i++) { if (pthread_create(&P->th[i], NULL, pipe_worker, P)) break; P->nworkers++; }
+    if (!P->nworkers) NX_FAIL("cannot create a worker thread: %s", strerror(errno));
+    if (pthread_create(&P->hasher, NULL, pipe_hasher, P)) NX_FAIL("cannot create the hasher thread: %s", strerror(errno));
+    P->hasher_up = 1;
+    pthread_mutex_lock(&P->mu);
+    while (fi < j->nf || built || P->write_seq < P->q_seq) {
+        // dispatch: build the next slot (the files are walked once, in order: a file is dispatched exactly once, so `written` means "earlier in order"),
+        // enqueue it when it fits the budget (always at least one slot in flight), else keep it built and wait for the head to drain
+        while (fi < j->nf || built) {
+            Slot *s = &P->slot[P->q_seq % PIPE_SLOTS];
+            if (P->q_seq - P->write_seq == PIPE_SLOTS) break;   // the ring is full
+            if (!built) {
+                s->nseg = 0; s->used = 0; s->rc = 0;
+                while (fi < j->nf && s->used < PIPE_CHUNK && s->nseg < PIPE_MAX_SEGS) {
+                    NxNode *f = j->files[fi]; Seg g = { f, fo, 0, NULL, fo == 0, 0 };
+                    if (fo == 0) {
+                        f->codec = 0; f->ext_stored = f->size; f->shared = 0; f->written = 1;
+                        if (f->size) g.share = base_share(j, f);
+                    }
+                    if (!f->size || g.share) { g.last = 1; }
+                    else {
+                        uint64_t end = fo + (PIPE_CHUNK - s->used); if (end > f->size) end = f->size;
+                        end = nx_sec_chunk_end(f->nca, f->sec, f->off + fo, f->off + end, f->off + f->size) - f->off;
+                        g.len = (size_t)(end - fo); g.last = end == f->size;
+                    }
+                    if (slot_add(s, g)) { pthread_mutex_unlock(&P->mu); goto out; }
+                    if (g.last) { fi++; fo = 0; } else fo += g.len;
+                }
+                if (!s->nseg) break;
+                built = 1;
+            }
+            if (P->inflight && P->inflight + s->used > PIPE_BUDGET) break;   // over budget: the slot stays built, enqueued after the head is written
+            if (s->cap < s->used) { uint8_t *nb = realloc(s->buf, s->used); if (!nb) { pthread_mutex_unlock(&P->mu); nx_err("out of memory"); goto out; } s->buf = nb; s->cap = s->used; }
+            P->inflight += s->used; s->state = SL_QUEUED; P->q_seq++; built = 0; pthread_cond_broadcast(&P->cv_work);
+        }
+        if (P->write_seq == P->q_seq) continue;   // (only when every file is dispatched: nothing left to wait for)
+        // consume the next slot in order
+        Slot *s = &P->slot[P->write_seq % PIPE_SLOTS];
+        while (s->state != SL_HASHED) pthread_cond_wait(&P->cv_main, &P->mu);
+        pthread_mutex_unlock(&P->mu);
+        if (s->rc) { nx_err("%s", s->err); goto out; }
+        const uint8_t *at = s->buf;
+        for (int i = 0; i < s->nseg; i++) {
+            Seg *g = &s->seg[i]; NxNode *f = g->f; const char *step = steps[f->id];
+            if (!f->size) { f->ext_off = 0; nx_sha256(NULL, 0, f->sha); continue; }
+            if (g->share) { NxNode *b = g->share; f->ext_off = b->ext_off; f->ext_stored = b->ext_stored; f->codec = b->codec; memcpy(f->sha, b->sha, 32); f->shared = 1; advance(j, step, f->size); continue; }
+            if (g->first) start = *pos;
+            if (write_all(fd, at, g->len, start + g->off)) goto out;
+            at += g->len; advance(j, step, g->len);
+            if (g->last) {
+                NxNode *same = sha_lookup(j, f);
+                if (same) { f->ext_off = same->ext_off; f->ext_stored = same->ext_stored; f->codec = same->codec; f->shared = 1; if (ftruncate(fd, (off_t)start)) { nx_err("truncate failed: %s", strerror(errno)); goto out; } }
+                else { f->ext_off = start; *pos = (start + f->size + 15) & ~15ull; sha_insert(j, f); }
+            }
+        }
+        pthread_mutex_lock(&P->mu);
+        P->inflight -= s->used; s->state = SL_FREE; P->write_seq++;
+        if (s->cap > 2 * PIPE_CHUNK) { free(s->buf); s->buf = NULL; s->cap = 0; }   // a slot that grew for a huge entry gives the memory back
+    }
+    pthread_mutex_unlock(&P->mu);
+    rc = 0;
+out:
+fail:
+    pipe_stop(P); free(P); return rc;
 }
 
 static void sum_sizes(Job *j, NxNode *d) { for (int i = 0; i < d->nkids; i++) { if (d->kids[i]->is_dir) sum_sizes(j, d->kids[i]); else j->total += (long long)d->kids[i]->size; } }
 
 static int write_nup(Job *j, const char *out) {
-    int fd = -1, rc = -1; uint8_t *buf = NULL, *toc = NULL; const char **steps = NULL; char (*stepnames)[64] = NULL;
+    int fd = -1, rc = -1; uint8_t *toc = NULL; const char **steps = NULL; char (*stepnames)[64] = NULL;
     // node ids: every directory first, breadth first from the package roots (a directory's children are one run of child slots), then the files in directory order
     for (int p = 0; p < j->npk; p++) if (push(&j->dirs, &j->nd, &j->dcap, j->pk[p].root)) goto out;
     for (uint32_t i = 0; i < j->nd; i++) { NxNode *d = j->dirs[i]; d->id = i; for (int k = 0; k < d->nkids; k++) if (d->kids[k]->is_dir && push(&j->dirs, &j->nd, &j->dcap, d->kids[k])) goto out; }
@@ -205,9 +349,8 @@ static int write_nup(Job *j, const char *out) {
     }
     // the blob
     if ((fd = open(out, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) NX_FAIL("cannot create %s: %s", out, strerror(errno));
-    if (!(buf = malloc(NX_CHUNK))) NX_FAIL("out of memory");
     uint64_t pos = blob;
-    for (uint32_t i = 0; i < j->nf; i++) if (write_file(j, fd, j->files[i], &pos, buf, steps[i])) goto out;
+    if (write_blob(j, fd, &pos, steps)) goto out;
     uint64_t end = blob; for (uint32_t i = 0; i < j->nf; i++) if (j->files[i]->size && j->files[i]->ext_off + j->files[i]->ext_stored > end) end = j->files[i]->ext_off + j->files[i]->ext_stored;
     if (ftruncate(fd, (off_t)end)) NX_FAIL("truncate failed: %s", strerror(errno));
     report(j, "toc");
@@ -239,7 +382,7 @@ static int write_nup(Job *j, const char *out) {
 out:
 fail:
     if (fd >= 0) close(fd); if (rc) unlink(out);
-    free(buf); free(toc); free(steps); free(stepnames); return rc;
+    free(toc); free(steps); free(stepnames); return rc;
 }
 
 int nximport_write_nup(const char *out_nup, const char **inputs, int n_inputs, const char *base_title_id,

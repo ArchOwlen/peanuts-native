@@ -1,5 +1,6 @@
 // AES-128 (ECB block, CTR, XTS with Nintendo's big-endian sector tweak) and SHA-256 for libnximport. Own implementation (FIPS-197 / FIPS 180-4),
-// with AES-NI (x86-64) and ARMv8 Crypto Extensions (aarch64) paths picked at run time when the CPU has them, else the portable one.
+// with AES-NI / SHA-NI (x86-64) and ARMv8 Crypto Extensions (aarch64: AES, SHA2) paths picked at run time when the CPU has them, else the portable ones.
+// Every function is thread-safe once the first call (any of them, single-threaded) has run the CPU detection; the hashes are self-tested against known answers.
 #ifndef NX_CRYPTO_H
 #define NX_CRYPTO_H
 #include <stddef.h>
@@ -24,4 +25,5 @@ void nx_sha256_final(NxSha256 *s, uint8_t out[32]);
 void nx_sha256(const void *p, size_t n, uint8_t out[32]);
 
 const char *nx_aes_backend(void);   // "aesni", "armv8" or "portable", for messages
+const char *nx_sha_backend(void);   // "sha-ni", "armv8" or "portable"
 #endif

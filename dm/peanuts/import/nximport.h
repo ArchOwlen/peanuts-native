@@ -30,6 +30,9 @@ NXIMPORT_API int nximport_icon(const char *file, const char *title_id, const cha
 // whole job (files are written in node-id order, so the steps of two packages interleave). A failed write removes the partial file.
 NXIMPORT_API int nximport_write_nup(const char *out_nup, const char **inputs, int n_inputs, const char *base_title_id,
                         void (*progress)(void *user, const char *step, long long done, long long total), void *user);
+// The writer's reader threads (decrypt + decompress run in parallel; the .nup is the same whatever the count): n <= 0 = automatic (the NXIMPORT_THREADS
+// environment variable if set, else the online CPUs capped at 6). Set before nximport_write_nup; about 256 MiB of buffers are in flight whatever n.
+NXIMPORT_API void nximport_set_threads(int n);
 // The shared system fonts out of a firmware folder (FontStandard 0100000000000811 → standard.ttf, FontNintendoExtended 0100000000000810 → nintendo_ext.ttf):
 // *.nca files found in the folder and up to two levels below (Eden's nand/system/Contents/registered layout, or a flat folder; a <id>.nca/00 folder too).
 NXIMPORT_API int nximport_firmware_fonts(const char *firmware_dir, const char *out_dir);
