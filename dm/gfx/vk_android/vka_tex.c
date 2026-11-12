@@ -566,8 +566,11 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
             *why = 3; free(im); return NULL; }
         fl = sfl;
     }
-    // A 3D texture is drawn into slice by slice (NVN render target views of its slices, or all of them layered): 2D / 2D-array views of slices need this (Vulkan 1.1 maintenance1)
-    if (is3d && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    // A 3D texture is drawn into slice by slice (NVN render target views of its slices, or all of them layered): 2D / 2D-array views of slices need this (Vulkan 1.1 maintenance1).
+    // PEANUTS: also for a sampled or shader-image 3D texture, not only a render target: NVN's own TextureView of a 3D texture may itself override its target to 2D or
+    // 2D_ARRAY, naming one or more depth slices (view_of below), as a compute pass reading or writing a volume one slice at a time does (an 8x8x8 3D texture read through
+    // such a view: without this bit its 2D view was refused outright, "no view of shape 0x1", and it read as unbound)
+    if (is3d && (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     // Zero-shared images (below): a large GPU-content image the caller makes (g_zwant: vka_tex_get, its content ST_ZERO) is made to alias the zeroed memory of its create info
     int zs = g_zwant && VKA_ENV("DM_VK_ZSHARE", 1) && vkz_candidate(t->L.size, (uint64_t)(VKA_ENVF("DM_VK_ZSHARE_MB", 4.0) * 1048576.0),
                                                                     vkz_max(f->kind >= 3, V.driver_id == VK_DRIVER_ID_MESA_TURNIP, (int64_t)VKA_ENVF("DM_VK_ZSHARE_MAX_MB", -1.0)), res, im->samples, is3d, compressed(f),
@@ -2338,8 +2341,25 @@ static void pfb_hit(int id, uint64_t frame, uint64_t fence) {
     if (!(g_pfb_st[id] & PFB_WANT)) { g_pfb_st[id] |= PFB_WANT; g_pfb_wants++; }
     dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
 }
+// PEANUTS: DM_VK_POOL_EAGER (default 0, live). A texture read only through the pool (no other first use: an agl / gsys lightmap handle in a storage-buffer material record,
+// "Texture pool reads" above) goes black for every frame between the submission whose shader set its bit and the submission whose vka_tex_prepare finds that one's fence
+// done (pfb_hit, then write_tex makes it there, eager because PFB_WANT). That gap is not the pool readback's own cost (its copy is the last thing its submission's command
+// buffer does, so the bits are ready the moment the GPU reaches the submission's fence); it is however many submissions the CPU had recorded past that one before the GPU
+// caught up to it, bounded by the command-buffer ring's own depth (vka_exec.c NSLOT=8): on a loading spike, exactly the long frames the owner's black flashes were measured
+// in (the CPU races ahead while the GPU is still draining the frame before), this can be the full 8, which at the frame times a long frame runs at is close to the
+// second-long flashes reported. With this on, pfb_consume_locked waits (bounded by the hang time) for the oldest ring slot's own fence instead of only taking what is
+// already done, so a texture's image is made at most about one submission's worth of real GPU time after its first pool read, not however many the CPU is ahead by.
+// Default off: unproven on real hardware past code review, and the trade is real, not free - stalling the recording thread here holds back every other texture and draw in
+// the submission being prepared, and doing that on the very frames that are already long (the GPU behind) may lengthen them further rather than shortening the black
+// window. A/B it on the device this was written for (AYN Thor, Turnip): with it on, compare "texture pool reads" readbacks/wants/made against a run with it off, and in the
+// per-game log look for [longframe] lines with "texture uploads N first" during the same loading moment - fewer or shorter such frames, not more, is the signal it helped
 static void pfb_consume_locked(void) {
     if (atomic_load(&g_pfb) <= 0) return;
+    if (VKA_ENV("DM_VK_POOL_EAGER", 0)) {
+        uint64_t oldest = UINT64_MAX;
+        for (int k = 0; k < PFB_RING; k++) if (g_pfb_r[k].busy && g_pfb_r[k].fence < oldest) oldest = g_pfb_r[k].fence;
+        if (oldest != UINT64_MAX && oldest > vka_done()) { pthread_mutex_unlock(&g_tmu); vka_wait_done(oldest, vka_hang_ns()); pthread_mutex_lock(&g_tmu); }
+    }
     uint64_t done = vka_done(), frame = vka_frame(), fence = vka_fence_last();
     for (int k = 0; k < PFB_RING; k++) {
         if (!g_pfb_r[k].busy || g_pfb_r[k].fence > done) continue;
@@ -2478,11 +2498,15 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     uint32_t tl = im->base + im->levels, l0 = v && v->set_levels ? v->base_level : 0, nl = v && v->set_levels && v->nlevels ? v->nlevels : tl > l0 ? tl - l0 : 1;
     if (im->vtrack && !storage && l0 < im->vmin) { uint32_t cut = im->vmin - l0; nl = nl > cut ? nl - cut : 1; l0 = im->vmin; }   // a sparse texture: from its wholly mapped levels
     vksoft_view(im->base, &l0, &nl);   // texture levels → the image's (a sparse texture's left-out levels, a soft texture's level 0)
-    uint32_t a0 = v && v->set_layers ? v->min_layer : 0, na = v && v->set_layers && v->nlayers ? v->nlayers : im->layers - a0;
-    if (im->d.target == NVN_TEXTURE_TARGET_3D) { a0 = 0; na = 1; }   // a 3D texture's view range names slices (a render target view's), which a 3D view does not take
-    if (l0 >= im->levels || a0 >= im->layers) return VK_NULL_HANDLE;
+    // PEANUTS: a 3D image has no array layers of its own (im->layers is always 1, img_create): its registered view's layer range names a depth-slice range instead (NVN's
+    // own 3D texture views, as a render target view's did already), bounded by its depth. Not forced to {0,1} here any more: a view whose target was overridden to 2D or
+    // 2D_ARRAY (one or more slices, below) needs the real range; a true 3D (whole-volume) view still gets {0,1} once its type is known, where Vulkan requires it
+    int img3d = im->d.target == NVN_TEXTURE_TARGET_3D;
+    uint32_t dmax = img3d ? (im->depth ? im->depth : 1) : im->layers;
+    uint32_t a0 = v && v->set_layers ? v->min_layer : 0, na = v && v->set_layers && v->nlayers ? v->nlayers : (a0 < dmax ? dmax - a0 : 1);
+    if (l0 >= im->levels || a0 >= dmax) return VK_NULL_HANDLE;
     if (l0 + nl > im->levels) nl = im->levels - l0;
-    if (a0 + na > im->layers) na = im->layers - a0;
+    if (a0 + na > dmax) na = dmax - a0;
     if (vt_want >= 0 && !storage) for (int i = 0; i < g_nfb; i++) if (g_fb_im[i] == im && g_fb_lv[i] > l0 && g_fb_lv[i] < l0 + nl) {
         static _Atomic int n; if (!atomic_exchange(&n, 1)) VLOG("a pass samples the texture it renders (serial %llu level %u) through levels %u+%u: sampled through the levels below it", (unsigned long long)im->serial, g_fb_lv[i], l0, nl);
         nl = g_fb_lv[i] - l0; }
@@ -2493,9 +2517,12 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     else if (e->t.set_swz) m = (VkComponentMapping){swz1(e->t.swz & 7), swz1(e->t.swz >> 3 & 7), swz1(e->t.swz >> 6 & 7), swz1(e->t.swz >> 9 & 7)};
     else { int fmt = v && v->set_format ? v->format : e->t.d.format; if (fmt == 0x37 || fmt == 0x6D || fmt == 0x6E || fmt == 0x6F || fmt == 0x70 || (fmt >= 0x71 && fmt <= 0x78) || fmt == 0x99 || fmt == 0x9B) m.a = VK_COMPONENT_SWIZZLE_ONE; }
     VkImageViewType vt = vt_want >= 0 ? (VkImageViewType)vt_want : view_type(tgt, na);
-    // What the image's type lets the view be (img_create: 3D for a 3D target, 1D for the 1D targets, cube-compatible for square 2D images of whole cubes)
-    int img3d = im->d.target == NVN_TEXTURE_TARGET_3D;
-    if ((vt == VK_IMAGE_VIEW_TYPE_3D) != img3d || vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY) return VK_NULL_HANDLE;   // no 1D images (img_create)
+    // What the image's type lets the view be (img_create: 3D for a 3D target, 1D for the 1D targets, cube-compatible for square 2D images of whole cubes).
+    // PEANUTS: a 3D image also takes a 2D or 2D-array view of one or more of its depth slices (img_create's VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT, Vulkan 1.1
+    // maintenance1), which the mismatch below used to reject outright for every non-3D view of a 3D image ("texture ID N has no view of shape 0x1" for an 8x8x8 3D
+    // texture viewed through a registration whose target was overridden to 2D for one Z slice: it read as unbound instead of that slice)
+    if (vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY) return VK_NULL_HANDLE;   // no 1D images (img_create)
+    if (img3d ? (vt != VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) : vt == VK_IMAGE_VIEW_TYPE_3D) return VK_NULL_HANDLE;
     if (vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
         if (im->w != im->h || im->layers < 6 || im->layers % 6 || im->samples > 1 || na < 6) return VK_NULL_HANDLE;
         if (vt == VK_IMAGE_VIEW_TYPE_CUBE) na = 6; else na -= na % 6;
