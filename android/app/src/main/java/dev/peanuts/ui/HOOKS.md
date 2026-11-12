@@ -1,34 +1,36 @@
-# dev.peanuts.ui — what the session owner wires up
+# dev.peanuts.ui — the library inside Banana's Home
 
-No upstream Java file is edited by this package. Everything upstream is reached through reflection (`Upstream.java`: Pack.titleIdOf, Nup.open().packages, PathUtil, Game.load/ready, Folders.packFor) or through public surface (`BuildConfig.NX_PROFILES`, MainActivity's exported adb extras).
+Banana's Home (`dev.nxnative.android.MainActivity`) is the one home: its game box is filled by `Library.fill`, its Settings page starts with `LibrarySettings.add`,
+its pickers' results pass through `LibrarySettings.result`, its Manage sheet has one Peanuts row (`GameSheet.open`). The look comes from `PUi`, a verbatim copy of
+upstream's package-private `Ui` on the same `R.color`/`R.drawable` resources (`diff Ui.java PUi.java | grep -v '^[<>] *\(package\|import dev\|public\)'` is the
+drift check; re-copy when upstream changes `Ui.java`).
 
-## Manifest (`android/app/src/main/AndroidManifest.xml`, the PEANUTS line)
+## Upstream hooks (each one line, tagged `PEANUTS`)
 
-Replace the `CatalogActivity` launcher line with these three (CatalogActivity stays, without the LAUNCHER filter; the library's ⋮ menu opens it):
+| File | Hook |
+|---|---|
+| `MainActivity.build()` | `Ui.page(this, frame, 900)` — 640 → 900 dp: three compact cards per row on a handheld |
+| `MainActivity.buildSettings()` | `dev.peanuts.ui.LibrarySettings.add(this, content);` before the Updates section |
+| `MainActivity.refresh()` | `dev.peanuts.ui.Library.fill(this, gameBox, games, Ondevice.cardView(), Ondevice::shows, this::gameCard, this::manage, this::addGame, this::refresh);` in place of the "Your games" block |
+| `MainActivity.manage()` | the `🔨 Build again` row → `dev.peanuts.ui.GameSheet.open(this, g.titleId)` |
+| `MainActivity.onActivityResult()` | `if (dev.peanuts.ui.LibrarySettings.result(this, request, result, data)) return;` first (requests 60–66) |
+| `AndroidManifest.xml` | `CatalogActivity` under `@style/Theme.Banana`; no Peanuts launcher entry (MainActivity keeps LAUNCHER) |
+| `src/ondevice/AndroidManifest.xml` | the `BuildService` line (import → Prepare → companion) |
 
-```xml
-<activity android:name="dev.peanuts.ui.LibraryActivity" android:label="@string/app_name" android:exported="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar"><intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter></activity>   <!-- PEANUTS: the library (home) -->
-<activity android:name="dev.peanuts.ui.SetupActivity" android:label="Setup" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />   <!-- PEANUTS: keys, firmware, folders -->
-<activity android:name="dev.peanuts.CatalogActivity" android:label="Peanuts Companions" android:exported="false" android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />   <!-- PEANUTS: the companion catalog (fallback) -->
-```
+`gameCard`, `manage`, `addGame`, `refresh` stay private in MainActivity: the hook passes them as method references.
 
-MainActivity keeps its own LAUNCHER filter (upstream's Home stays reachable), or the owner drops that filter on the Peanuts build only — this package does not care.
+## Pieces
+
+- `Library` — Home's game box: the filter row (All · Ready · Build needed · Not in this app version, Find, Add game), READY (upstream's full cards two per row, the
+  progress card and the build card first and full width), BUILD NEEDED (compact cards three per row), NOT IN THIS APP VERSION (folded behind Show N); the first-run
+  card when no game folder is set; the scan (`LibraryScanner`) and the catalog (`CompanionPort`) off the main thread; a scanned game that is ready goes into
+  upstream's list (`Upstream.addToList`) so its card is Banana's own. The build's progress (`BuildPipeline` → `BuildListener`) lands on the build card; during Prepare
+  upstream's Ondevice card is the card.
+- `GameSheet` — the game's dialog: Base / Update / DLC / Companion rows, Build or Rebuild, Add keys… when prod.keys are missing. Its Choose/Add pickers come back
+  through `LibrarySettings.result` (requests 65, 66).
+- `LibrarySettings` — Settings › Library: folders, keys, firmware fonts, Rescan, Companions; the pickers (also the first-run card's and the sheet's).
+- `LibraryScanner`, `Upstream`, `CompanionPort`, `ImporterPort`, `BuildPort` — as before (reflection into upstream and the sibling Peanuts packages).
 
 ## Launching a Ready game
 
-`LibraryActivity.launch` sends `Intent().setClassName(<this package>, "dev.nxnative.android.MainActivity").putExtra("game", <dump or .nup>).putExtra("pack", <pack dir>).putExtra("run", true)` — the adb form. MainActivity gates these extras by `AdbControl.allowed(BuildConfig.NX_PLAY, Prefs.adbControl)`: always allowed in a test app (`-PnxApp=peanuts` is one). For a play/live Peanuts build the owner needs either `Prefs.adbControl` on by default or a one-line PEANUTS hook in `MainActivity.gated` letting intents from the app's own package through.
-
-## Agent A (importer)
-
-`ImporterPort` loads `dev.peanuts.importer.Native` reflectively: static `int keys(String)`, `String probe(String)` (JSON array of `{title_id, app_id, kind, version, name, publisher}`), `int icon(String, String, String)`, `int firmwareFonts(String, String)`, `String lastError()`. 0 = success. If its static initializer throws (no `libnximport.so` in the APK) the stub is used.
-
-## Agent C (build pipeline)
-
-`BuildPort` loads `dev.peanuts.build.BuildPipeline` reflectively: if it implements `dev.peanuts.ui.BuildPort` it is used as is; otherwise (agent C's actual API, as landed) `BuildPort.Pipeline` adapts to `static int start(Context, BuildRequest, BuildListener)`, filling `BuildRequest`'s public fields (titleId, name, base, update, dlcs, gameDir = the library root from setup, companionPackage = the chosen one when "install after build" is on) from `dev.peanuts.ui.GameSheet.State` (public fields: titleId, name, base, needsImport, update, dlcs, home, nup, launch, companionPackage/companionVersion/installCompanion/companionRoot, companionItem = a `dev.peanuts.Catalog.Item`) and wrapping the sheet's listener in a `BuildListener` proxy (`progress(step, percent, detail)` → `progress("step: detail", percent, 100)`). The listener's `progress`/`done` may be called from any thread. After `done(true, …)` the library re-scans; READY needs a `pack.tsv` under `<home>/<title ID>-work/<any>/` or upstream's list entry for the dump/.nup to be `Game.ready`.
-
-Per-title choices (chosen update file, DLC files, companion package, "install after build", second-screen mode) are in `dev.peanuts.PeanutsPrefs` for `dev.peanuts.settings.CompanionSection` to reuse.
-
-## dev.peanuts (not upstream): optional cleanups
-
-- `Catalog`, `Catalog.Item`, `Installer` are package-private; `CompanionPort` reaches them through reflection. Making them `public` lets `CompanionPort` become plain calls.
-- The catalog's names (`Catalog.NAMES`) are cached in `files/catalog-names.json` (one day) by `CompanionPort.names`.
+Upstream's own card (Play → `MainActivity.launch`). `GameEnv.ensureFonts`/`ensureBuildId` run for every ready game after each scan, so the env is set before Play.

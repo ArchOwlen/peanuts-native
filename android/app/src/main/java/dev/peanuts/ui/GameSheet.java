@@ -1,20 +1,13 @@
 package dev.peanuts.ui;
 
+import android.app.Activity;
 import android.app.AlertDialog;
-import android.graphics.Color;
-import android.graphics.Typeface;
-import android.os.Handler;
-import android.os.Looper;
-import android.view.Gravity;
 import android.view.View;
-import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import dev.nxnative.android.R;
 import dev.peanuts.PeanutsPrefs;
 
 import java.io.File;
@@ -23,14 +16,16 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * A game that is not built yet: its base, the update that goes in (the newest found; Choose… picks another file), its DLC (the ones matched by title ID, Add… picks
- * more), its companion from the catalog (with "install after the build") and one Build button, which hands the sheet's State to the build pipeline (BuildPort) and
- * shows its progress. When the build ends the library re-scans.
+ * A game's sheet (SPEC.md): a Banana dialog (PUi.sheet, Close as the negative button) of Setting rows: its base, the update that goes in (the newest found;
+ * Choose another… picks a file), its DLC (the ones matched by title ID; Add… picks more), its companion from the catalog ("Install after the build" toggle), then
+ * Build (Rebuild for a ready game), which hands the sheet's {@link State} to the build pipeline through {@link Library#startBuild} and closes: progress lives on the
+ * game's card. Without prod.keys an NSP/XCI's Build is off, with "Add keys…" beside it (the keys picker; the sheet re-renders when they land). A game this app has
+ * no profile for gets Profile.missing's sentence only.
  */
-final class GameSheet {
-    static final int REQ_UPDATE = 31, REQ_DLC = 32;
+public final class GameSheet {
+    static final int REQ_UPDATE = LibrarySettings.REQ_SHEET_UPDATE, REQ_DLC = LibrarySettings.REQ_SHEET_DLC;
 
-    /** What the pipeline gets: the files to import, where the .nup and the pack go, the companion to install. Public: agent C's dev.peanuts.build reads it */
+    /** What the pipeline gets: the files to import, where the .nup and the pack go, the companion to install. Public: dev.peanuts.build reads it */
     public static final class State {
         public String titleId, name;
         /** The base: a dump folder, a .nup or an NSP/XCI (then needsImport) */
@@ -48,26 +43,21 @@ final class GameSheet {
         public Object companionItem;
     }
 
-    /** The open sheet (the activity forwards the file pickers' results to it) */
+    /** The open sheet (the activity forwards the file pickers' results to it: LibrarySettings.result) */
     static GameSheet current;
 
-    private final LibraryActivity a;
+    private final Activity a;
     private final LibraryScanner.Title title;
     private final CompanionPort.Item companion;
-    private final Runnable onFinished;
-    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final Library lib;
     private AlertDialog dialog;
     private LinearLayout box;
-    private TextView progressText;
-    private ProgressBar bar;
-    private Button build;
     private LibraryScanner.Source chosenUpdate;
     private final List<File> extraDlc = new ArrayList<>();
     private boolean installCompanion;
-    private boolean building;
 
-    private GameSheet(LibraryActivity a, LibraryScanner.Title t, CompanionPort.Item companion, Runnable onFinished) {
-        this.a = a; this.title = t; this.companion = companion; this.onFinished = onFinished;
+    private GameSheet(Activity a, LibraryScanner.Title t, CompanionPort.Item companion, Library lib) {
+        this.a = a; this.title = t; this.companion = companion; this.lib = lib;
         String picked = PeanutsPrefs.chosenUpdate(a, t.titleId);
         for (LibraryScanner.Source u : t.updates) if (picked != null && u.file.getPath().equals(picked)) chosenUpdate = u;
         if (chosenUpdate == null && !t.updates.isEmpty()) chosenUpdate = t.updates.get(0);   // sorted newest first
@@ -75,84 +65,88 @@ final class GameSheet {
         installCompanion = companion != null && PeanutsPrefs.installCompanion(a, t.titleId);
     }
 
-    static void show(LibraryActivity a, LibraryScanner.Title t, CompanionPort.Item companion, Runnable onFinished) {
-        GameSheet s = new GameSheet(a, t, companion, onFinished);
+    /** MainActivity's Manage › Build again (the PEANUTS row): the sheet of that title */
+    public static void open(Activity a, String titleId) { Library.openSheet(a, titleId); }
+
+    static void show(Activity a, LibraryScanner.Title t, CompanionPort.Item companion, Library lib) {
+        GameSheet s = new GameSheet(a, t, companion, lib);
         current = s;
         s.open();
     }
 
     private void open() {
-        ScrollView scroll = new ScrollView(a);
         box = new LinearLayout(a);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(8), dp(20), dp(8));
-        scroll.addView(box);
         render();
-        dialog = new AlertDialog.Builder(a).setTitle(title.name).setView(scroll).setNegativeButton("Close", null).create();
+        dialog = PUi.sheet(a, title.name, box).setNegativeButton("Close", null).create();
         dialog.setOnDismissListener(d -> { if (current == this) current = null; });
         dialog.show();
     }
 
     private void render() {
         box.removeAllViews();
+        String missing = title.status == LibraryScanner.Status.NO_PROFILE ? Upstream.profileMissing(title.titleId, title.name) : null;
+        if (missing != null) { PUi.add(box, PUi.body(a, missing), 0); return; }
+        boolean ready = title.status == LibraryScanner.Status.READY;
+        boolean building = lib.building(title.titleId);
+        PUi.add(box, PUi.body(a, ready
+                ? "Rebuild makes the .nup and the pack again from the files below, and updates the companion. About 25 minutes, in the background."
+                : "Build makes one .nup from the files below, prepares it, and installs the companion. About 25 minutes, in the background."), 0);
         // Base
         LibraryScanner.Source b = title.base;
-        row("Base", b == null ? "not found" : b.file.getName() + "  ·  " + (b.isDump() ? "dump folder" : b.isNup() ? ".nup" : b.file.getName().toLowerCase(Locale.ROOT).endsWith(".xci") ? "XCI, import needed" : "NSP, import needed")
-                + (b.version > 0 ? "  ·  " + versionText(b.version) : "") + (b != null && !b.publisher.isEmpty() ? "\n" + b.publisher : ""), null, null);
+        String baseLine = b == null ? "None found" : b.file.getName() + (b.version > 0 || !b.isDump() && !b.isNup() ? " · " + versionText(b.version) : "")
+                + " · " + (b.isDump() ? "dump folder" : b.isNup() ? ".nup" : b.file.getName().toLowerCase(Locale.ROOT).endsWith(".xci") ? "XCI, import needed" : "import needed")
+                + (!b.publisher.isEmpty() ? " · " + b.publisher : "");
+        PUi.add(box, new PUi.Setting(a, "📀", "Base", null).value(baseLine).view, 12);
         // Update
-        String up = chosenUpdate == null ? (title.updates.isEmpty() ? "none found" : "none") : chosenUpdate.file.getName() + "  ·  " + versionText(chosenUpdate.version)
-                + (chosenUpdate == (title.updates.isEmpty() ? null : title.updates.get(0)) ? "  (newest)" : "");
-        row("Update", up, "Choose…", v -> a.pickFile(REQ_UPDATE, "Pick the update (.nsp / .xci)"));
+        LibraryScanner.Source newest = title.updates.isEmpty() ? null : title.updates.get(0);
+        String up = chosenUpdate == null ? (title.updates.isEmpty() ? "None found · Choose…" : "None · Choose…")
+                : chosenUpdate.file.getName() + " · " + versionText(chosenUpdate.version) + (chosenUpdate == newest ? ", the newest found" : "") + " · Choose another…";
+        PUi.add(box, new PUi.Setting(a, "⬆️", "Update", v -> { if (!building) LibrarySettings.pickFile(a, REQ_UPDATE, "Pick the update (.nsp / .xci)"); }).value(up).chevron(a).view, 0);
         // DLC
-        LinearLayout dl = new LinearLayout(a); dl.setOrientation(LinearLayout.VERTICAL);
-        List<LibraryScanner.Source> dlcs = title.dlcs;
-        if (dlcs.isEmpty() && extraDlc.isEmpty()) dl.addView(text("none found", 14, Color.LTGRAY, Typeface.DEFAULT));
-        for (LibraryScanner.Source d : dlcs) dl.addView(text("• " + (d.name.isEmpty() ? d.file.getName() : d.name) + "  ·  " + d.titleId, 14, Color.LTGRAY, Typeface.DEFAULT));
-        for (File f : extraDlc) {
-            boolean known = false;
-            for (LibraryScanner.Source d : dlcs) if (d.file.equals(f)) known = true;
-            if (known) continue;
-            LinearLayout r = new LinearLayout(a); r.setOrientation(LinearLayout.HORIZONTAL); r.setGravity(Gravity.CENTER_VERTICAL);
-            r.addView(text("• " + f.getName(), 14, Color.LTGRAY, Typeface.DEFAULT), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-            Button x = new Button(a); x.setText("Remove"); x.setOnClickListener(v -> { extraDlc.remove(f); saveDlc(); render(); });
-            r.addView(x);
-            dl.addView(r);
-        }
-        row("DLC", null, "Add…", v -> a.pickFile(REQ_DLC, "Pick a DLC (.nsp)"), dl);
+        List<String> names = new ArrayList<>();
+        for (LibraryScanner.Source d : title.dlcs) names.add(d.name.isEmpty() ? d.file.getName() : d.name);
+        for (File f : extraDlc) { boolean known = false; for (LibraryScanner.Source d : title.dlcs) if (d.file.equals(f)) known = true; if (!known) names.add(f.getName()); }
+        String dl = names.isEmpty() ? "None found · Add…" : names.size() + (names.size() == 1 ? " found: " : " found: ") + String.join(", ", names) + " · Add…";
+        PUi.add(box, new PUi.Setting(a, "➕", "DLC", v -> { if (!building) LibrarySettings.pickFile(a, REQ_DLC, "Pick a DLC (.nsp)"); }).value(dl).chevron(a).view, 0);
+        if (!extraDlc.isEmpty()) PUi.add(box, PUi.button(a, "Forget the DLC you added", PUi.Kind.QUIET, v -> { extraDlc.clear(); saveDlc(); render(); }), 0, PUi.wrap());
         // Companion
         File root = title.companionRoot();
         String installed = companion == null ? null : CompanionPort.installedVersion(root, companion.packageName);
-        String cs = companion == null ? "no companion in the catalog"
-                : installed == null ? "available: " + companion.packageName + " " + companion.version + " (" + String.format(Locale.US, "%.0f KB", companion.size / 1024.0) + ")"
-                : installed.equals(companion.version) ? "installed " + installed : "installed " + installed + "  ·  update " + companion.version;
-        LinearLayout cl = new LinearLayout(a); cl.setOrientation(LinearLayout.VERTICAL);
-        cl.addView(text(cs, 14, Color.LTGRAY, Typeface.DEFAULT));
-        if (companion != null && !companion.version.equals(installed)) {
-            CheckBox cb = new CheckBox(a); cb.setText(installed == null ? "Install after the build" : "Update after the build"); cb.setTextColor(Color.WHITE); cb.setChecked(installCompanion);
-            cb.setOnCheckedChangeListener((v, on) -> { installCompanion = on; PeanutsPrefs.installCompanion(a, title.titleId, on); });
-            cl.addView(cb);
-        }
-        row("Companion", null, null, null, cl);
+        boolean canInstall = companion != null && !companion.version.equals(installed);
+        String cs = companion == null ? "No companion in the catalog for this game"
+                : installed == null ? companion.packageName + " " + companion.version + " · " + size(companion.size) + (installCompanion ? " · Install after the build" : " · Not installed after the build")
+                : installed.equals(companion.version) ? "installed " + installed + " · up to date"
+                : "installed " + installed + " · " + companion.version + " " + (installCompanion ? "after the build" : "available");
+        PUi.Setting comp = new PUi.Setting(a, "🖥️", "Companion", null).value(cs);
+        if (canInstall) comp.toggle(a, installCompanion, (v, on) -> { installCompanion = on; PeanutsPrefs.installCompanion(a, title.titleId, on); render(); });
+        PUi.add(box, comp.view, 0);
+        PUi.add(box, PUi.divider(a), 12, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, PUi.dp(a, 1)));
         // Build
-        if (title.status == LibraryScanner.Status.NO_PROFILE) {
-            box.addView(text("This app version does not include " + title.name + " (" + title.titleId + "). Install a build that includes it.", 14, Color.rgb(0xff, 0x8a, 0x65), Typeface.DEFAULT));
-        } else {
-            build = new Button(a);
-            build.setText(title.status == LibraryScanner.Status.READY ? "Rebuild" : "Build");
-            build.setBackgroundColor(Color.rgb(0xff, 0xd9, 0x5a)); build.setTextColor(Color.rgb(0x14, 0x12, 0x0c)); build.setTypeface(Typeface.DEFAULT_BOLD);
-            build.setEnabled(!building && title.base != null);
-            build.setOnClickListener(v -> startBuild());
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = dp(12);
-            box.addView(build, lp);
-            if (title.base != null && title.base.needsImport() && !PeanutsPrefs.hasKeys(a)) box.addView(text("The import needs your prod.keys: Setup (⋮ menu).", 13, Color.rgb(0xff, 0x8a, 0x65), Typeface.DEFAULT));
+        boolean needKeys = title.base != null && title.base.needsImport() && !PeanutsPrefs.hasKeys(a);
+        if (needKeys) {
+            LinearLayout r = PUi.row(a);
+            r.addView(PUi.warnChip(a, "Keys needed", "Keys needed", "Importing an NSP or XCI decrypts it with your own prod.keys. Add them, then Build."));
+            TextView t = PUi.small(a, "Importing an NSP needs your prod.keys.");
+            t.setPadding(PUi.dp(a, 10), 0, 0, 0);
+            r.addView(t, PUi.weight());
+            PUi.add(box, r, 14);
         }
-        bar = new ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal);
-        bar.setMax(1000); bar.setVisibility(building ? View.VISIBLE : View.GONE);
-        box.addView(bar);
-        progressText = text("", 13, Color.LTGRAY, Typeface.DEFAULT);
-        box.addView(progressText);
+        if (title.base == null) PUi.add(box, PUi.body(a, "No base game found. Only an update or DLC is in the folder."), 14);
+        if (building) PUi.add(box, PUi.small(a, "Building now: the progress is on the game's card."), 14);
+        LinearLayout actions = PUi.row(a);
+        PUi.Action build = PUi.action(a, R.drawable.ic_build, ready ? "Rebuild" : "Build", PUi.Kind.PRIMARY, v -> startBuild());
+        build.setEnabled(!building && title.base != null && !needKeys && title.home != null);
+        actions.addView(build, PUi.weight());
+        if (needKeys) {
+            LinearLayout.LayoutParams lp = PUi.wrap();
+            lp.leftMargin = PUi.dp(a, 10);
+            actions.addView(PUi.button(a, "Add keys…", PUi.Kind.SOFT, v -> LibrarySettings.pickKeys(a)), lp);
+        }
+        PUi.add(box, actions, 14);
     }
+
+    private static String size(long bytes) { return bytes >= 1 << 20 ? String.format(Locale.US, "%.1f MB", bytes / 1048576.0) : String.format(Locale.US, "%.0f KB", bytes / 1024.0); }
 
     /** The state the pipeline gets, from the sheet as it is now */
     State state() {
@@ -170,38 +164,15 @@ final class GameSheet {
     }
 
     private void startBuild() {
-        if (building) return;
         State s = state();
         if (s.base == null) { Toast.makeText(a, "No base game found", Toast.LENGTH_SHORT).show(); return; }
-        if (s.home == null) { Toast.makeText(a, "Set the game folder first (Setup)", Toast.LENGTH_LONG).show(); return; }
-        building = true;
-        build.setEnabled(false);
-        bar.setVisibility(View.VISIBLE); bar.setIndeterminate(true);
-        progressText.setText("Starting…");
-        dialog.setCancelable(false);
-        BuildPort.get().build(a, s, new BuildPort.Listener() {
-            @Override public void progress(String step, long done, long total) {
-                ui.post(() -> {
-                    if (total > 0) { bar.setIndeterminate(false); bar.setProgress((int) (done * 1000 / total)); progressText.setText(step + "  ·  " + (done * 100 / total) + "%"); }
-                    else { bar.setIndeterminate(true); progressText.setText(step + (done > 0 ? "  ·  " + done : "")); }
-                });
-            }
-            @Override public void done(boolean ok, String message) {
-                ui.post(() -> {
-                    building = false;
-                    dialog.setCancelable(true);
-                    bar.setVisibility(View.GONE);
-                    progressText.setText(ok ? "Done." + (message == null || message.isEmpty() ? "" : " " + message) : "Failed: " + message);
-                    progressText.setTextColor(ok ? Color.rgb(0x3d, 0xdc, 0x84) : Color.rgb(0xff, 0x8a, 0x65));
-                    if (build != null) build.setEnabled(true);
-                    if (ok) { Toast.makeText(a, title.name + ": ready", Toast.LENGTH_LONG).show(); dialog.dismiss(); }
-                    if (onFinished != null) onFinished.run();
-                });
-            }
-        });
+        if (s.home == null) { Toast.makeText(a, "Set the game folder first (Settings › Library)", Toast.LENGTH_LONG).show(); return; }
+        String why = lib.startBuild(s);
+        if (why != null) { new AlertDialog.Builder(a).setTitle("Build").setMessage(why).setPositiveButton("OK", null).show(); return; }
+        dialog.dismiss();
     }
 
-    /** A picked file (LibraryActivity.onActivityResult) for the Choose…/Add… buttons */
+    /** A picked file (LibrarySettings.result) for the Update and DLC rows */
     void picked(int request, File f) {
         if (request == REQ_UPDATE) {
             PeanutsPrefs.chosenUpdate(a, title.titleId, f.getPath());
@@ -221,34 +192,14 @@ final class GameSheet {
         render();
     }
 
+    /** The keys landed (Add keys…): Build comes on */
+    void keysChanged() { render(); }
+
     private void saveDlc() {
         List<String> l = new ArrayList<>();
         for (File f : extraDlc) l.add(f.getPath());
         PeanutsPrefs.chosenDlc(a, title.titleId, l);
     }
 
-    // ---- Views ----
-
-    private void row(String name, String value, String button, View.OnClickListener l) { row(name, value, button, l, null); }
-
-    private void row(String name, String value, String button, View.OnClickListener l, View body) {
-        LinearLayout r = new LinearLayout(a); r.setOrientation(LinearLayout.VERTICAL); r.setPadding(0, dp(8), 0, dp(8));
-        LinearLayout head = new LinearLayout(a); head.setOrientation(LinearLayout.HORIZONTAL); head.setGravity(Gravity.CENTER_VERTICAL);
-        head.addView(text(name, 13, Color.rgb(0xff, 0xd9, 0x5a), Typeface.DEFAULT_BOLD), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        if (button != null) { Button b = new Button(a); b.setText(button); b.setEnabled(!building); b.setOnClickListener(l); head.addView(b); }
-        r.addView(head);
-        if (value != null) r.addView(text(value, 14, Color.WHITE, Typeface.DEFAULT));
-        if (body != null) r.addView(body);
-        box.addView(r);
-    }
-
-    private TextView text(String s, int sp, int color, Typeface face) {
-        TextView t = new TextView(a);
-        t.setText(s); t.setTextSize(sp); t.setTextColor(color); t.setTypeface(face); t.setPadding(0, dp(2), 0, dp(2));
-        return t;
-    }
-
-    private static String versionText(long v) { return v == 0 ? "base" : (v & 0xFFFF) == 0 ? "v" + (v >> 16) : "v" + v; }
-    private int dp(int v) { return Math.round(v * a.getResources().getDisplayMetrics().density); }
-
+    private static String versionText(long v) { return v == 0 ? "v0" : (v & 0xFFFF) == 0 ? "v" + (v >> 16) : "v" + v; }
 }

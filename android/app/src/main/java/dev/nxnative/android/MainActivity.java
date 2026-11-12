@@ -139,7 +139,7 @@ public final class MainActivity extends Activity {
         FrameLayout frame = (FrameLayout) bananas.getParent();
         while (frame.getChildCount() > 1) frame.removeViewAt(1);
         boolean wide = getResources().getConfiguration().screenWidthDp >= 600;
-        LinearLayout content = Ui.page(this, frame, settingsGame != null && wide ? 1040 : 640);
+        LinearLayout content = Ui.page(this, frame, settingsGame != null && wide ? 1040 : 900);   // PEANUTS: the home's cards three per row on a handheld (upstream: 640);
         if (settingsGame != null) for (Game x : Game.load(this)) if (x.gameDir.equals(settingsGame.gameDir)) { settingsGame = x; break; }   // its folders as they are now (Folders, Import pack)
         if (settingsGame != null) { accessCard = null; gameBox = null; overlayRow = null; GameSettings.build(this, content, settingsGame, this::gameSettingsAgain, () -> page(false)); }
         else if (settingsPage) buildSettings(content);
@@ -184,6 +184,7 @@ public final class MainActivity extends Activity {
         gameBox = null;
         content.addView(Ui.header(this, Ui.back(this, v -> page(false)), "Settings", null));
 
+        dev.peanuts.ui.LibrarySettings.add(this, content);   // PEANUTS: Settings › Library (folders, keys, fonts, rescan, the companions catalog)
         // Updates first, so the version and the check are easy to find (Updater: the release app also checks at every fresh start)
         Ui.add(content, Ui.section(this, "Updates"), 16);
         LinearLayout upd = settingsCard(content);
@@ -441,25 +442,7 @@ public final class MainActivity extends Activity {
             new Thread(() -> { if (Game.collapse(this)) runOnUiThread(() -> { if (!isFinishing()) refresh(); }); }, "nx-list-merge").start();
         }
         gameBox.removeAllViews();
-        if (games.isEmpty() && !Ondevice.showing()) { gameBox.addView(emptyCard()); return; }
-        // while a game is being prepared its card says what happens (the steps card would only repeat it), and the heading's Add game still adds another game
-        LinearLayout top = Ui.row(this);
-        TextView h = Ui.section(this, "Your games");
-        top.addView(h, Ui.weight());
-        Button add = Ui.button(this, "Add game", Ui.Kind.QUIET, v -> addGame());
-        add.setCompoundDrawablesRelativeWithIntrinsicBounds(Ui.icon(this, R.drawable.ic_add, R.color.bn_accent), null, null, null);
-        add.setCompoundDrawablePadding(dp(6));
-        top.addView(add);
-        gameBox.addView(top);
-        // One card per game: while a game is being prepared its card is the progress card (Ondevice), at the game's place, or first for a game not listed yet
-        View pc = Ondevice.cardView();
-        if (pc != null && pc.getParent() instanceof ViewGroup) ((ViewGroup) pc.getParent()).removeView(pc);
-        boolean placed = false;
-        if (pc != null) { for (Game g : games) placed |= Ondevice.shows(g); if (!placed) { Ui.add(gameBox, pc, 4); placed = true; pc = null; } }
-        for (Game g : games) {
-            if (pc != null && Ondevice.shows(g)) { Ui.add(gameBox, pc, gameBox.getChildCount() == 1 ? 4 : Ui.GAP); pc = null; continue; }
-            Ui.add(gameBox, gameCard(g), gameBox.getChildCount() == 1 ? 4 : Ui.GAP);
-        }
+        dev.peanuts.ui.Library.fill(this, gameBox, games, Ondevice.cardView(), Ondevice::shows, this::gameCard, this::manage, this::addGame, this::refresh);   // PEANUTS: the library is Home's game list (the sections, the compact cards, the build card; the progress card placed first)
     }
 
     /** No game yet: the banana, the three steps, and Add game */
@@ -738,6 +721,7 @@ public final class MainActivity extends Activity {
         LinearLayout pack = Ui.add(content, Ui.listCard(this), 6);
         if (Ondevice.isDump(new File(g.gameDir)) && noProfile == null)
             pack.addView(new Ui.Setting(this, "🔁", "Prepare again", v -> { page(false); Ondevice.prepare(this, new File(g.gameDir), true); }).value("Remakes what does not fit").chevron(this).view);
+        if (noProfile == null) pack.addView(new Ui.Setting(this, "🔨", "Build again", v -> { page(false); dev.peanuts.ui.GameSheet.open(this, g.titleId); }).value("Remakes the .nup and the pack").chevron(this).view);   // PEANUTS: the Build sheet (dev.peanuts.ui.GameSheet)
         if (Ondevice.shows(g))   // its card is the progress card: the job's own Manage (Forget, the deletes)
             pack.addView(new Ui.Setting(this, "⏳", "Preparing", v -> { page(false); Ondevice.manageJob(this); }).value("Forget the job or delete its files").chevron(this).view);
         pack.addView(new Ui.Setting(this, "📦", "Export pack…", v -> PackUi.exportPick(this, g)).value("One .zip, into a folder you pick").chevron(this).view);
@@ -912,6 +896,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (dev.peanuts.ui.LibrarySettings.result(this, request, result, data)) return;   // PEANUTS: the library's pickers (keys, folders, the sheet's files)
         if (Ondevice.activityResult(this, request, result, data)) return;
         if (request == ReadinessActivity.REQUEST) { if (result == ReadinessActivity.FIX_DRIVER) GpuDriver.dialog(this, PICK_DRIVER); return; }   // its "Pick a GPU driver"
         if (result != RESULT_OK || data == null || data.getData() == null) return;

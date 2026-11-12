@@ -34,6 +34,18 @@ final class Upstream {
         return out;
     }
 
+    /** Profile.missing's sentence for a game this APK has no profile for (null when it has one) */
+    static String profileMissing(String titleId, String name) {
+        try {
+            Method m = Class.forName(P + "Profile").getDeclaredMethod("missing", String.class, String.class);
+            m.setAccessible(true);
+            Object o = m.invoke(null, titleId, name);
+            return o == null ? null : o.toString();
+        } catch (Throwable t) {
+            return hasProfile(titleId) ? null : "This app version does not include " + name + " (" + titleId + "). Install a build that includes it.";
+        }
+    }
+
     static boolean hasProfile(String titleId) { return titleId != null && profiles().containsKey(titleId.toUpperCase(Locale.ROOT)); }
 
     /** A dump folder's or .nup's title ID (Pack.titleIdOf), null when it is neither */
@@ -83,8 +95,32 @@ final class Upstream {
 
     /** An entry of upstream's game list (Game): where the game and its pack are, and whether it starts as it is (Game.ready) */
     static final class Entry {
-        final String titleId, name, gameDir, packDir; final boolean ready;
-        Entry(String titleId, String name, String gameDir, String packDir, boolean ready) { this.titleId = titleId; this.name = name; this.gameDir = gameDir; this.packDir = packDir; this.ready = ready; }
+        final String titleId, name, gameDir, packDir; final boolean ready; final long used;
+        Entry(String titleId, String name, String gameDir, String packDir, boolean ready) { this(titleId, name, gameDir, packDir, ready, 0); }
+        Entry(String titleId, String name, String gameDir, String packDir, boolean ready, long used) { this.titleId = titleId; this.name = name; this.gameDir = gameDir; this.packDir = packDir; this.ready = ready; this.used = used; }
+    }
+
+    /** The fields of one of upstream's Game objects (MainActivity's list, handed to Library.fill), without the readiness check; null when it is not one */
+    static Entry entryOf(Object g) {
+        if (g == null) return null;
+        try {
+            Class<?> game = g.getClass();
+            Field titleId = field(game, "titleId"), name = field(game, "name"), gameDir = field(game, "gameDir"), packDir = field(game, "packDir"), used = field(game, "used");
+            return new Entry(str(titleId.get(g)).toUpperCase(Locale.ROOT), str(name.get(g)), str(gameDir.get(g)), str(packDir.get(g)), false, used.getLong(g));
+        } catch (Throwable t) { Log.w("peanuts", "game entry: " + cause(t)); return null; }
+    }
+
+    /** A scanned game that is ready (a dump or .nup with its pack) into upstream's list (Game.put), so Home shows it as one of Banana's own cards; false when it could not be added */
+    static boolean addToList(Context c, File game, File pack, String titleId, String name) {
+        try {
+            Class<?> k = Class.forName(P + "Game");
+            java.lang.reflect.Constructor<?> ctor = k.getDeclaredConstructor(String.class, String.class, String.class, String.class);
+            ctor.setAccessible(true);
+            Object g = ctor.newInstance(titleId, name, game.getPath(), pack.getPath());
+            Method put = k.getDeclaredMethod("put", Context.class, k); put.setAccessible(true);
+            put.invoke(null, c, g);
+            return true;
+        } catch (Throwable t) { Log.w("peanuts", "add to list " + game + ": " + cause(t)); return false; }
     }
 
     /** Upstream's game list with each entry's readiness (reads packs: off the main thread) */
