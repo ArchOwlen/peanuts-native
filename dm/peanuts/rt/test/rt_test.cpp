@@ -2,7 +2,7 @@
 // the rendered pages to PNG files.
 //
 //   rt_test <package dir> <out dir> [romfs dir [--provider]]
-//   rt_test --module <package dir> <out dir> <title id hex> <build id hex> [page id...]
+//   rt_test --module <package dir> <out dir> <title id hex> <build id hex> [--romfs <dir>] [page id...]
 //
 // `--provider` (R6) hands the romfs dir to the runtime through PnRtRomfs callbacks (a fake provider
 // over POSIX open/pread/readdir, below) instead of PnRtConfig::romfs_dir: the PNGs must come out
@@ -295,17 +295,28 @@ std::string WriteProbePackage(const std::filesystem::path& out_dir) {
 int RunModuleMode(int argc, char** argv) {
     if (argc < 6) {
         std::fprintf(stderr,
-                     "usage: rt_test --module <package dir> <out dir> <title hex> <build hex> [page...]\n");
+                     "usage: rt_test --module <package dir> <out dir> <title hex> <build hex> [--romfs <dir>] [page...]\n");
         return 2;
     }
     const std::string package_dir = argv[2];
     const std::filesystem::path out_dir = argv[3];
     const uint64_t title = std::strtoull(argv[4], nullptr, 16);
     const char* build = argv[5];
+    // R7: `--romfs <dir>` anywhere after the build id hands the module a game RomFS (the Dread
+    // module's standby page names romfs:...bctex textures); the remaining arguments are page ids.
+    const char* romfs_dir = nullptr;
+    std::vector<const char*> pages;
+    for (int i = 6; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--romfs") == 0 && i + 1 < argc) {
+            romfs_dir = argv[++i];
+        } else {
+            pages.push_back(argv[i]);
+        }
+    }
     std::filesystem::create_directories(out_dir);
     FakeMemory mem;
     mem.regions[MainBase] = std::vector<uint8_t>(MainSize, 0);
-    PnRtConfig cfg = MakeConfig(mem, package_dir, nullptr);
+    PnRtConfig cfg = MakeConfig(mem, package_dir, romfs_dir);
     cfg.title_id = title;
     cfg.build_id_hex = build;
     cfg.panel_w = 1240;
@@ -331,8 +342,8 @@ int RunModuleMode(int argc, char** argv) {
         std::fprintf(stderr, "rt_test: FAILED: the package was not accepted (%s)\n", status);
         ++failures;
     }
-    for (int i = 6; i < argc; ++i) {
-        failures += !RenderPage(rt, argv[i], out_dir / (std::string{argv[i]} + ".png"));
+    for (const char* page : pages) {
+        failures += !RenderPage(rt, page, out_dir / (std::string{page} + ".png"));
     }
     pn_rt_destroy(rt);
     std::printf("rt_test: %s\n", failures == 0 ? "OK" : "FAILED");

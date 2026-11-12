@@ -28,6 +28,9 @@ file(MAKE_DIRECTORY ${PNRT_INC_ROOT}/core)
 file(CREATE_LINK ${PNRT_DIR}/mods ${PNRT_INC_ROOT}/core/mods SYMBOLIC)
 
 set(PNRT_LIFTED
+  mods/engine_ichigo.cpp
+  mods/engine_il2cpp.cpp
+  mods/engine_mercury.cpp
   mods/mod_actions.cpp
   mods/mod_assets.cpp
   mods/mod_clock.cpp
@@ -89,9 +92,13 @@ target_compile_options(peanuts_rt PRIVATE -fvisibility=hidden -fvisibility-inlin
 find_package(Threads REQUIRED)
 # dlopen (mod_module.cpp loads a package's native module through Common::DynamicLibrary).
 target_link_libraries(peanuts_rt PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+# zlib: engine_mercury.cpp inflates the gzip stream inside a Dread .bctex (InflateGzip). The NDK
+# ships libz.so; FindZLIB finds it through the toolchain sysroot, and `z` is the fallback either way.
 find_package(ZLIB)
 if(ZLIB_FOUND)
   target_link_libraries(peanuts_rt PUBLIC ZLIB::ZLIB)
+else()
+  target_link_libraries(peanuts_rt PUBLIC z)
 endif()
 if(ANDROID)
   target_link_libraries(peanuts_rt PUBLIC log)

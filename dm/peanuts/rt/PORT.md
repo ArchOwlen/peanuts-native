@@ -1,4 +1,4 @@
-# peanuts_rt port notes (R1a .. R5)
+# peanuts_rt port notes (R1a .. R7)
 
 The Eden Duo DSMod companion runtime (`~/eden/src/core/mods`) lifted into a standalone static
 library. **R5 (2026-11-12): the lift is Eden Duo v1.3.5.1 (tag `v1.3.5.1`, `102f69ed3f`,
@@ -32,8 +32,8 @@ hunks listed below (`diff -u ~/eden/src/core/mods/X mods/X` shows exactly them).
 ## R5: the v1.3.5.1 lift (runtime 24) and native modules
 
 Every file in Eden's `src/core/mods/` at v1.3.5.1 is in `mods/` **except** the ones that stay
-out by design: `mod_guest_bridge.cpp` (BRK guest-call bridge), `engine_il2cpp/mercury/ichigo.cpp`
-(engine probes), `mod_re_tools.cpp` + `mod_console.cpp` (dev tools, `EDEN_DSMOD_BUILD_DEV_TOOLS=0`),
+out by design: `mod_guest_bridge.cpp` (BRK guest-call bridge), ~~`engine_il2cpp/mercury/ichigo.cpp`~~
+(lifted in R7, see "Engines" below), `mod_re_tools.cpp` + `mod_console.cpp` (dev tools, `EDEN_DSMOD_BUILD_DEV_TOOLS=0`),
 `duo_core.cmake`, `modules/README.md`. 86 files in `mods/` (+ `modules/dsmod_module_sdk.h`);
 `cmp` against the exported v1.3.5.1 tree shows exactly four edited files, all hunks
 `PNRT`-marked (table below): `mod_runtime.h`, `mod_assets.cpp`, `mod_romfs_sources.cpp`,
@@ -104,6 +104,7 @@ mod_view_default.h, mod_input_tokens.h (their functionality lives inside the fil
 | mods/mod_assets.cpp | `#if !PNRT` around `SerialVfsFile` + `OpenPrivateRomFS` (Eden loader/PatchManager/NCA chain); `OpenGameRomFS()` body replaced by `root = system.RomfsRoot()`; the `sysfont:` source's archive opener replaced by `system.SysfontRoot()` (no system NAND). |
 | mods/mod_romfs_sources.cpp (R5) | `BuildBase` = `system.RomfsRoot()` ("base:" is the same extracted dir as "romfs:"), `BuildAoc` = nullptr ("aoc:" never available; the Eden bodies stay under `#else`). |
 | mods/mod_module_services.cpp (R5) | `ResolveTitleSaveDirectory` = `system.SaveRoot()` (PnRtConfig::save_dir) instead of the save-data HLE + profile manager. |
+| mods/mod_module.cpp | `GameModule::Load`'s build-id check accepts the host's 16-hex-digit (8-byte, zero-padded) build id as a prefix of a manifest's full 20-byte id and vice versa (one PNRT hunk at the `build_ids` any_of). |
 
 Everything else in `mods/` is byte-identical to Eden v1.3.5.1.
 
@@ -160,13 +161,17 @@ Everything else in `mods/` is byte-identical to Eden v1.3.5.1.
 
 R5: the **module stubs are gone** (mod_module*.cpp are lifted; `RunModuleAction`,
 `InitializeGameModule`, `LockMapStateUnlessRaster`, ... are Eden's). What remains stubbed is
-only the guest bridge and the engine probes:
+only the guest bridge (R7: the engine stubs are gone too, see "Engines"):
 
 - **mod_guest_bridge.cpp** (also: RunAction's Call/Sequence kinds, mod_actions.cpp): `RequestCall`,
   `StartSequence` (log "unsupported on this host", no-op; RunAction still returns `Done`),
-  `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences` (no-ops), `ScanPattern`
-  (nullopt).
-- **engine_il2cpp/mercury/ichigo.cpp**: `FindClassSlotByName`, `DetectMethodsOffset`, `FindPlayerNode` (nullopt); `DecodeBctex`, `DecodeSosXtx`, `ParseMfnt`, `ParseSosFont` (false); `DecodeLzss`, `ExtractArchiveMember` (empty).
+  `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences` (no-ops).
+  **`ScanRange` + `ScanPattern` are Eden's bodies verbatim** (lines 63-228 of v1.3.5.1's
+  mod_guest_bridge.cpp, copied into pnrt_stubs.cpp): they only read guest memory
+  (OwnerMemory, HeapLow/HeapHigh, InGameplay) and engine_il2cpp.cpp's `FindClassSlotByName`
+  links against `ScanRange`; ResolvePoint's "pattern" points now scan for real instead of
+  getting nullopt. Upstream sync: re-copy the two functions when that file changes.
+- ~~engine_il2cpp/mercury/ichigo.cpp~~ lifted as of R7 (byte-identical).
 - ~~mod_module*.cpp~~ lifted as of R5 (see above).
 - **mod_nx_runtime.cpp / mod_nx_assets.cpp**: no stubs since R1b (both lifted as-is).
 - Dev tools (`mod_re_tools.cpp`, `mod_console.cpp`): compiled out by `EDEN_DSMOD_BUILD_DEV_TOOLS=0` (the shells in mod_runtime.cpp are already empty then).
@@ -287,6 +292,99 @@ bytes, only_base.txt and sub/a.txt from the base, zstd sub/b.txt 300,000 bytes, 
 per name). ASan (detect_leaks=1) clean on all three. arm64 libpeanuts_rt.a builds with
 `OpenProviderDirectory` and all `pn_rt_*`; peanuts_nup.c compiles for aarch64-linux-android33
 (needs plat_sha256 and the ZSTD_* symbols the host already links).
+
+## R7 (2026-11-12): engines -- the engine-specific decoders are lifted
+
+Why: on the device the Dread companion logged `mod_map.cpp:1663 GetImage:: DSMod:
+'romfs:/textures/gui/textures/loadingscreentileset.bctex' is a Mercury texture this build cannot
+decode` (same for `.../fonts/textures/occ_atlas.bctex`), so its standby page had no loading rings
+and no font atlas: `DecodeBctex` was a `return false` stub.
+
+How Eden wires them (v1.3.5.1): `GetImage` (mod_map.cpp:1640-1670) picks the decoder by the asset's
+bytes/extension -- SARC/BNTX/DDS/PNG through `DecodeBntx`/`DecodeDds`/stb (mod_assets.cpp), then
+`DecodeSosXtx` (engine_ichigo.cpp) and `DecodeBctex` (engine_mercury.cpp); `LoadFont`
+(mod_assets.cpp:389-410) tries the module's font extension first, then `ParseMfnt`
+(engine_mercury.cpp) and `ParseSosFont` (engine_ichigo.cpp); `ReadAssetBytes` (mod_assets.cpp:171)
+uses `DecodeLzss` + `ExtractArchiveMember` (engine_ichigo.cpp) for `<archive.lzs>#<member>`;
+`ResolvePoint` (mod_state.cpp:255-358) uses `FindClassSlotByName` / `DetectMethodsOffset`
+(engine_il2cpp.cpp) for IL2CPP points and `FindPlayerNode` (engine_mercury.cpp) for "player"
+points. None of them touches the guest bridge: the texture/font/archive ones are static byte
+decoders, the lookups read guest memory through `OwnerMemory()` only.
+
+**In (byte-identical, `mods/`, listed in CMake's PNRT_LIFTED):**
+
+| file | engine / title | what |
+|---|---|---|
+| engine_mercury.cpp | Mercury (Metroid Dread) | `DecodeBctex` ("MTXT" + gzip around an NVN XTX container; RGBA8/BGRA8/BC1/BC3, block-linear via `BlockLinearOffset` from engine_formats.h), `ParseMfnt` (font metrics, in-core fallback), `FindPlayerNode` (heap sweep + stick-correlation scoring) |
+| engine_ichigo.cpp | Ichigo (Story of Seasons: FoMT) | `DecodeLzss`, `ExtractArchiveMember`, `DecodeSosXtx` (raw XTX BC1/BC3/BC7/RGBA8/BGRA8), `ParseSosFont` |
+| engine_il2cpp.cpp | Unity IL2CPP (Hollow Knight) | `FindClassSlotByName`, `DetectMethodsOffset`, `ResolveMethodByName`, `MethodTableLooksReal` |
+
+Dependencies: `bc_decoder.h` (already in third_party), `engine_formats.h` (already lifted),
+**zlib** (`InflateGzip` in engine_mercury.cpp: inflateInit2/inflate/inflateEnd). No LZ4, no zstd
+(the LZSS in engine_ichigo.cpp is hand-written). CMake: `find_package(ZLIB)` -> `ZLIB::ZLIB`, with
+a plain `z` fallback; the NDK's sysroot libz is found by FindZLIB (1.3.0.1) and the Android host
+already links `z` (android/host/CMakeLists.txt).
+
+**Shim added: `shim/zlib.h`** -- `#include_next <zlib.h>` then `#undef far` (and `near`). The
+NDK's zconf.h defines `far` as an empty macro (16-bit memory-model leftover, zconf.h:415) and
+engine_mercury.cpp includes <zlib.h> before mod_runtime.h, whose mod_input_swipe.h has a local
+named `far`: clang then fails with "expected unqualified-id". Eden never sees it (its bundled
+zlib); the shim keeps the lifted file byte-identical. The host build (glibc zlib) is unaffected.
+
+**Still stubbed and why:** only mod_guest_bridge.cpp's bridge entry points (`RequestCall`,
+`StartSequence`, `ArmSpies`, `ApplyPatches`, `DrainGuestBridgeResults`, `RunPolledSequences`): they
+need BRK breakpoints in the guest (`InstallBreakpoint` / `OnGuestBreakpoint`, `core/arm/debug.h`),
+which this host has no equivalent for. `ScanRange`/`ScanPattern` from that file are verbatim in
+pnrt_stubs.cpp (see Stubs).
+
+**Catalog survey** (`grep` over <eden-duo-companions>/packages/*/dualscreen/manifest.json
+for source schemes and engine-specific keys): every package uses only `romfs:` / `file:` /
+`module:` / `base:` / `sysfont:` / `msbt:` / `widget:` / `composite:` sources. Engine decoders
+needed: **MetroidDread** -> Mercury (38 `.bctex` sources, one `"player"` point = `FindPlayerNode`;
+the module's font extension supplies the metrics, `ParseMfnt` is the fallback). **LinksAwakening**,
+**MarioKart8Deluxe** -> SARC/BNTX/bffnt only (already in since R1b). No catalog package is a Story
+of Seasons (Ichigo) or Hollow Knight (IL2CPP) companion, so those two are lifted for completeness
+and have no package-level test here. All other packages are module-driven (`file:` PNGs or
+module-generated images) and need no engine decoder.
+
+**rt_test change:** module mode takes `--romfs <dir>` (anywhere after the build id; the other
+arguments stay page ids), so a module package can be run against a game RomFS.
+
+### Verified R7 (host, 2026-11-12; work dir <work dir>/rt-engines)
+
+- Dread RomFS: no dump existed on the PC any more (the Aug-27 `<an extracted RomFS>` was gone), so
+  the base NSZ (`<your dump folder>/Metroid Dread
+  [010093801237C000][v0].nsz`) was decompressed with `~/nsz-venv/bin/nsz -D` and its RomFS dumped
+  with `eden-cli --dump-romfs` (harness bin-store `24-75539f37ac70`) to `<work>/dread/romfs-dread`
+  (4.2 GB, textures/ = 1.2 GB; the NSP was deleted afterwards). Package: the published
+  `metroid-dread-1.0.0` release zip (`gh release download`, its linux-x86_64 module sha256
+  `304ab82f...` matches the manifest; the catalog dir holds no modules/).
+- `rt_test --module dread/pkg out-dread 010093801237C000 646761F643AFEBB3 --romfs dread/romfs-dread
+  main` (ASan, detect_leaks=1): module loads, log `GetImage: DSMod: decoded
+  'romfs:/textures/system/fonts/textures/occ_atlas.bctex' (2048x1024) from the game's own
+  filesystem` and `... 'loadingscreentileset.bctex' (1024x256) ...`, `LoadFont: font
+  'romfs:/system/fonts/occ_32.bfont' has 308 glyph(s) ... (via module)`, the module's map data
+  generated from the romfs (9 areas, 823 strings). `main.png` 1240x1080 = the standby page with the
+  Chozo loading ring, "Synchronizing environment..." in the game's occ font and the three glyphs,
+  i.e. exactly what the device was missing. Exit 0, no ASan/LSan reports. Without `--romfs` the
+  same run logs `asset '...loadingscreentileset.bctex' not found` (the pre-R7 "cannot decode"
+  warning is gone because the decoder now runs; the file is simply absent) and no page frame.
+- LA regression: `rt_test <LA package> out-la <romfs>` (ASan) unchanged -- same status lines as R5
+  (standby tick 96 / gear tick 190 / probe, Close tap -> `page=map`, equip_x 0xFF -> 0x08, one
+  haptic pulse), `rt_test: OK`, gear.png/standby.png visually as in R1b/R2.
+- `cmp` against the exported v1.3.5.1 tree: engine_mercury.cpp, engine_ichigo.cpp,
+  engine_il2cpp.cpp, engine_formats.h byte-identical; the edited lifted files are exactly the five
+  in the table above (mod_runtime.h, mod_assets.cpp, mod_romfs_sources.cpp,
+  mod_module_services.cpp, mod_module.cpp), all hunks PNRT-marked.
+- arm64 (NDK 28.2.13676358, android-33): libpeanuts_rt.a builds (after the zlib.h shim); llvm-nm
+  shows `DecodeBctex`, `ParseMfnt`, `FindPlayerNode`, `DecodeSosXtx`, `DecodeLzss`, `ParseSosFont`,
+  `ExtractArchiveMember`, `FindClassSlotByName`, `DetectMethodsOffset`, `ScanRange`, `ScanPattern`
+  as defined `T` symbols, `inflate`/`inflateInit2_`/`inflateEnd` as the only new undefined refs
+  (the NDK libz). Not run on device.
+- Gaps: `FindPlayerNode` and the IL2CPP lookups compile and link but are exercised only with the
+  all-zero fake memory (nothing to find; `ScanPattern` logs "pattern (17 bytes) not found", which
+  is the honest answer); no Ichigo (`.lzs` / SoS XTX) sample exists on this PC, so engine_ichigo.cpp
+  is compile-verified only.
 
 ## Known gaps (R5)
 
