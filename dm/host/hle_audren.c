@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 #if PLAT_ANDROID
-#include <sys/resource.h>
+#include <sys/resource.h>   // PEANUTS: setpriority for the render thread (render_main)
 #endif
 
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
