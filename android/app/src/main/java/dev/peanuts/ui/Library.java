@@ -322,12 +322,36 @@ public final class Library {
             if (!confirmedAbsent(act, gameDir)) { missingSince.remove(gameDir); continue; }
             long now = System.currentTimeMillis();
             Long since = missingSince.putIfAbsent(gameDir, now);
-            if (since != null && now - since >= 60_000L) hiddenNow.add(gameDir);   // confirmed absent on two scans at least 60 s apart: hide, never remove
+            if (since != null && now - since >= 60_000L) { missingSince.remove(gameDir); removeEntry(act, gameDir); }   // confirmed absent on two scans at least 60 s apart: its list entry goes (owner's choice, 2026-11-13)
         }
         missingSince.keySet().retainAll(seenThisPass);   // an entry gone from upstream's list some other way (the user removed it themselves, etc.) drops its bookkeeping too
         hiddenUnmounted.clear();
         hiddenUnmounted.addAll(hiddenNow);
-        Log.i("peanuts", "[library] stale check: " + candidates + " candidates, " + hiddenNow.size() + " hidden");
+        Log.i("peanuts", "[library] stale check: " + candidates + " candidates, " + hiddenNow.size() + " hidden (volume not mounted)");
+    }
+
+    /**
+     * Removes one entry from upstream's Game list, as its own "Game file gone > Remove" does for a game that is not a picked .nup: only the list entry
+     * goes; the dump, its pack and the saves stay (Add game brings it back). On the UI thread, where upstream itself loads and saves the list, so the two
+     * never write it at once. Reached by reflection (Game is package-private upstream). Any failure leaves the entry as it is.
+     */
+    private static void removeEntry(Activity act, String gameDir) {
+        act.runOnUiThread(() -> {
+            try {
+                Class<?> g = Class.forName("dev.nxnative.android.Game");
+                java.lang.reflect.Method load = g.getDeclaredMethod("load", Context.class), save = g.getDeclaredMethod("save", Context.class, List.class);
+                java.lang.reflect.Field dir = g.getDeclaredField("gameDir");
+                load.setAccessible(true); save.setAccessible(true); dir.setAccessible(true);
+                @SuppressWarnings("unchecked") List<Object> games = (List<Object>) load.invoke(null, act);
+                boolean gone = games.removeIf(x -> { try { return gameDir.equals(dir.get(x)); } catch (IllegalAccessException e) { return false; } });
+                if (!gone) return;
+                save.invoke(null, act, games);
+                Log.i("peanuts", "[library] removed the entry of a missing game: " + gameDir);
+                rescan(act);
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                Log.w("peanuts", "[library] could not remove the entry of " + gameDir + ": " + e);
+            }
+        });
     }
 
     /** Whether path is on a volume Android currently lists (internal storage, or a mounted SD/USB); null when this cannot be told (no StorageManager, or
