@@ -16,6 +16,9 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#if PLAT_ANDROID
+#include <sys/resource.h>
+#endif
 
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
 void dm_guest_thread_join(void *tt);
@@ -111,6 +114,16 @@ static void render_main(void *arg) {
     static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
     for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
     dm_pcmout_start(out);
+    // PEANUTS: every guest thread (this one included) is started at the same OS priority, Android's THREAD_PRIORITY_DISPLAY (nice -4; hle_thread.c prio_qos, DM_QOS_MAP off
+    // by default): fine for game logic, but this thread has a hard 5 ms deadline the OS does not otherwise know about. Without a fast/MMAP track (the AAudio stream above opens
+    // "not low latency": a 20 ms burst, not the fast path's own real-time-scheduled mixer thread), nothing gives this thread's audio deadline any weight over the game's other
+    // threads when the CPU is busy. On a Snapdragon 8 Gen 2 Thor, under load (Fire Emblem: Three Houses' battle map, Animal Crossing: New Horizons) this thread's measured render
+    // time per 5 ms frame grew well past its budget as a session went on (mean 0.3 → 1.3 ms, max to 15 ms) and catch-up renders kept accumulating as a result. Raise it to
+    // Android's own audio thread priority (THREAD_PRIORITY_AUDIO, nice -16: the same class Android's native audio mixer threads run at) so the scheduler favors it the way a
+    // real low-latency audio thread would be, instead of leaving it level with every other guest thread
+#if PLAT_ANDROID
+    setpriority(PRIO_PROCESS, (id_t)gettid(), -16);
+#endif
     LOG("audren: render thread started (%d buffers in flight, paced by the clock, held back by the output)", NBUF);   // PEANUTS: clock-paced (see enum NBUF above)
     // One block per 5 ms by the clock, as the DSP timer on Horizon; the output's releases only say how far ahead the thread may run (queue full: it waits, so the sound card stays
     // the master; the clock is 0.5 % fast so it does). The Mac's output releases a block every 5 ms and the renders followed it; Android's AAudio without a fast track releases four
