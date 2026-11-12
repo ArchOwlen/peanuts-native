@@ -561,7 +561,7 @@ public final class Library {
         if (hidden > 0) {
             // critique-phase2c §A-3: lets the player see and remove a confirmed-missing (or currently unreachable) game themselves, through upstream's
             // own "Game file gone → Remove" dialog, instead of this code ever deleting the record on its own
-            Button hideB = PUi.button(a, "Hidden: " + hidden + " missing game" + (hidden == 1 ? "" : "s") + " · " + (showHidden ? "Hide" : "Show"),
+            Button hideB = PUi.button(a, hidden + " hidden · " + (showHidden ? "Hide" : "Show"),
                     PUi.Kind.QUIET, v -> { showHidden = !showHidden; render(); });
             LinearLayout.LayoutParams hlp = PUi.wrap();
             hlp.leftMargin = PUi.dp(a, 8);
