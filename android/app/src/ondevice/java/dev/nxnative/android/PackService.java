@@ -370,6 +370,7 @@ public final class PackService extends Service {
                     Log.w(TAG, "split: " + e.getMessage());   // the job is done all the same; a later split begins by deleting it again
                 }
                 Job.deleteTree(j.splitScan(this));
+                Job.deleteTree(j.ueShaders(this));   // PEANUTS: an Unreal game's decoded archives (Job.ueShaders)
                 Job.deleteTree(new File(j.dir(), "xlate")); Job.deleteTree(j.xlate(this));   // PEANUTS: the results live in the app's own storage (Job.xlate)
                 Job.deleteTree(new File(j.dir(), "lib"));
             } else if (stopReason != null) {
@@ -564,6 +565,12 @@ public final class PackService extends Service {
         // the split reads only the files the profile's shader_map.tsv names when the dump's build is the profile's, and keeps that result only when its tables are the
         // profile's; otherwise it scans every file (android/SHADERS.md, Targeted split)
         PackEngine.setenv("DM_SPLIT_TARGETED", "1");
+        // PEANUTS: an Unreal game's shader code archives are decoded by the split itself (ue_ondevice.py; the Mac's NSP script did it before the split): into the app's own storage,
+        // Oodle-compressed shaders by the game's own decoder in this title's host library, loaded by a worker process (the probe on the Thor: Octopath Traveler 0, main+0x4f77e10)
+        PackEngine.setenv("DM_UE_DECODE", j.ueShaders(this).getPath());
+        PackEngine.setenv("DM_UE_HOST", pyLib == null ? "" : "/system/bin/linker64 " + new File(PackNative.repo().getParentFile(), "python/bin/nxpack_worker").getPath());
+        PackEngine.setenv("DM_UE_HOST_LIB", "libnxhost_" + j.titleId() + ".so");
+        PackEngine.setenv("DM_UE_MODULES", pack.getPath());
         PackEngine.setenv("DM_SPLIT_DIRECT", "1");   // a targeted file whose map sources name their containers (#BNSH@ / #BAHS@ / #IDRK@ offsets) is read at those containers only, not whole // PEANUTS
         PackEngine.setenv("DM_PACKER_COMMIT", BuildConfig.NX_COMMIT);   // pack.tsv's packer: no repository on the phone to ask
         PackEngine.setenv("NX_PACK_WORK", od.getPath());

@@ -48,6 +48,9 @@ _cc = None
 def aes_decrypt(key, data):
     """AES-256 ECB decryption through CommonCrypto (every Mac has it; no Python package needed)"""
     global _cc
+    if _cc is None and sys.platform != 'darwin':   # PEANUTS: off the Mac (the on-device packer: no CommonCrypto, no OpenSSL) through _nxaes, dm/peanuts/pack_worker/nxaes.c
+        import _nxaes; _cc = _nxaes
+    if _cc is not None and not hasattr(_cc, 'argtypes'): return _cc.ecb_decrypt(key, data)   # PEANUTS
     if _cc is None:
         _cc = ctypes.CDLL('/usr/lib/libSystem.B.dylib').CCCrypt
         _cc.restype = ctypes.c_int32

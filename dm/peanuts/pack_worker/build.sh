@@ -16,3 +16,9 @@ mkdir -p "$S/python/bin"
   -L"$S/lib" -lpython3.14 -Wl,-rpath,'$ORIGIN/../../lib' -Wl,-z,max-page-size=16384
 "$BIN/llvm-strip" --strip-debug "$S/python/bin/nxpack_worker"
 ls -l "$S/python/bin/nxpack_worker"
+# _nxaes (nxaes.c): AES for uepak.py on the phone (Unreal pak indexes), a module of the Python home's lib-dynload
+DYN="$S/python/lib/python3.14/lib-dynload"
+"$BIN/clang" --target=aarch64-linux-android33 -O2 -Wall -fPIC -shared -I"$INC" -o "$DYN/_nxaes.cpython-314-aarch64-linux-android.so" "$HERE/nxaes.c" \
+  -L"$S/lib" -lpython3.14 -Wl,-z,max-page-size=16384
+"$BIN/llvm-strip" --strip-debug "$DYN/_nxaes.cpython-314-aarch64-linux-android.so"
+ls -l "$DYN/_nxaes.cpython-314-aarch64-linux-android.so"

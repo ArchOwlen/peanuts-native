@@ -608,6 +608,11 @@ final class Job {
         return new File(c.getNoBackupFilesDir(), "xlate/" + titleId());
     }
 
+    /** PEANUTS: an Unreal game's decoded shader code archives (shader_split.py DM_UE_DECODE, ue_ondevice.py), in the app's own storage: the decode swaps its folder in by renaming */
+    synchronized File ueShaders(Context c) {
+        return new File(c.getNoBackupFilesDir(), "ue/" + titleId());
+    }
+
     /** Deletes a folder of the job's own outputs: ondevice/ paths, and the pack the job made itself (Ondevice's Manage, asked first; never the dump or the saves) */
     static void deleteTree(File f) { Outputs.deleteTree(f); }
 
