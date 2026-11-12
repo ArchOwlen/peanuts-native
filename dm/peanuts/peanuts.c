@@ -333,7 +333,11 @@ static int rt_mem_read(void *u, uint64_t addr, void *buf, size_t len) {
     if (time(NULL) - g_rd_at > 2) rt_ranges_refresh();
     if (rt_range_has(addr, len)) { memcpy(buf, (const void *)(uintptr_t)addr, len); return 1; }
     if (plat_mem_read(addr, buf, len)) return 0;
-    rt_ranges_refresh();   // readable but not in the cache: a new mapping
+    // Readable but not in the cache: maybe a new mapping, so refresh, but at most every 500 ms. Some pages read memory that stays outside the cached ranges
+    // (Animal Crossing's, every tick), and a /proc/self/maps parse per such read held the tick thread at 100 % (~140 ms a tick, the page at ~7 Hz).
+    struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m);
+    static int64_t miss_at; int64_t now = (int64_t)m.tv_sec * 1000 + m.tv_nsec / 1000000;
+    if (now - miss_at >= 500) { miss_at = now; rt_ranges_refresh(); }
     return 1;
 }
 static int rt_mem_write(void *u, uint64_t addr, const void *buf, size_t len) { (void)u; return plat_mem_write(addr, buf, len) == 0; }
@@ -559,12 +563,21 @@ static void rt_tick_once(void) { pn_rt_tick(g_rt); }   // the frames come throug
 static void *rt_thread(void *arg) {
     (void)arg;
     pthread_setname_np(pthread_self(), "peanuts-tick");
+    int64_t last = 0;
     for (;;) {
         pthread_mutex_lock(&g_tick_mu);
-        while (g_tick_signalled - g_tick_done < 2) {   // one tick per two presented frames (30 Hz at 60 fps: enough for a second screen, half the sampling and redraw cost); a stalled present (the game paused) still ticks at 20 Hz for the page's own animations
-            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 50000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
-            if (pthread_cond_timedwait(&g_tick_cv, &g_tick_mu, &ts)) break;
+        // ~30 Hz whatever the game's rate: a tick on the first present at least 25 ms after the last one (every second frame at 60 fps, every frame at 30 fps;
+        // counting two presents made a 30 fps game's page, e.g. Animal Crossing's, sample, redraw and take touches at 15 Hz). A stalled present (the game
+        // paused) still ticks at 20 Hz for the page's own animations.
+        for (;;) {
+            struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m);
+            int64_t since = (int64_t)m.tv_sec * 1000000000 + m.tv_nsec - last;
+            if ((g_tick_signalled != g_tick_done && since >= 25000000) || since >= 50000000) break;
+            int64_t wait = 50000000 - since;
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += wait; while (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&g_tick_cv, &g_tick_mu, &ts);
         }
+        { struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m); last = (int64_t)m.tv_sec * 1000000000 + m.tv_nsec; }
         g_tick_done = g_tick_signalled;
         pthread_mutex_unlock(&g_tick_mu);
         rt_tick_once();
