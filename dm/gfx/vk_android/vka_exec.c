@@ -1001,6 +1001,8 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
     g_stat_ops++;
     vka_barrier(g_cb);
 }
+// PEANUTS(upstream-candidate): sRGB<->linear converting copy between formats for copy_t2t (Link's Awakening); general fix, not Peanuts-specific. Covers sconv_image below,
+// the format-mismatch branch in copy_t2t and the plain-copy vs blit condition it changed (s->f.srgb / s->f.vk == d->f.vk && s->f.srgb == d->f.srgb checks further down).
 // Scratch images of a real sRGB format for copy_t2t's sRGB ↔ linear conversions: one per format and size class, transfer use only, kept for the process (a 1080p one is 8 MiB;
 // at most SCONV_N, then the conversion is refused and the plain blit runs). Every transfer op is ordered after the previous one by the replay's barriers, so one image serves every copy
 enum { SCONV_N = 4 };
@@ -1045,7 +1047,7 @@ static void copy_t2t(const p_copy_t2t *c) {
         else VRED_ONCE("depth resolve is not on Vulkan yet");
     } else if (c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT))
                && s->samples == d->samples && s->f.bpb == d->f.bpb && s->f.bw == d->f.bw && s->f.bh == d->f.bh
-               && ((s->f.vk == d->f.vk && s->f.srgb == d->f.srgb) || sa != VK_IMAGE_ASPECT_COLOR_BIT || (s->f.kind && s->f.kind < 3 && d->f.kind && d->f.kind < 3))) {
+               && ((s->f.vk == d->f.vk && s->f.srgb == d->f.srgb) || sa != VK_IMAGE_ASPECT_COLOR_BIT || (s->f.kind && s->f.kind < 3 && d->f.kind && d->f.kind < 3))) {   // PEANUTS: srgb (see above)
         // A plain copy only between equal formats (or depth / stencil, or integer to integer, which a blit cannot convert): NVN's copy converts the texels when the formats differ,
         // as nvn_mtl.m's copy_t2t draws it. The Legend of Zelda: Link's Awakening copies its B10G11R11 frame into the RGBA8 window every frame, the same size and 4 bytes a texel:
         // copied bit for bit, the packed float bits showed as rainbow bands over the whole picture (Thor, 2026-11-11); the blit below converts them
@@ -1061,6 +1063,7 @@ static void copy_t2t(const p_copy_t2t *c) {
         VkImageBlit r = {ss, {{x0, y0, 0}, {x1, y1, 1}}, ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + c->dr.height, 1}}};
         VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, s->f.vk, &fp);
         VkFilter fl = (c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && sa == VK_IMAGE_ASPECT_COLOR_BIT && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        // PEANUTS: sconv_image (see above).
         // One side sRGB, the other linear: 8-bit sRGB images are stored as their UNORM twin, so a blit between the VkImages neither encodes on the write nor decodes on the
         // read, as the console's copy (and nvn_mtl.m's draw into the sRGB view) does. The blit goes through a scratch image of the real sRGB format: into it (the encode) and
         // then its bytes copied raw into the destination, or the source's bytes copied raw into it and blitted out (the decode). Link's Awakening's frame copy into its sRGB

@@ -15,7 +15,7 @@ Playable on the Mac: title movie and logo, file selection, the opening autosave 
 | `sys_resource 0` | `game.tsv` | NPDM META +0x14 is zero: virtual address memory is disabled |
 | `pad_layout full` | `game.tsv` | the right stick rotates the camera |
 | `depth_mode zero` | `game.tsv` | the game selects near-zero depth; offline pipeline bases must use the same vertex entry |
-| `fps_target 60` | `game.tsv` | the game's frame governor (static manager `main+0x34bd4b0`, enable byte `+0x3e4`) drops to 30 fps after one frame over 1/60 s and, measuring wall time at interval 2, never returns; the host turns it off at 60 or holds it at 30 (`hle_fpslock.c`, the "Grezzo frame governor enable" row) |
+| `fps_target 60` <!-- PEANUTS --> | `game.tsv` | the game's frame governor (static manager `main+0x34bd4b0`, enable byte `+0x3e4`) drops to 30 fps after one frame over 1/60 s and, measuring wall time at interval 2, never returns; the host turns it off at 60 or holds it at 30 (`hle_fpslock.c`, the "Grezzo frame governor enable" row) |
 
 No game-specific rewriter cuts, SDK cuts or host branches are needed for the tested route. Only update 1.1.0 is registered; the base build has not been brought up.
 

@@ -2291,6 +2291,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         if (!ind && inst_n <= 1) { int32_t c = dw ? dw->count : di->count; g_claim_words = c > 0 ? (uint32_t)c : 1; }
         else VRED_ONCE("geometry shader %016llx writes memory in an %s draw: drawn without the claim, its writes repeated by the device's runs of each primitive", (unsigned long long)sh[2]->key, ind ? "indirect" : "instanced");
     }
+    // PEANUTS(upstream-candidate): indirect quad/line-loop draws read their record on the CPU instead of being skipped; general fix (Three Houses), not Peanuts-specific.
     // Quads or a line loop drawn indirectly: the indices are made on the CPU (below), so the record is read there too, as the game wrote it before the submission (one the GPU
     // writes in this same submission reads stale: logged once). Fire Emblem: Three Houses' KTGL 2D path draws some frames this way; the draws were skipped
     p_draw dwc; p_draw_idx dic;

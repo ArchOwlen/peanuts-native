@@ -60,6 +60,9 @@ def decode(romfs, main_nso, out):
     dec = None
     try:
         if uepak.io_shader_tocs(romfs):
+            # PEANUTS fix (AUDIT #7): an IoStore title's archives may need the game's own Oodle before uepak.job can even list them (unlike the loose-pak case below,
+            # which only raises once it knows n > 0); without this check DeviceOodle ran Popen on an empty command and failed with a confusing OSError/FileNotFoundError
+            if not cmd or not lib or not mods: raise ValueError('Oodle-compressed shaders and no host to decode them (DM_UE_HOST, DM_UE_HOST_LIB, DM_UE_MODULES)')
             dec = DeviceOodle(cmd, lib, mods)
         listing, n = uepak.job(romfs, main_nso, work, decode=dec)
         if not listing: raise ValueError(f'the RomFS has Unreal paks, but none under {romfs} holds a shader code archive')

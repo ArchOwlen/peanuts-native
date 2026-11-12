@@ -28,6 +28,7 @@ void dm_pcmout_wait(void *k, int ms);
 
 // P_SIZE: bytes of the game's AudioRendererParameter copied before the two fields are changed. SDK 16's struct is 0x38 bytes; SDK 8's (Link's Awakening) has one more word,
 // its revision at +0x38: copying only 0x38 left the revision uninitialized and the SDK rejected it (CheckValidRevision, Result 0x499). The SDK reads only its own size of the copy
+// PEANUTS(upstream-candidate): clock-paced render thread, general fix for AAudio's bursty release cadence, not Peanuts-specific.
 // NBUF: blocks in flight. Android's AAudio stream without a fast track releases a 20 ms burst (four blocks at once), so more than one burst must be queued for the clock-paced
 // renders below to run ahead of the output
 enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF = PLAT_APPLE ? 4 : 8, FRAME_NS = 5000000 };
@@ -93,6 +94,7 @@ static _Atomic uint64_t g_frames, g_nonsilent;
 enum { CQ = 4 }; static int16_t g_cq[CQ][FRAME_MAX * 2]; static int g_cq_n[CQ]; static _Atomic uint32_t g_cq_head, g_cq_tail;   // output queue of catch-up frames
 static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cq_cv = PTHREAD_COND_INITIALIZER;   // the render thread signals each frame it takes off the queue (catch-up pacing)
 static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
+// PEANUTS(upstream-candidate): render lock widened to a recursive one guarding the whole catch-up/clock-pacing path above; general fix, not Peanuts-specific.
 // The render lock (recursive): the render thread holds it from its choice (a queued catch-up frame, or a render of its own) through the render, an update from its catch-up render
 // through queuing it, so the two never cross. The thread used to decide on an empty queue, wait for the catch-up render in progress, and append its own, later, frame first: two 5 ms
 // blocks swapped, a click
@@ -109,7 +111,7 @@ static void render_main(void *arg) {
     static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
     for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
     dm_pcmout_start(out);
-    LOG("audren: render thread started (%d buffers in flight, paced by the clock, held back by the output)", NBUF);
+    LOG("audren: render thread started (%d buffers in flight, paced by the clock, held back by the output)", NBUF);   // PEANUTS: clock-paced (see enum NBUF above)
     // One block per 5 ms by the clock, as the DSP timer on Horizon; the output's releases only say how far ahead the thread may run (queue full: it waits, so the sound card stays
     // the master; the clock is 0.5 % fast so it does). The Mac's output releases a block every 5 ms and the renders followed it; Android's AAudio without a fast track releases four
     // at once, and the thread rendered four frames in 1.6 ms then nothing for 18 ms: the renderer event fired in bursts (one or two wakes for four frames), the game's updates between
@@ -123,16 +125,16 @@ static void render_main(void *arg) {
             if (!atomic_load(&g_open)) break;
         }
         if (!nfree) break;
-        uint64_t t = now_ns();
+        uint64_t t = now_ns();   // PEANUTS: clock pacing (see above)
         if (t > next + FRAME_NS * NBUF) next = t;   // far behind (the output stopped, the thread held off): render now, the cadence starts afresh
         else if (next > t) { struct timespec ts = {0, (long)(next - t)}; nanosleep(&ts, NULL); }
         next += FRAME_NS - FRAME_NS / 200;
         const int16_t *src; int got;
-        render_lock();
+        render_lock();   // PEANUTS: render lock (see above)
         uint32_t h = atomic_load(&g_cq_head);
         if (h != atomic_load(&g_cq_tail)) { src = g_cq[h % CQ]; got = g_cq_n[h % CQ]; atomic_store(&g_cq_head, h + 1); cq_popped(); }   // play queued catch-up output first
         else { g_frame_n = 0; exec(g_handle[0], g_handle[1]); src = g_frame; got = g_frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
-        render_unlock();
+        render_unlock();   // PEANUTS: render lock (see above)
         int n = got ? got : 240;
         gbuf *b = free_list[--nfree];
         if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
@@ -397,6 +399,7 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
     }
     return 0;
 }
+// PEANUTS: render lock (see render_lock/render_unlock above), not a plain mutex, so the catch-up render can nest inside the render thread's lock without deadlocking.
 // Render one frame (generate commands + CPU processing); dst = output (stereo int16, *nout samples). The two callers (render thread, catch-up) are serialized by the render lock (above
 // cq_popped): they share one command buffer
 static _Atomic uint64_t g_updates, g_renders, g_catchups;
@@ -462,7 +465,7 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     }
     int md = gen20 ? *(int32_t *)(sys + 0x4c) : mode(sys), dv = gen20 ? *(int32_t *)(sys + 0x48) : device(sys);
     if (md != 1 || dv != 1) return 0x40299;   // same as the original: manual rendering needs CPU + manual mode
-    render_lock();
+    render_lock();   // PEANUTS: render lock (see above)
     uint64_t t0 = now_ns();
     // Command generation must exclude the game thread's RequestUpdate (AudioRenderSystem::Update, which holds the mutex at mu_off): the original system thread (SendCommandToDsp) generates under the same lock. Processing (the CPU DSP) stays outside the lock, as in the original.
     uint8_t *cl; size_t n;
@@ -477,7 +480,7 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     // render time per frame (budget: 5 ms per frame): mean / max every 2000 frames
     static uint64_t sum, mx, cnt; uint64_t d = now_ns() - t0; sum += d; if (d > mx) mx = d;
     if (++cnt == 2000) { LOG("audren: render time mean %.2f ms / max %.2f ms (5 ms budget per frame, last 2000 frames); catch-up renders so far %llu", sum / 2000 / 1e6, mx / 1e6, (unsigned long long)atomic_load(&g_catchups)); sum = mx = cnt = 0; }
-    render_unlock();
+    render_unlock();   // PEANUTS: render lock (see above)
     return RES_OK;
 }
 // Where the AudioRenderSystem sits inside AudioRendererImpl, read off the SDK's own ExecuteAudioRendererRendering: its prologue adds the offset to `this` (x0) before the first branch.
@@ -531,6 +534,7 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
             while (atomic_load(&g_open) && t - atomic_load(&g_cq_head) >= CQ && !pthread_cond_timedwait(&g_cq_cv, &g_cq_mu, &dl)) {}
             pthread_mutex_unlock(&g_cq_mu);
         }
+        // PEANUTS: render lock around the catch-up render too (see above), so it cannot cross a render-thread render
         if (t - atomic_load(&g_cq_head) < CQ) { render_lock(); render_once(sys, g_cq[t % CQ], &g_cq_n[t % CQ]); atomic_store(&g_cq_tail, t + 1); render_unlock(); }
         else render_once(sys, NULL, NULL);   // still full (the output stopped): render anyway, output discarded
     }

@@ -64,6 +64,8 @@
 #   Environment DM_SPLIT_FILES=<file>: also write the RomFS files any shader was found in, first appearances or not (a profile's shader_files.tsv, from a full split)
 #   Environment DM_SPLIT_SELECTED=1 (the phone's split of a profile with a selected set, PackService): the package keeps the code of only the profile's shader_seen.tsv keys and the pixel
 #   shaders paired with them (what vk_android_build.py builds from a key list); every other shader's record is empty (KEEP, Shaders). The tables (shader_map.tsv ...) are those of a full split
+#   PEANUTS: DM_SPLIT_DIRECT (with DM_SPLIT_TARGETED=1; see map_sources/direct_targets/direct_file/table_rows below) and DM_SPLIT_WORKER/DM_UE_DECODE (see pool/_pool_init and
+#   main's ue_ondevice.decode below) are the on-device split's own environment, needed because the phone's split runs through PackService rather than the Mac tooling.
 #   Environment DM_SPLIT_DIRECT=1 (with DM_SPLIT_TARGETED=1; the phone's split): a file whose map sources all name a container with its offset (#BNSH@, #BAHS@, #IDRK@) is read at those
 #   containers only, not whole (direct_targets, direct_file); its tables must still be the profile's, else the targeted scan of the whole files follows (log: 'direct split: ...')
 # Memory: the shaders are deduplicated by key as they are found (Shaders), and a large compressed container is inflated into a temporary file rather than memory (idrk_shaders); a file of
@@ -659,6 +661,7 @@ def idrk_data(d, a, b, flags, head=None, sink=None):
         a += cs
     return None if sink is not None else b''.join(out)
 
+# PEANUTS: on-device split support (see file header)
 def idrk_shaders(path, label, out, only=None):
     """Koei Tecmo's KTGL keeps its shaders in G2S containers ('_S2G3000', type KTID 0x7bcd279f in Age of Calamity: 23,108 entries in three RDB files, 2.3 GB inflated), each a material's variations
     as GLSLC compiler outputs (glslc_shaders). One '_DOK0000' container (type KTID 0x20a6a0bb, the engine's system resources; once in system.rdb.bin and once in the update's .bin1) holds 151 bare
@@ -666,13 +669,14 @@ def idrk_shaders(path, label, out, only=None):
     and only entries whose data starts with one of those two magics are inflated. A container that inflates to more than SPOOL bytes (Pokémon Pokopia's 2.38 GiB .fdata) is
     inflated into a temporary file, read through a mapping, instead of joined in memory; its outputs go to out as they are found (a Shaders keeps one copy of each key).
     only: the data offsets of the entries to read (the direct scan, direct_file); the others are passed over without a look at their data"""
+    # PEANUTS: on-device split support (see file header) — only= above
     from romfs import mmap
     import tempfile
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
         at = InFile(label, len(d))
         for a, b, flags, n in idrk_entries(d):
             at.now(a)
-            if only is not None and a not in only: continue
+            if only is not None and a not in only: continue   # PEANUTS: on-device split support (direct scan)
             if idrk_data(d, a, b, flags, 4) not in (b'_S2G', b'_DOK'): continue
             where = f'{label}#IDRK@{a:#x}'
             if n > SPOOL and flags & 0x500000:
@@ -2398,6 +2402,7 @@ NV_STAGES = ['vs', 'ps', 'gs', 'hs', 'ds', 'cs']   # NVN stage order
 COMMON, TREES = None, {}   # Unity common strings and borrowed type trees (given when the pool starts)
 ZDICTS, _ZD = {}, {}       # zstd dictionaries by ID (given when the pool starts) and their digested form in this process
 
+# PEANUTS: on-device split support (see file header)
 def _pool_init(common, trees, zdicts={}, direct=None):
     global COMMON, TREES, ZDICTS, DIRECT
     COMMON, TREES, ZDICTS, DIRECT = common, trees, zdicts, direct
@@ -2846,8 +2851,9 @@ def scan_file(args):
     A file no reader can read (a format revision the reader does not know: its red line, or the exception it raised) is left out, and the split goes on: one such
     archive used to end the whole split with nothing written (PR #282: one of Mario Strikers: Battle League's 879 Next Level Games archives). main reports them.
     A file of DIRECT (DM_SPLIT_DIRECT) is read at its recorded containers (direct_file), whole when that cannot be done"""
+    # PEANUTS: on-device split support (see file header) — the DIRECT branch below
     try:
-        if DIRECT and len(args) == 2 and (t := DIRECT.get(args[1])) and (r := direct_file(args, *t)) is not None: return r
+        if DIRECT and len(args) == 2 and (t := DIRECT.get(args[1])) and (r := direct_file(args, *t)) is not None: return r   # PEANUTS
         return scan_file_in(args)
     except (Exception, SystemExit) as e:   # red() is a SystemExit
         why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
@@ -2941,7 +2947,7 @@ def scan_file_in(args):
                 if '.fx' in entry[0] or '/shaders/' in entry[0] or entry[0].endswith(('.vs.bin', '.ps.bin', '.fs.bin')):
                     found += phyre_shaders(vbf.read(f, entry), f'/{rel}/{entry[0]}')
         return rel, uniq_keys(found), var_pairs(found), trees
-    d, kind = plain_blob(path, rel, head)
+    d, kind = plain_blob(path, rel, head)   # PEANUTS: on-device split support — plain_blob factored out below for direct_file's reuse (see file header)
     if kind == 'monolith':
         scan_blob(d, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -3002,6 +3008,7 @@ def source_file(s, rels):
     """The RomFS file of a map source (without its leading '/'): the shortest prefix ending at a '/' or '#' or the end that is a file of the dump (rels), or None"""
     return next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#'] + [len(s)] if s[:i] in rels), None)
 
+# PEANUTS: on-device split support (see file header)
 def map_sources(keys=False):
     """The RomFS sources of the profile's shader_map.tsv, without their leading '/' (main's and the captures' are not RomFS files: NOT_ROMFS); with keys, {(source, key)}"""
     srcs = set()
@@ -3011,6 +3018,7 @@ def map_sources(keys=False):
             if len(c) > 4 and c[0].endswith('.bin') and c[4].startswith('/') and not c[4].startswith(NOT_ROMFS): srcs.add((c[4][1:], c[3]) if keys else c[4][1:])
     return srcs
 
+# PEANUTS: on-device split support (see file header)
 def direct_targets(files):
     """DM_SPLIT_DIRECT=1: {relative path: ([(member path, kind, offset)], (the map's keys of the file, sorted))} of the files among files ((path, rel) of the targeted scan's plain jobs) whose
     every map source is a recorded container (DIRECT_FORMS); kind 'BNSH' with the container's offset, 'BAHS' with 0 (the member is the BAHS file, parsed whole), 'IDRK' with the entry's data
@@ -3030,6 +3038,7 @@ def direct_targets(files):
         keys[r].add(k)
     return {r: (sorted(t), tuple(sorted(keys[r]))) for r, t in out.items() if r not in plain}
 
+# PEANUTS: on-device split support (see file header)
 def direct_file(args, targets, keys):
     """scan_file's result for a file of DIRECT: its recorded containers only; None when the file is to be scanned whole (another reader's head, a member or container not where the
     map says, a reader's error: the whole scan then says what is wrong, as before). keys: the map's keys of this file; a result without every one of them (a container that moved,
@@ -3117,6 +3126,7 @@ class InProcess:
         return f
     def map(self, fn, it): return map(fn, it)
 
+# PEANUTS: on-device split support (see file header)
 def pool(J, *initargs):
     """The scan's workers: J processes, or this process when J is 1 (InProcess). DM_SPLIT_WORKER=<command> (the phone's split, PackService): the workers are
     processes of that command, which runs Python as `python3 -c` does, over pipes (split_pool.py: the phone's Python has no python executable and no
@@ -3340,16 +3350,16 @@ def main():
     out = None
     if targeted:
         want, why = profile_files(files, main_v)
-        if rd:   # the direct, the targeted and the full scan keep their results apart, so a scan the one before fell back to resumes as that scan
+        if rd:   # PEANUTS: on-device split support (see file header) — the direct, the targeted and the full scan keep their results apart, so a scan the one before fell back to resumes as that scan
             os.makedirs(rd, exist_ok=True)
             for f in os.listdir(rd):
-                if f not in ('direct', 'targeted', 'full', 'direct.failed', 'targeted.failed'): _remove(os.path.join(rd, f))   # an older split's results, kept in the folder itself
+                if f not in ('direct', 'targeted', 'full', 'direct.failed', 'targeted.failed'): _remove(os.path.join(rd, f))   # an older split's results, kept in the folder itself (direct/*.failed: PEANUTS)
         if want is not None:
             big, todo = scan_jobs(files, want)
             dg = scan_digest(inputs, big + todo + mains)
             print(f'targeted split: {len(want):,} of {len(files):,} RomFS files hold the shaders of the profile\'s shader_map.tsv (main build {", ".join(build_id(m) for m in main_v)}); only these are scanned', flush=True)
-            # the direct scan first (DM_SPLIT_DIRECT: the recorded containers of each file, direct_targets), the targeted scan of the whole files when its tables differ; each keeps its
-            # own results and its own 'failed' digest (ScanCache's digest with the containers, as the results hold other shaders)
+            # PEANUTS: on-device split support (see file header) — the direct scan first (DM_SPLIT_DIRECT: the recorded containers of each file, direct_targets), the targeted
+            # scan of the whole files when its tables differ; each keeps its own results and its own 'failed' digest (ScanCache's digest with the containers, as the results hold other shaders)
             modes = [('targeted', None, dg)]
             if os.environ.get('DM_SPLIT_DIRECT') == '1' and (dt := direct_targets(todo)):
                 modes.insert(0, ('direct', dt, hashlib.sha256((dg + repr(sorted(dt.items()))).encode()).hexdigest()))
@@ -3459,6 +3469,7 @@ def absent_tables(name, text, absent):
         elif not absent.intersection(c): out.append(ln)
     return ''.join(out)
 
+# PEANUTS: on-device split support (see file header)
 def table_rows(b):
     """A table's rows without its comment lines: the header prose changes with the tool's wording (2026-10-28: "no PC shader pairing supplied"), and a profile written before
     such a change must still match a scan of the same build (PackService.splitMatchesProfile compares the same way)"""
@@ -3485,12 +3496,12 @@ def scan_jobs(files, want=None):
     if want is not None: big, files = [j for j in big if j[1] in want], [f for f in files if f[1] in want]
     return big, files
 
-def split_tables(results, big, files, dumps, J, common, zdicts, cache, targeted=False, direct=None):
+def split_tables(results, big, files, dumps, J, common, zdicts, cache, targeted=False, direct=None):   # PEANUTS: direct= on-device split support (see file header)
     """Scans the jobs (results: main's, which come first) → the split's outputs, the tables as text: {'keys', 'order', 'rows', 'map', 'facts', 'pairs', 'pso', 'files', 'npairs', 'bad', 'summary'}.
     targeted: Fallback when a Unity serialized file wants a type tree, which a bundle the scan left out may lend. direct: the files read at their recorded containers (direct_targets, DIRECT)"""
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
-    with pool(J, common, {}, zdicts, direct) as ex:
+    with pool(J, common, {}, zdicts, direct) as ex:   # PEANUTS: direct param above
         n = len(big) + len(files)
         results += pooled(ex, big, n, cache=cache) + pooled(ex, files, n, len(big), chunk=16, cache=cache)
     stage('sorting the shaders found')

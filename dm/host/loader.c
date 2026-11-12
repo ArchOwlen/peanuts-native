@@ -786,6 +786,7 @@ static void pac_patch_text(module_t *m) {
 #endif
 }
 
+// PEANUTS(upstream-candidate): general host fix, not Peanuts-specific — reserves a module arena so Android's mmap layout matches the console's (Link's Awakening OOB read).
 // Modules back to back in load order, as Horizon's rtld places them (main, subsdk*, sdk adjacent, each after the last): a game may read a little past its own module and get
 // the next one's bytes without a fault. The Legend of Zelda: Link's Awakening builds its main camera actor with actor profile 0xFFFF and indexes the profile table with it
 // unchecked (main+0x1c180): the byte read, main+0x214c889, lies in subsdk0 on the console, and on the Mac too, where vm_allocate hands out ascending addresses and the
@@ -826,7 +827,7 @@ static void map_image(module_t *m, const char *dir) {
         if (sz < fl + bl) die("%s is shorter than FILE_IMAGE_LEN %#llx + BACK_LEN %#llx", path, (unsigned long long)fl, (unsigned long long)bl);
         m->size = m->image_size; m->patch_len = (sz - bl - fl + 0x3FFF) & ~0x3FFFull;
         if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
-        uint8_t *a = module_mmap(m->name, pre + m->size);
+        uint8_t *a = module_mmap(m->name, pre + m->size);   // PEANUTS: module arena (see above)
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
@@ -839,7 +840,7 @@ static void map_image(module_t *m, const char *dir) {
         return;
     }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
-    m->base = module_mmap(m->name, m->size);
+    m->base = module_mmap(m->name, m->size);   // PEANUTS: module arena (see above)
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
@@ -888,7 +889,7 @@ void load_modules(const char *dir, const char **names, int n) {
     }
     plat_slots_init();
 #if PLAT_ANDROID
-    arena_reserve(g_mod, n, dir);
+    arena_reserve(g_mod, n, dir);   // PEANUTS: module arena (see above)
 #endif
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];

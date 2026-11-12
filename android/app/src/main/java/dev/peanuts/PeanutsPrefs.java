@@ -22,7 +22,7 @@ public final class PeanutsPrefs {
 
     // ---- Setup ----
 
-    /** files/keys/prod.keys: where SetupActivity copies the picked prod.keys (never shipped) */
+    /** files/keys/prod.keys: where LibrarySettings copies the picked prod.keys (never shipped) — PEANUTS: fixed a stale comment naming the deleted SetupActivity */
     public static File keysFile(Context c) { return new File(new File(c.getFilesDir(), "keys"), "prod.keys"); }
     /** files/firmware/fonts: the shared fonts extracted from the user's firmware (standard.ttf, nintendo_ext.ttf) */
     public static File fontsDir(Context c) { return new File(new File(c.getFilesDir(), "firmware"), "fonts"); }

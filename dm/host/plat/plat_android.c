@@ -228,6 +228,7 @@ plat_thread_t plat_thread_of(pthread_t t) { return (plat_thread_t)pthread_gettid
 plat_thread_t plat_thread_self(void) { return (plat_thread_t)gettid(); }
 void plat_thread_self_release(plat_thread_t t) { (void)t; }
 void plat_thread_set_name(const char *name) { char b[16]; snprintf(b, sizeof b, "%s", name); pthread_setname_np(pthread_self(), b); }
+// PEANUTS(upstream-candidate): general host fix, not Peanuts-specific — excludes the guard page from the reported stack range.
 // Bionic's pthread_getattr_np range starts at the mapping base, so it includes the PROT_NONE guard below the stack (glibc and Darwin leave it out). svcQueryMemory reports this range
 // as the main thread stack and IL2CPP's GC scans all of it: Fire Emblem Engage faulted in the guard page (main+0x4731f4, GC_mark_from) ~1 s after nnMain. The guard is left out here
 void plat_thread_stack(uint64_t *top, uint64_t *size) {

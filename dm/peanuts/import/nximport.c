@@ -91,7 +91,8 @@ static NxNca *job_nca(Job *j, const NxContainer *c, const char *id) {
     char nm[48]; snprintf(nm, sizeof nm, "%s.nca", id);
     const NxEntry *e = nx_container_find(c, nm); if (!e) { nx_err("%s is not in %s", nm, c->path); return NULL; }
     NxNca *n = &j->ncas[j->nncas]; if (nx_nca_open(n, c, e)) return NULL;
-    if (!n->key_ok) { nx_err("%s in %s: %s", nm, c->path, n->key_why); return NULL; }
+    // PEANUTS fix (AUDIT #1): nx_nca_open can succeed with key_ok 0 (no titlekey/area key: key_why says why); it still opened the NCA's sections, so they must be closed here too
+    if (!n->key_ok) { nx_err("%s in %s: %s", nm, c->path, n->key_why); nx_nca_close(n); return NULL; }
     j->nncas++; return n;
 }
 

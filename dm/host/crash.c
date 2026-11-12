@@ -75,6 +75,7 @@ void crash_off(const char *tag, uint64_t a) {   // Also used by diag.c
     Dl_info di;
     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+    // PEANUTS(upstream-candidate): general host fix, not Peanuts-specific — prints lib+offset for a stripped (hidden-visibility) build, where dladdr finds no symbol name.
     else if (dladdr((void *)a, &di) && di.dli_fname && di.dli_fbase) {   // a stripped library (the host builds hidden): its file and the offset in it, for a symbolizer on the unstripped build
         const char *s = strrchr(di.dli_fname, '/');
         fprintf(stderr, " %s%s%#llx (%s+%#lx)", tag, *tag ? "=" : "", a, s ? s + 1 : di.dli_fname, (unsigned long)(a - (uint64_t)di.dli_fbase));

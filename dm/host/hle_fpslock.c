@@ -28,6 +28,7 @@
 // put its floor back, until the game restarted. So a floor row never writes above that maximum, and a rate needing more vsyncs than that is not offered (row_holds)
 // The vsync kinds hold only rates that divide 60 (60, 30, 20, 15); the rate kinds any target (rate_ok)
 // And a step count: a framework that runs a whole number of fixed steps each frame and presents at that many vsyncs, picked by a mode field before it (a profile's fps_steps rows; steps_tick)
+// PEANUTS: new EXTRA_VSYNCS_U8 lock kind (Link's Awakening / Echoes of Wisdom frame-controller rows below use it) — a game tweak, candidate for an overlay once peanuts.tsv exists.
 // And a frame controller's range of extra vsyncs as two bytes, the least then the most it may wait (Link's Awakening's Grezzo controller: its 30 fps mode is one extra vsync with two
 // world steps a frame; a late frame takes it there, a quick one back, no hysteresis). Target 60 writes 0, 0 (never 30: a late frame shows one vsync late instead), 30 writes 1, 1.
 // The game rewrites both itself (boost on and off, a level's own least), so the row is re-asserted at every present; the game keeps setting its present interval (follows_game)
@@ -36,8 +37,8 @@ enum { FPS_F32, VSYNCS_I32, MS_F32, FPS_I32, TICKS_U32, SECS_F32, MODE_U32, FPS_
 static float ms_want(int fps) { return 1000.0f / (float)fps - (fps == 60 ? MS_MARGIN : 0); }
 // deref: after [main + ptr_off], nderef more pointers, each at the object reached so far + deref[i] (an object behind a global, then members)
 typedef struct { const char *build, *what; uint64_t ptr_off; uint32_t field; uint8_t kind, copies; uint32_t scale; uint8_t nderef; uint16_t deref[3]; } lock_t;
-static int vsync_kind(int kind) { return kind == VSYNCS_I32 || kind == MIN_VSYNCS_I32 || kind == STEPS_I32 || kind == EXTRA_VSYNCS_U8; }
-static int follows_game(int kind) { return kind == MIN_VSYNCS_I32 || kind == STEPS_I32 || kind == EXTRA_VSYNCS_U8; }   // the game still sets its present interval itself (dm_fps_lock_engine leaves these out)
+static int vsync_kind(int kind) { return kind == VSYNCS_I32 || kind == MIN_VSYNCS_I32 || kind == STEPS_I32 || kind == EXTRA_VSYNCS_U8; }   // PEANUTS: EXTRA_VSYNCS_U8 (see enum above)
+static int follows_game(int kind) { return kind == MIN_VSYNCS_I32 || kind == STEPS_I32 || kind == EXTRA_VSYNCS_U8; }   // the game still sets its present interval itself (dm_fps_lock_engine leaves these out) — PEANUTS: EXTRA_VSYNCS_U8
 static int rate_ok(int kind, int target) { return !vsync_kind(kind) || 60 % target == 0; }
 static const lock_t k_locks[] = {
     // Donkey Kong Bananza v458752: sead's dynamic present interval controller (main+0x204a18, called each frame from the framework's main+0x203674). It picks the interval from
@@ -46,6 +47,7 @@ static const lock_t k_locks[] = {
     // game's logic steps by that interval, as BotW's VFR does (docs/reference/frame-rate.md). A floor of 2 makes the game itself run at 30 and stay at the right speed.
     // The controller is at [framework+0x218] (main+0x5bfb00); the framework at [app], the app object at main+0x26cc208 (nnMain main+0x5bdff4, its GOT slot main+0x2455ca0)
     { "e25c90c1c136638885659fd55bf8a03b", "sead frame-rate controller minimum interval", 0x26cc208, 0x0, MIN_VSYNCS_I32, 1, 0, 2, {0x0, 0x218} },
+    // PEANUTS: per-game lock row (Link's Awakening EXTRA_VSYNCS_U8)
     // The Legend of Zelda: Link's Awakening 1.1.0: Grezzo's frame controller (main+0xc910, a virtual method; its decision at main+0xca64..+0xcb28). Each frame it counts the vsyncs the
     // last frame missed ([gfx+0x81ac] − +0x4dc), takes one off when that frame's CPU time (system tick, limit 13,333,332 ns at main+0x1cab1f8) and GPU time ([gfx+0x81c0], limit
     // 14,166,666 ns at main+0x1cab1e8) were both under their limits, clamps the count to [+0x4e2 least, +0x4e3 most] on the game manager and writes it to +0x4e1 (and the extra world
@@ -54,6 +56,7 @@ static const lock_t k_locks[] = {
     // and a few frames in a hundred run late, each a flip to 30 and back (50-58 fps on the overlay); with least = most = 0 those frames show one vsync late instead and the world
     // steps once a frame as at 60. Found 2026-11-12 (LAS recomp's pace.c describes the same bytes for 1.0.1; the layout did not change)
     { "909e904af78ac1b8deefe97ab2ccdb51", "Grezzo frame controller extra vsyncs", 0x1c97188, 0x4e2, EXTRA_VSYNCS_U8, 1 },
+    // PEANUTS: per-game lock row (Echoes of Wisdom EXTRA_VSYNCS_U8)
     // The Legend of Zelda: Echoes of Wisdom 1.1.0 (v196608): Grezzo's frame governor, rewritten since Link's Awakening (no least / most bytes: the clamp pattern is not in this
     // main). The game manager is a static object at main+0x34bd4b0 (bss; made at main+0x33b1e4, handed to its per-frame task object {vtable main+0x3085020, manager} at
     // main+0x3432d4); its frame task main+0x345da0 (vtable +0x78; the governor from +0x346b8c) takes this frame's cost as the larger of the CPU time since the last frame less the
@@ -633,6 +636,7 @@ void dm_fps_lock_tick(void) {
                          if (fb.n) LOG("main: Frostbite simulation rate left as the game sets it (%s)", src); }
             else for (int r = 0; r < nrow; r++) {   // back to the game's own: the values the game had before the host wrote them (NieR and Frostbite keep the last cap until the game sets them again)
                 uint64_t obj = row_obj(rows[r]); if (!obj) continue;
+                // PEANUTS: EXTRA_VSYNCS_U8 restore path
                 if (rows[r]->kind == EXTRA_VSYNCS_U8) {   // the two bytes the game had (least 0, most 1 in play)
                     if (have_orig[r][0]) { uint16_t *p = (uint16_t *)(uintptr_t)(obj + rows[r]->field); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, (uint16_t)orig[r][0], __ATOMIC_RELAXED);
                                            LOG("main: %s back to the game's least %u most %u (%s)", rows[r]->what, orig[r][0] & 0xff, (orig[r][0] >> 8) & 0xff, src); }
@@ -702,6 +706,7 @@ void dm_fps_lock_tick(void) {
             }
             continue;
         }
+        // PEANUTS: EXTRA_VSYNCS_U8 write path
         if (L->kind == EXTRA_VSYNCS_U8) {   // the least and the most extra vsyncs, two bytes, re-asserted every frame (the game rewrites them)
             uint64_t a = obj + L->field; uint16_t cur, want = target == 60 ? 0x0000 : target == 30 ? 0x0101 : 0xffff;
             if (want == 0xffff || !rd(a, &cur, sizeof cur) || cur == want) continue;
