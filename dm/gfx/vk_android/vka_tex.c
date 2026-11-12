@@ -2402,7 +2402,13 @@ static void treg(int id, const tex_t *t, const view_t *v, int img) {
     if (id < 0 || id >= (1 << 20)) return;
     pthread_mutex_lock(&g_tmu);
     if (id >= g_ntreg) { int n = g_ntreg ? g_ntreg : 1024; while (n <= id) n *= 2; g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
-    treg_ent *e = &g_treg[id]; e->t = *t; e->has_v = v != NULL; if (v) e->v = *v; e->img = (uint8_t)img; e->pgen = nvn_pool_live(t->pool, NULL, NULL);
+    // A NULL texture clears the ID (as nvn_mtl.m's mtl_reg_tex does): its slot reads the null view, every lookup sees it unregistered (serial 0). Mario Kart 8 Deluxe
+    // registers NULL into its texture pool at the title screen
+    treg_ent *e = &g_treg[id];
+    if (!t) {
+        static _Atomic int n; if (!atomic_exchange(&n, 1)) VLOG("texture ID %d registered with no texture (a %s registration of NULL): the ID is cleared, its slot the null view", id, img ? "RegisterImage" : "RegisterTexture");
+        memset(e, 0, sizeof *e);
+    } else { e->t = *t; e->has_v = v != NULL; if (v) e->v = *v; e->img = (uint8_t)img; e->pgen = nvn_pool_live(t->pool, NULL, NULL); }
     dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
     if (!g_tver) g_tver = calloc(1 << 20, sizeof *g_tver);
     if (g_tver) atomic_fetch_add_explicit(&g_tver[id], 1, memory_order_release);
