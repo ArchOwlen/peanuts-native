@@ -3373,7 +3373,7 @@ def main():
                     stage('comparing the shaders found with the app\'s list')
                     why = profile_differs(out, pairsout, psopairsout)
                 except Fallback as e: why = str(e)
-                if not why: print(f'{mode} split: its tables are the profile\'s, byte for byte', flush=True); break
+                if not why: print(f'{mode} split: its tables are the profile\'s, byte for byte', flush=True); break   # PEANUTS: the direct, then the targeted mode (DM_SPLIT_DIRECT)
                 out = None; why = f'the {mode} scan ' + why
                 if failed:
                     with open(failed, 'w') as f: f.write(mdg + '\n')
