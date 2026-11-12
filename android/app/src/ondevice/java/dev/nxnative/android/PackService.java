@@ -319,7 +319,7 @@ public final class PackService extends Service {
             if (j.apkChanged()) {
                 stepLog(j, "the job's shaders are from another app version: translating them again");
                 j.resetChainSteps();
-                Job.deleteTree(new File(j.dir(), "xlate"));
+                Job.deleteTree(new File(j.dir(), "xlate")); Job.deleteTree(j.xlate(this));   // PEANUTS: the results live in the app's own storage (Job.xlate)
                 Job.deleteTree(new File(j.dir(), "lib"));
             }
             ranNow.clear();
@@ -370,7 +370,7 @@ public final class PackService extends Service {
                     Log.w(TAG, "split: " + e.getMessage());   // the job is done all the same; a later split begins by deleting it again
                 }
                 Job.deleteTree(j.splitScan(this));
-                Job.deleteTree(new File(j.dir(), "xlate"));
+                Job.deleteTree(new File(j.dir(), "xlate")); Job.deleteTree(j.xlate(this));   // PEANUTS: the results live in the app's own storage (Job.xlate)
                 Job.deleteTree(new File(j.dir(), "lib"));
             } else if (stopReason != null) {
                 j.state("paused", stopReason, null);
@@ -450,7 +450,7 @@ public final class PackService extends Service {
         // The update's RomFS and main: folders of the dump, or (a .nup) <file>.nup:update/<version>/romfs and …/exefs/main (base/… for version 0), which the
         // tools take where they take the folders (android/NUP.md "Naming a package"); the dump itself goes to pack_android.py as it is, folder or .nup
         String upRomfs = DumpCheck.versionPath(dump, j.version(), "romfs"), upMain = DumpCheck.versionPath(dump, j.version(), "exefs/main");
-        File split = new File(od, "split"), splitTmp = new File(od, "split.tmp"), splitScan = j.splitScan(this), xlate = new File(od, "xlate"), lib = new File(od, "lib");
+        File split = new File(od, "split"), splitTmp = new File(od, "split.tmp"), splitScan = j.splitScan(this), xlate = j.xlate(this), lib = new File(od, "lib");   // PEANUTS: xlate in the app's own storage (Job.xlate)
         String tool;
         String[] argv;
         List<String> selected = null;

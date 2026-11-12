@@ -602,6 +602,12 @@ final class Job {
         return new File(c.getNoBackupFilesDir(), "split.scan/" + titleId());
     }
 
+    /** PEANUTS: the shaders step's results (DMSH_VK_RESULTS), one file per shader, in the app's own storage: on shared storage each write goes through Android's FUSE
+     *  layer and the step ran at ~19 shaders a second with its workers waiting; here 248 (Pokémon Sword, AYN Thor) */
+    synchronized File xlate(Context c) {
+        return new File(c.getNoBackupFilesDir(), "xlate/" + titleId());
+    }
+
     /** Deletes a folder of the job's own outputs: ondevice/ paths, and the pack the job made itself (Ondevice's Manage, asked first; never the dump or the saves) */
     static void deleteTree(File f) { Outputs.deleteTree(f); }
 
