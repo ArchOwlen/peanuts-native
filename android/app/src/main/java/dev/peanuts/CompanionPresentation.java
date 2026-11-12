@@ -53,7 +53,18 @@ final class CompanionPresentation extends Presentation {
 
     @Override protected void onCreate(Bundle saved) {
         super.onCreate(saved);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // NOT_FOCUSABLE as Eden Duo's AuxPresentation does: a focusable second window takes the input focus when touched, and the game on the main
+        // display then loses the controller (seen on the AYN Thor: after a tap on Screen-2 the game ignored its buttons). Touches still arrive.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        // The two panels are lit independently: Screen-2 follows the system brightness (as Eden Duo's), instead of sitting at full while the main screen dims
+        applyBrightness(systemBrightness());
+        brightnessObserver = new android.database.ContentObserver(ui) {
+            @Override public void onChange(boolean selfChange) { applyBrightness(systemBrightness()); }
+        };
+        try {
+            getContext().getContentResolver().registerContentObserver(android.provider.Settings.System.getUriFor(android.provider.Settings.System.SCREEN_BRIGHTNESS), false, brightnessObserver);
+            getContext().getContentResolver().registerContentObserver(android.provider.Settings.System.getUriFor(android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE), false, brightnessObserver);
+        } catch (RuntimeException e) { android.util.Log.w("peanuts", "companion: cannot watch brightness: " + e); }
         FrameLayout root = new FrameLayout(getContext());
         root.setBackgroundColor(Color.BLACK);
         page = new ImageView(getContext());
@@ -77,7 +88,39 @@ final class CompanionPresentation extends Presentation {
     }
 
     @Override protected void onStart() { super.onStart(); poll(); }
-    @Override protected void onStop() { ui.removeCallbacksAndMessages(null); super.onStop(); }
+    @Override protected void onStop() {
+        ui.removeCallbacksAndMessages(null);
+        if (brightnessObserver != null) { try { getContext().getContentResolver().unregisterContentObserver(brightnessObserver); } catch (RuntimeException ignored) { } brightnessObserver = null; }
+        super.onStop();
+    }
+
+    private android.database.ContentObserver brightnessObserver;
+
+    /** The system brightness as a window brightness: none (follow) in automatic mode, else the manual level over the panel's own full scale */
+    private float systemBrightness() {
+        try {
+            android.content.ContentResolver r = getContext().getContentResolver();
+            boolean auto = android.provider.Settings.System.getInt(r, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE, 0) == android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC;
+            if (auto) return WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
+            int raw = android.provider.Settings.System.getInt(r, android.provider.Settings.System.SCREEN_BRIGHTNESS, -1);
+            if (raw < 0) return WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
+            return Math.max(0.01f, Math.min(1f, raw / (float) brightnessMax()));
+        } catch (RuntimeException e) { return WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE; }
+    }
+
+    /** The panel's full brightness scale: not 255 everywhere (1023 and 2047 are common), so assuming 255 would pin Screen-2 at maximum */
+    private static int brightnessMax() {
+        try {
+            android.content.res.Resources s = android.content.res.Resources.getSystem();
+            int id = s.getIdentifier("config_screenBrightnessSettingMaximum", "integer", "android");
+            return id != 0 ? Math.max(1, s.getInteger(id)) : 255;
+        } catch (RuntimeException e) { return 255; }
+    }
+
+    private void applyBrightness(float value) {
+        WindowManager.LayoutParams p = getWindow().getAttributes();
+        if (p.screenBrightness != value) { p.screenBrightness = value; getWindow().setAttributes(p); }
+    }
 
     private void poll() {
         int w = Bridge.pageWidth(), h = Bridge.pageHeight();
