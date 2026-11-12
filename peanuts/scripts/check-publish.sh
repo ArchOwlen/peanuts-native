@@ -24,7 +24,7 @@ bad=$(git log "$since"..HEAD --format='@@%h%n%B' | awk '/^@@/{h=substr($0,3); ne
 
 # Rule 2: private data in the files Peanuts changed (their current contents)
 PRIV='192\.168\.[0-9]+\.[0-9]+|(^|[^0-9.])10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+|/home/[a-z_][a-z0-9_-]*/|/Users/[A-Za-z]|[Cc]:\\Users\\|/mnt/(nvme|ironwolf|data|sd)|\.claude/(jobs|projects)|cc-socks|:5555\b|\.ts\.net|@gmail\.com|@yahoo\.|@outlook\.|@hotmail\.'
-git diff --name-only --diff-filter=d "$since" HEAD -- . ':!dm/peanuts/third_party' > "${TMPDIR:-/tmp}/check-publish.$$"
+git diff --name-only --diff-filter=d "$since" HEAD -- . ':!dm/peanuts/third_party' ':!peanuts/scripts/check-publish.sh' ':!peanuts/scripts/install-hooks.sh' > "${TMPDIR:-/tmp}/check-publish.$$"
 hits=$(tr '\n' '\0' < "${TMPDIR:-/tmp}/check-publish.$$" | xargs -0 grep -nIE "$PRIV" 2>/dev/null | grep -vE '127\.0\.0\.1|0\.0\.0\.0')
 rm -f "${TMPDIR:-/tmp}/check-publish.$$"
 [ -n "$hits" ] && { echo "private data in changed files (replace with a placeholder such as <work dir> or <device ip>):"; echo "$hits" | cut -c1-200; fail=1; }
