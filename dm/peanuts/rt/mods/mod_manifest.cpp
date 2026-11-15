@@ -1995,6 +1995,9 @@ void ParseManifestJson(const nlohmann::json& json, Manifest& manifest) {
             s.hazard_tint = static_cast<int>(st.value("hazard_tint", s.hazard_tint));
             s.water_tint = static_cast<int>(st.value("water_tint", s.water_tint));
             s.fade_ticks = static_cast<u32>(st.value("fade_ticks", s.fade_ticks));
+            // PNRT: the manifest counts ticks at the game's 60 Hz; this host ticks at ~30 Hz, so the
+            // same wall-clock fade takes half as many ticks.
+            s.fade_ticks = std::max<u32>(1, s.fade_ticks / 2);
             s.item_icon = static_cast<s32>(st.value("item_icon", s.item_icon));
             s.door_icon = static_cast<s32>(st.value("door_icon", s.door_icon));
             s.marker_icon = static_cast<s32>(st.value("marker_icon", s.marker_icon));

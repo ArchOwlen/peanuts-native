@@ -1,0 +1,9 @@
+# Memory of a build with code mods (gen_runtime_profile.py profile-modules): <title ID> <key> <value>, key mem_reserve | mem_alias | app_pool.
+# The game without mods keeps its profile's numbers (dm/games/<title ID>/game.tsv).
+#
+# Pokemon Brilliant Diamond: the profile's 2 GB pool is full with Luminescent Platinum's files when the starter is chosen (MapPhysicalMemory +60 MB refused
+# twice at 1.90 GB mapped, then a null read). 3 GB, with the alias region and the reservation 2 GB larger: the game's StandardAllocator takes pool minus used
+# of the alias region and Unity's pools need the rest (dm/games/0100000011D90000/README.md: the console's 3.21 GB pool reached +3.90 GB of 4.375 GB)
+0100000011D90000	app_pool	0xC0000000
+0100000011D90000	mem_alias	0x198000000
+0100000011D90000	mem_reserve	0x1C0000000

@@ -5,13 +5,13 @@
 </p>
 
 <p align="center">
-  <img alt="status" src="https://img.shields.io/badge/status-pre--release-lightgrey">
+  <img alt="status" src="https://img.shields.io/badge/release-0.1.1-brightgreen">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Android%2013%2B-green">
 </p>
 
 > [!NOTE]
-> Peanuts Native is in development and has no public release yet. It is not affiliated with Nintendo.
+> Peanuts Native is in development. The current release is on the [releases page](https://github.com/igawa6/peanuts-native/releases). It is not affiliated with Nintendo.
 
 ## What it is
 
@@ -24,14 +24,11 @@ companion for that game: a map, your party, items or quests, read live from the 
 use the same package format as [Eden Duo](https://github.com/igawa6/eden-duo), so every Eden Duo companion works here
 too.
 
-## Screenshots
-
-*(to come: the top screen and the companion on the bottom screen for each supported game)*
-
 ## Supported games
 
-These Switch 1 games build and play on an AYN Thor with their companion. Use the game update listed. The app shows
-which update you have and which one a game supports, and asks before building any other.
+These are the Switch 1 games this app version includes. All but the last two build and play on an AYN Thor with
+their companion. Use the game update listed. The app shows which update you have and which one a game supports, and
+asks before building any other.
 
 | Game | Title ID | Game update | Companion | Runs at |
 |---|---|---|---|---|
@@ -43,10 +40,14 @@ which update you have and which one a game supports, and asks before building an
 | Super Mario Odyssey | `0100000000010000` | 1.4.1 | Yes | 60 fps |
 | Mario Kart 8 Deluxe | `0100152000022000` | 4.0.0, 4.0.1 | Yes | 60 fps |
 | Animal Crossing: New Horizons | `01006F8002326000` | 3.0.3 | Yes | 30 fps, as on Switch |
-| Persona 5 Royal | `01005CA01580E000` | 1.0.2 | Yes | 30 fps, as on Switch |
+| Persona 5 Royal | `01005CA01580E000` | 1.0.2 | Yes | 60 fps |
 | Castlevania: Belmont's Curse | `0100BA4026E94000` | 1.1.0 | Yes | 60 fps |
 | OCTOPATH TRAVELER 0 | `01005270232F2000` | 1.0.5 | Yes | 60 fps |
 | Pokémon Brilliant Diamond | `0100000011D90000` | 1.3.0 | Yes | 60 fps |
+| Pokémon Sword | `0100ABF008968000` | 1.3.2 | Yes | 60 fps (30 on Switch) |
+| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | 1.9.0 | Yes | 60 fps (30 on Switch); new, little tested |
+| Super Mario Bros. Wonder | `010015100B514000` | 1.0.0, 1.0.1, 1.2.1 | Not checked | Not tested on a device yet |
+| DRAGON QUEST III HD-2D Remake | `01003E601E324000` | 1.1.2 only | Not checked | Not tested on a device yet |
 
 ## What you need
 
@@ -55,21 +56,42 @@ which update you have and which one a game supports, and asks before building an
 - Android 13 or later, a Snapdragon GPU with Vulkan 1.3, and 12 GB of RAM or more. A Turnip Vulkan driver is
   recommended; the app can download one.
 - Free storage for the game and its build. Plan for the size of the game plus a few GB.
-- Your own `prod.keys` and your own game dump (NSP, XCI or a dump folder), with its update.
+- Your own `prod.keys`, your own firmware dump (a folder or a `.zip`) and your own game dump (NSP, XCI or a dump
+  folder), with its update.
 
 ## Your keys and games
 
 Peanuts Native only runs games you dumped from your own console, with keys from that console. It contains no Nintendo
-code, firmware or keys, never asks you for any, and does not link to places that offer them. Nobody from this project
+code, firmware or keys, never downloads any, and does not link to places that offer them. Nobody from this project
 will ever ask you for money, keys or game files.
 
 ## Getting started
 
 1. Install the APK and allow All files access when asked.
-2. In Settings, choose your game folder, your update folder and your `prod.keys`.
+2. On the first screen, add your **Keys** (`prod.keys`), pick your **Game folder**, and add your **Firmware**. Both
+   keys and firmware are needed before the first build. A build folder is optional (Settings, Library, **Build
+   folder**): pick one, on the phone or the microSD card, to keep every build there, organized by title ID.
 3. Open a game from the library and tap **Build**. The app imports the game, rewrites its code, translates its
    shaders and installs its companion. Most games take 5 to 40 minutes on the Thor.
 4. Tap the game to play. The companion starts on the bottom screen.
+
+Hold a game's cover to open its own page: picture and speed settings, mods, the companion, saves and storage.
+After an app update, rebuilding every game is strongly recommended: hold the cover, open **Storage**, tap
+**Build again**, then **Rebuild**.
+
+## Settings worth knowing
+
+- **Console mode**: Docked or Handheld, for all games in Settings and per game on its page. It can also be changed
+  while the game runs, from the in-game panel.
+- **Resolution scale** (first version): 0.5x to 2x of the size the game draws at. Not every effect follows it.
+- **Mods** (first version): hold the cover, **Game** tab, **Mods**. Install a mod from a folder or a zip. It is on
+  from the game's next start, and each mod has a switch and a delete button. A mod that changes the game's code gets
+  a build with mods, which starts by itself (it waits while another build runs). Until that build is ready, the game
+  starts without that mod. After a failed build, tap **Build with mods** to try again.
+- **Saves**: back up, restore, import and **Delete save data** on the game's **Saves** tab.
+
+A game can also be built on a computer and pushed to the device: see [BUILDER.md](peanuts/docs/BUILDER.md). The builder is tested
+on macOS and Linux. Windows is written but not tested yet.
 
 ## Companions
 
@@ -95,6 +117,8 @@ from a game, and point other players to their own dump instead.
 
 **Does the companion slow the game down?** Very little. The games above hold their frame rate with the companion
 running.
+
+More questions and troubleshooting: [FAQ.md](peanuts/docs/FAQ.md).
 
 ## Contributing
 

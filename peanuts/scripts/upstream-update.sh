@@ -6,7 +6,7 @@
 #
 # `--check`: run only the hunk-marker check, against the CURRENT branch (no fetch-and-rebase, no
 # working-tree-clean requirement), and exit non-zero on failure. This lets the check run now,
-# mid-development, or from a pre-commit hook -- CRITIQUE-phase2a.md D-1: previously it only ran
+# mid-development, or from a pre-commit hook -- found in review: previously it only ran
 # after a rebase had already rewritten history, which is too late to catch anything before it's
 # baked into the overlay branch.
 #
@@ -70,7 +70,7 @@ dm/gfx/tools/split_pool.py|dm/gfx/tools/ue_ondevice.py)
 # is deliberately left UNMARKED (today: the two shader-digest files whose bytes feed
 # DMSH_VK_CHAIN, where even a comment forces re-translating every installed library -- see
 # peanuts/UPSTREAM-EDITS.md's "Shader-chain exceptions" table, which this allow-list mirrors).
-# CRITIQUE-phase2a.md D-1: the old script had these two files hardcoded as if `is_peanuts_owned`
+# Found in review: the old script had these two files hardcoded as if `is_peanuts_owned`
 # applied to them, with no actual exception mechanism, so the hunk check failed on every run.
 is_allowlisted() {
     f="$1"
@@ -86,7 +86,7 @@ allowlist_reason() {
 # PEANUTS marker, OR fall inside a `PEANUTS begin` / `PEANUTS end` span in the file as it stands
 # at $branch. A file-level "grep PEANUTS anywhere in the file" check (the old behaviour) passes a
 # file that has one marked hook plus a second, unmarked hunk dropped in by mistake -- exactly the
-# gap CRITIQUE-phase1.md F1/F2 found. The span support (CRITIQUE-phase2a.md D-1) covers the case
+# gap a review found. The span support (found in review) covers the case
 # a single trailing "see above" comment doesn't sit inside every hunk's own line window when
 # several hunks share one explanation.
 check_hunks_marked() {

@@ -10,6 +10,8 @@ program_id	010055D009F78000
 
 # ---- App ----
 name	Fire Emblem: Three Houses
+# PEANUTS: handheld: the game renders at 1280x720 instead of 1920x1080; on the AYN Thor (Adreno 740) its 1080p frame took about 17.4 ms of GPU time (47-54 fps), handheld holds close to 60 (2026-11-14)
+op_mode	handheld
 ipa	FireEmblemThreeHouses.ipa
 app_category	public.app-category.role-playing-games
 # camera on the right stick in the monastery and in battle

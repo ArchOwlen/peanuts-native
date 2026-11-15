@@ -2,8 +2,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Ideas and game requests are welcome. Supported games are listed on the [main page](https://github.com/moceure/BananaNative).
-        **No game files, keys, firmware or links to them**: don't share them, offer them or ask where to get them. Banana Native works with your own dump of a game you own. Posts that break this are edited or removed ([rules](https://github.com/moceure/BananaNative/discussions/23)).
+        Ideas and game requests are welcome. Supported games are listed on the [main page](https://github.com/igawa6/peanuts-native).
+        **No game files, keys, firmware or links to them**: don't share them, offer them or ask where to get them. Peanuts Native works with your own dump of a game you own. Posts that break this are edited or removed.
   - type: textarea
     id: body
     attributes:

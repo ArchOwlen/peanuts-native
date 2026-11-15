@@ -82,6 +82,10 @@ final class Prefs {
     static void padMap(Context c, String titleId, String spec) { put(c, gameKey("pad_map", titleId), spec); }
 
     /** Game settings › Display (per game): false = Fit (keep aspect, letterboxed; the default), true = Stretch to screen (DM_VK_STRETCH=1: the picture fills the display) */
+    /** Settings › Screen rotation: false = Landscape (the default: the game window is locked to landscape on a phone), true = Automatic (no orientation request, the window follows the display, portrait too) */
+    static final String[] ROTATION_NAMES = {"Landscape", "Automatic"};
+    static boolean rotationAuto(Context c) { return of(c).getBoolean("rotation_auto", false); }
+    static void rotationAuto(Context c, boolean on) { of(c).edit().putBoolean("rotation_auto", on).commit(); }
     static final String[] DISPLAY_NAMES = {"Fit (keep aspect)", "Stretch to screen"};
     static boolean stretch(Context c, String titleId) { return of(c).getBoolean(gameKey("stretch", titleId), false); }
     static void stretch(Context c, String titleId, boolean on) { of(c).edit().putBoolean(gameKey("stretch", titleId), on).commit(); }
@@ -143,10 +147,11 @@ final class Prefs {
     /** The recommended frame rate cap as the launcher stores it (Recommend.cap), null for none */
     static Integer recCap(Context c, String titleId) { return Recommend.cap(rec(c, titleId, Recommend.FPS_CAP), limited(titleId)); }
     /** Game settings › Reset to defaults: every choice of the game's own back to the main screen's default (Extra environment's lines stay) */
-    static final String[] GAME_SETTINGS = {"window", "fps_cap", "gpu_driver", "gpu_ts", "pause_return", "ndsr_choice2", "ndsr_sharp", "drs2", "ram_saver", "decouple", "hold60", "full_vegetation", "gsr2_clarity", "dlss_sharp", "dlss_mode", "scene_res", "res_preset", "aspect"};
+    static final String[] GAME_SETTINGS = {"window", "render_pct", "gfx_quality", "fps_cap", "gpu_driver", "gpu_ts", "pause_return", "ndsr_choice2", "ndsr_sharp", "drs2", "ram_saver", "decouple", "hold60", "full_vegetation", "gsr2_clarity", "dlss_sharp", "dlss_mode", "scene_res", "res_preset", "aspect", "console_mode", "res_scale"};   // PEANUTS: console_mode (ScreenMode), res_scale (ResScale)
     static void resetGame(Context c, String titleId) {
         SharedPreferences.Editor e = of(c).edit();
         for (String k : GAME_SETTINGS) e.remove(gameKey(k, titleId));
+        e.remove(gameKey("lp_mode", titleId));   // Turn Link Play off, retaining the saved host and room for next time.
         Profile p = Profile.of(titleId);
         if (p != null) {
             for (Profile.Option opt : p.options) e.remove(gameKey("opt_" + opt.env, titleId));
@@ -331,10 +336,18 @@ final class Prefs {
         java.util.List<ResPresets.Preset> ps = ResPresets.presets(p);
         if (ps.isEmpty()) return "";
         boolean legacy = ownWindow(c, titleId) || of(c).contains("window") || !sceneRes(c, titleId).isEmpty();
-        String stored = resPreset(c, titleId), r = rec(c, titleId, Recommend.RES_PRESET);
+        String stored = ResPresets.mapStored(ps, p.presetFrom, resPreset(c, titleId)), r = rec(c, titleId, Recommend.RES_PRESET);
         if (stored.isEmpty() && !ownResolution(c, titleId) && ResPresets.of(ps, r) != null) stored = r;   // nothing of the game's own: the recommended preset, before the main screen's window
         return ResPresets.current(ps, p, SceneRes.presets(p), stored, legacy, gameWindow(c, titleId), sceneRes(c, titleId));
     }
+    /**
+     * Tester rows (Settings › Help › Tester settings, off by default): the launcher rows that only testers need. For a game with Resolution presets they are the Advanced choice with
+     * its Window and 3D scene rows, the Upscaler and the Dynamic resolution slider (simpleRes); a player sees Resolution's presets alone. What is stored keeps applying either way
+     */
+    static boolean testerRows(Context c) { return of(c).getBoolean("tester_rows", false); }
+    static void testerRows(Context c, boolean on) { of(c).edit().putBoolean("tester_rows", on).commit(); }
+    /** Whether a game shows the simple Resolution only: its profile has Resolution presets and the tester rows are off */
+    static boolean simpleRes(Context c, String titleId) { return !testerRows(c) && !ResPresets.presets(Profile.of(titleId)).isEmpty(); }
     /** Whether the player chose this game's Resolution: a preset or Advanced, or (from before the presets) its own window or 3D scene */
     static boolean ownResolution(Context c, String titleId) {
         return !resPreset(c, titleId).isEmpty() || ownWindow(c, titleId) || !sceneRes(c, titleId).isEmpty();
@@ -347,6 +360,26 @@ final class Prefs {
     static String startScene(Context c, String titleId) {
         java.util.List<ResPresets.Preset> ps = ResPresets.presets(Profile.of(titleId));
         return ps.isEmpty() ? sceneRes(c, titleId) : ResPresets.scene(ps, resolutionChoice(c, titleId), sceneRes(c, titleId));
+    }
+
+    /**
+     * Resolution, Upscaling quality and Graphics quality of a game whose profile has a render_cfg row (Profile.renderCfg): the output in "window" (the Game resolution key, so
+     * an older choice carries over), the render scale in "render_pct" and the graphics quality in "gfx_quality" (1 quality, 0 performance), each per game. Read through
+     * Profile.renderSetting (the lazy migration of an older Game resolution value); a pick writes all three
+     */
+    static Profile.Render render(Context c, Profile p, String titleId) {
+        return p.renderSetting(gameWindow(c, titleId), of(c).getInt(gameKey("render_pct", titleId), -1), of(c).getInt(gameKey("gfx_quality", titleId), -1));
+    }
+    static void render(Context c, String titleId, Profile.Render r) {
+        of(c).edit().putString(gameKey("window", titleId), r.out).putInt(gameKey("render_pct", titleId), r.pct).putInt(gameKey("gfx_quality", titleId), r.quality ? 1 : 0).commit();
+    }
+    /** The device class of the host's render target pool choice (vka_low_ram: MemTotal 12 GiB or less; ActivityManager's totalMem is MemTotal) */
+    static boolean lowRam(Context c) {
+        android.app.ActivityManager am = (android.app.ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
+        if (am == null) return true;
+        android.app.ActivityManager.MemoryInfo m = new android.app.ActivityManager.MemoryInfo();
+        am.getMemoryInfo(m);
+        return m.totalMem <= (12L << 30);
     }
 
     /**
@@ -496,10 +529,14 @@ final class Prefs {
 
     /** The build identifier alone (Signer.buildId): "launcher-2@4a15067", "0.1 · 6a6448d". Home shows it under its title (the build tag would not fit a phone's width) */
     static String buildId() {
+        if (!BuildConfig.NX_PEANUTS_ID.isEmpty()) return BuildConfig.NX_PEANUTS_ID;   // PEANUTS: "peanuts-native-0.1.1" (release), "peanuts-native-0.1.1-dev" (any other build): build.gradle nxPeanutsId
         return Signer.buildId(BuildConfig.NX_PLAY, BuildConfig.VERSION_NAME, BuildConfig.NX_COMMIT, BuildConfig.NX_DIRTY, BuildConfig.NX_BRANCH);
     }
 
-    private static String buildTag() { return Signer.buildTag(BuildConfig.NX_PLAY, buildId()); }
+    private static String buildTag() {
+        if (!BuildConfig.NX_PEANUTS_ID.isEmpty()) return BuildConfig.NX_PEANUTS_ID;   // PEANUTS: the identifier is the whole tag (it names the app)
+        return Signer.buildTag(BuildConfig.NX_PLAY, buildId());
+    }
 
     /** Game settings › Aspect ratio, for a game whose profile has a variant labelled w:h (Profile.aspectVariant; a native 4:3 mod): the label chosen ("4:3"), null = as
      *  shipped (16:9). GameActivity passes DM_PATCH_VARIANT=<variant> and DM_VK_PICTURE_ASPECT=<label>; the pack holds both versions (pack_android.py rewrite_variants) */

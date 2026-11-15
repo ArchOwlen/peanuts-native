@@ -44,6 +44,7 @@ typedef struct {
     _Atomic uint64_t cb_n;             // device callbacks of this output (the watchdog's evidence that the device still plays it)
     uint64_t wd_n, wd_t;               // watchdog: callback count last seen and when it last moved (under g_aos_lock)
     int stalled, retry_ms; uint64_t retry_at;   // the device stopped calling back (or would not start): the silent sink stands in and the watchdog retries the AudioUnit at retry_at, backing off
+    int host_out;                      // PEANUTS: the in-process audio renderer's output (dm_pcmout_open): no feeder ring by default (aa_open)
 } aout;
 
 // Registry of open outputs: suspended / resumed all at once by the front-end lifecycle (going to background).
@@ -92,13 +93,14 @@ static void *event_notify(void *p) {
 }
 
 // Take n bytes from the pending queue and hand them to the output side; once a whole block has played, move it to released and notify the ordinary thread.
-static void pull(aout *a, uint8_t *dst, uint64_t n) {
+static uint64_t pull_x(aout *a, uint8_t *dst, uint64_t n, int pad) {   // PEANUTS: pad 0 (the feeder thread, aa_feeder) takes what is queued, counts and pads nothing, and returns the bytes it took; pad 1 is the callback's
     int released = 0;
-    int16_t *s16 = (int16_t *)dst; uint64_t ns = n / 2;
+    int16_t *s16 = (int16_t *)dst; const uint64_t n0 = n;
     uint32_t qh = atomic_load_explicit(&a->q_head, memory_order_relaxed);
     while (n) {
         uint32_t qt = atomic_load_explicit(&a->q_tail, memory_order_acquire);
         if (qh == qt || atomic_load_explicit(&a->state, memory_order_acquire) != STATE_STARTED) {
+            if (!pad) break;   // PEANUTS
             if (qh == qt && atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED) { atomic_fetch_add(&a->under_n, 1); atomic_fetch_add(&a->under_b, n); }
             memset(dst, 0, n); break; }
         gbuf *b = a->q[qh & (QMAX - 1)];
@@ -116,6 +118,7 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
             a->pos = 0; released = 1;
         }
     }
+    uint64_t ns = (n0 - (pad ? 0 : n)) / 2;   // PEANUTS: the samples taken (all n0 when padded)
     uint32_t vb = atomic_load_explicit(&a->vol, memory_order_relaxed);
     if (vb != 0x3f800000u) {   // the output's volume (SetAudioOutVolume), as the audout session applies it to the PCM16 it plays; saturating
         float v; memcpy(&v, &vb, 4);
@@ -125,20 +128,23 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
         if (a->event) notify_release(a);   // the notify thread only signals the guest's event: outputs without one (the host's renderer output, games that poll) need no wake-up
         if (a->rel_sem) plat_sem_signal(a->rel_sem);
     }
+    return pad ? n0 : n0 - n;   // PEANUTS
 }
 
 // A six-channel output (front-left front-right center LFE back-left back-right) goes to the device as stereo, downmixed here with the audio renderer's default Q15 coefficients (hle_audren.c):
 // Core Audio's own 6 → 2 mapping keeps only the front pair, so voices on the center (Luigi's Mansion 3) and the back channels were silent. The queue still takes all six guest channels,
 // in blocks through a stack buffer (no allocation in the real-time callback)
+static void pull(aout *a, uint8_t *dst, uint64_t n) { pull_x(a, dst, n, 1); }   // PEANUTS
 static int device_channels(const aout *a) { return a->ch == 6 ? 2 : a->ch; }
-static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
-    if (a->ch != 6) { pull(a, dst, bytes); return; }
+static uint64_t pull_device_x(aout *a, uint8_t *dst, uint64_t bytes, int pad) {   // PEANUTS: pad as pull_x; returns the device bytes made (whole frames)
+    if (a->ch != 6) return pull_x(a, dst, bytes, pad);
     enum { BLOCK = 128, CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
     int16_t scratch[BLOCK * 6], *out = (int16_t *)dst;
-    uint64_t frames = bytes / (2 * sizeof *out);
+    uint64_t frames = bytes / (2 * sizeof *out), done = 0;
     while (frames) {
         uint64_t n = frames < BLOCK ? frames : BLOCK;
-        pull(a, (uint8_t *)scratch, n * 6 * sizeof *scratch);
+        uint64_t got = pull_x(a, (uint8_t *)scratch, n * 6 * sizeof *scratch, pad) / (6 * sizeof *scratch);   // PEANUTS: frames taken
+        const int short_ = got < n; n = got;   // fewer than asked: nothing more is queued (pad 0), these are the last frames made
         for (uint64_t i = 0; i < n; i++) {
             const int16_t *p = scratch + 6 * i;
             int64_t c = (int64_t)p[2] * CC + (int64_t)p[3] * CL;
@@ -147,9 +153,12 @@ static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
             *out++ = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
             *out++ = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
         }
-        frames -= n;
+        frames -= n; done += n;
+        if (short_) break;
     }
+    return done * 2 * sizeof *out;
 }
+static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) { pull_device_x(a, dst, bytes, 1); }   // PEANUTS
 
 static _Atomic uint64_t g_render_calls;   // Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
 uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
@@ -252,7 +261,55 @@ static void au_teardown(au_t au) { AudioUnitUninitialize(au); AudioComponentInst
 // pulls exactly the frames it is asked for, as au_render does. The buffer is two bursts, at least 5 ms (the Mac's request; DM_DBG_AU_FRAMES=N asks N frames). A device that will
 // not open at 48 kHz gets a stream at its own rate and the linear resampler of av_android.h. A stream that is disconnected (headphones out, a Bluetooth route change) stops calling
 // back: the watchdog's silent sink takes over, and the next start opens a new stream on the current route; nxhost_audio_route_changed (dm_audio_reset) does it at once
-struct aa_out { AAudioStream *s; aout *a; int rate, ch; nx_rs rs; int16_t *scratch; uint32_t scratch_frames; _Atomic int lost; };
+// PEANUTS: a stream that is not low latency calls back for a whole burst at once (960 frames, 20 ms on the Thor), and a game that keeps about three small blocks queued (Octopath Traveler 0's
+// six-channel output: 2.9 blocks of 5 ms) has less than that queued at the callback: 2,500 underruns per 2,000 callbacks at a steady 60 fps, 11 % of the stream zero-padded, while the game's
+// other, two-channel output (blocks of 21 ms) had none. A feeder thread takes the game's blocks at the pace the sound card plays them, 1.5 ms looks, into a ring of downmixed frames holding
+// one burst and 5 ms (aa_feeder); the callback plays from the ring, so it comes up short only when the game itself has nothing queued. A low-latency stream (a burst under 10 ms) is left
+// as it was, and DM_AUDIO_FEED=0 / 1 turns the ring off / on for any stream
+enum { FEED_RING = 8192, FEED_MIN_BURST = 480, FEED_CHUNK = 240, FEED_MAXCH = 8 };
+struct aa_out { AAudioStream *s; aout *a; int rate, ch; nx_rs rs; int16_t *scratch; uint32_t scratch_frames; _Atomic int lost;
+                int16_t *ring; uint32_t target; _Atomic uint32_t rh, rt; pthread_t ft; _Atomic int frun; int fon; };   // the ring, in frames of 48 kHz at the device's channels
+static void *aa_feeder(void *p) {
+    struct aa_out *o = p; aout *a = o->a; int16_t tmp[FEED_CHUNK * FEED_MAXCH];
+    dm_host_helper_qos(PLAT_QOS_USER_INTERACTIVE);
+    while (atomic_load_explicit(&o->frun, memory_order_acquire)) {
+        uint32_t rt = atomic_load_explicit(&o->rt, memory_order_relaxed), rh = atomic_load_explicit(&o->rh, memory_order_acquire), fill = rt - rh;
+        if (fill < o->target) {
+            uint32_t n = o->target - fill; if (n > FEED_CHUNK) n = FEED_CHUNK;
+            n = (uint32_t)(pull_device_x(a, (uint8_t *)tmp, (uint64_t)n * 2 * o->ch, 0) / (2u * o->ch));   // what the game has queued, no silence
+            if (!n) { usleep(1500); continue; }
+            for (uint32_t i = 0; i < n; i++) memcpy(o->ring + (size_t)((rt + i) & (FEED_RING - 1)) * o->ch, tmp + (size_t)i * o->ch, 2u * o->ch);
+            atomic_store_explicit(&o->rt, rt + n, memory_order_release);
+            if (fill + n < o->target) { usleep(500); continue; }   // the queue gave less than asked: look again soon
+        }
+        usleep(1500);
+    }
+    return NULL;
+}
+static void aa_feed_start(struct aa_out *o) {
+    if (!o->ring || o->fon) return;
+    atomic_store(&o->rh, 0); atomic_store(&o->rt, 0); atomic_store(&o->frun, 1);
+    if (pthread_create(&o->ft, NULL, aa_feeder, o)) { atomic_store(&o->frun, 0); return; }
+    o->fon = 1;
+    for (int i = 0; i < 30 && atomic_load(&o->rt) < o->target; i++) usleep(1000);   // the ring is full, or the game has nothing queued, when the stream starts
+}
+static void aa_feed_stop(struct aa_out *o) {
+    if (!o->fon) return;
+    atomic_store(&o->frun, 0); pthread_join(o->ft, NULL); o->fon = 0;
+}
+// What the callback plays: frames of the ring, then silence, counted as an underrun as pull() counts one
+static void aa_take(struct aa_out *o, uint8_t *dst, uint64_t frames) {
+    aout *a = o->a;
+    if (!o->fon) { pull_device(a, dst, frames * 2 * o->ch); return; }
+    uint32_t rh = atomic_load_explicit(&o->rh, memory_order_relaxed), rt = atomic_load_explicit(&o->rt, memory_order_acquire), n = rt - rh;
+    if (n > frames) n = (uint32_t)frames;
+    for (uint32_t i = 0; i < n; i++) memcpy(dst + (size_t)i * 2 * o->ch, o->ring + (size_t)((rh + i) & (FEED_RING - 1)) * o->ch, 2u * o->ch);
+    atomic_store_explicit(&o->rh, rh + n, memory_order_release);
+    if (n < frames) {
+        memset(dst + (size_t)n * 2 * o->ch, 0, (size_t)(frames - n) * 2 * o->ch);
+        if (atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED) { atomic_fetch_add(&a->under_n, 1); atomic_fetch_add(&a->under_b, (frames - n) * 2 * (uint64_t)a->ch); }
+    }
+}
 static aaudio_data_callback_result_t aa_render(AAudioStream *s, void *ctx, void *data, int32_t frames) {
     (void)s; struct aa_out *o = ctx; aout *a = o->a;
     atomic_fetch_add_explicit(&g_render_calls, 1, memory_order_relaxed); atomic_fetch_add_explicit(&a->cb_n, 1, memory_order_relaxed);
@@ -267,13 +324,13 @@ static aaudio_data_callback_result_t aa_render(AAudioStream *s, void *ctx, void 
             a->st_fmin = ~0u; a->st_fmax = 0; a->st_qsum = a->st_count = 0; a->st_u0 = un; a->st_ub0 = ubb;
         } }
     uint64_t fb = 2u * (uint64_t)o->ch;
-    if (o->rate == RATE) pull_device(a, data, (uint64_t)frames * fb);
+    if (o->rate == RATE) aa_take(o, data, (uint64_t)frames);   // PEANUTS: from the ring (was pull_device)
     else {
         int16_t *d = data; uint32_t left = (uint32_t)frames;
         while (left) {
             uint32_t n = left, need = rs_need(&o->rs, n);
             while (need > o->scratch_frames && n > 1) { n /= 2; need = rs_need(&o->rs, n); }
-            pull_device(a, (uint8_t *)o->scratch, (uint64_t)need * fb);
+            aa_take(o, (uint8_t *)o->scratch, (uint64_t)need);   // PEANUTS: from the ring (was pull_device)
             rs_run(&o->rs, o->scratch, need, d, n);
             d += (size_t)n * o->ch; left -= n;
         }
@@ -290,6 +347,7 @@ static void aa_error(AAudioStream *s, void *ctx, aaudio_result_t err) {
 static void aa_close(struct aa_out *o) {
     if (o->s) { AAudioStream_close(o->s); o->s = NULL; }
     free(o->scratch); o->scratch = NULL; o->scratch_frames = 0;
+    aa_feed_stop(o); free(o->ring); o->ring = NULL;   // PEANUTS
 }
 static aaudio_result_t aa_try(struct aa_out *o, int rate) {
     AAudioStreamBuilder *b = NULL; aaudio_result_t r = AAudio_createStreamBuilder(&b);
@@ -323,6 +381,11 @@ static aaudio_result_t aa_open(struct aa_out *o) {
         if (!o->scratch) { aa_close(o); atomic_store(&o->lost, 1); return AAUDIO_ERROR_NO_MEMORY; }
     }
     int32_t burst = AAudioStream_getFramesPerBurst(o->s), want = 4 * burst;
+    {   // PEANUTS: the ring (see struct aa_out)
+        const char *fe = getenv("DM_AUDIO_FEED"); int feed = fe ? atoi(fe) != 0 : !o->a->host_out && burst >= (int32_t)((int64_t)FEED_MIN_BURST * o->rate / RATE);
+        // (not the audio renderer's own output by default: games pace on its consumption, and Metroid Dread's cutscenes stalled behind the ring, 2026-11-14)
+        if (feed && o->ch <= FEED_MAXCH && (o->ring = malloc((size_t)FEED_RING * 2 * o->ch))) o->target = (uint32_t)((int64_t)burst * RATE / o->rate) + RATE / 200;
+    }
     if (want < o->rate / 100) want = o->rate / 100;
     const char *e = getenv("DM_DBG_AU_FRAMES"); if (e && atoi(e) > 0) want = atoi(e);
     int32_t got = AAudioStream_setBufferSizeInFrames(o->s, want);
@@ -340,18 +403,20 @@ static au_status_t au_create(aout *a) {
 static au_status_t au_start(au_t o) {
     if (!o) return -1;
     if (atomic_load(&o->lost) || !o->s || AAudioStream_getState(o->s) == AAUDIO_STREAM_STATE_DISCONNECTED) { aaudio_result_t r = aa_open(o); if (r != AAUDIO_OK) return r; }
+    aa_feed_start(o);   // PEANUTS
     aaudio_result_t r = AAudioStream_requestStart(o->s);
-    if (r != AAUDIO_OK) atomic_store(&o->lost, 1);
+    if (r != AAUDIO_OK) { atomic_store(&o->lost, 1); aa_feed_stop(o); }   // PEANUTS: feeder stopped (the silent sink takes the queue)
     return r;
 }
 // Synchronous, as AudioOutputUnitStop: when it returns no callback runs, so the silent sink can take the queue over (it has one consumer)
 static void au_stop(au_t o) {
     if (!o || !o->s) return;
-    if (AAudioStream_requestStop(o->s) != AAUDIO_OK) { atomic_store(&o->lost, 1); return; }
+    if (AAudioStream_requestStop(o->s) != AAUDIO_OK) { atomic_store(&o->lost, 1); aa_feed_stop(o); return; }   // PEANUTS: feeder stopped, one consumer of the queue at a time
     aaudio_stream_state_t st = AAudioStream_getState(o->s);
     for (int i = 0; i < 20 && st != AAUDIO_STREAM_STATE_STOPPED && st != AAUDIO_STREAM_STATE_DISCONNECTED && st != AAUDIO_STREAM_STATE_CLOSED; i++)
         if (AAudioStream_waitForStateChange(o->s, st, &st, 50000000) != AAUDIO_OK) break;
     if (st != AAUDIO_STREAM_STATE_STOPPED) { LOG("[RED] audio #%d: the AAudio stream did not stop (state %s): closing it", o->a->id, AAudio_convertStreamStateToText(st)); aa_close(o); atomic_store(&o->lost, 1); }
+    aa_feed_stop(o);   // PEANUTS: after the last callback
 }
 static void au_dispose(au_t o) { if (o) { aa_close(o); free(o); } }
 static void au_teardown(au_t o) { au_dispose(o); }
@@ -497,6 +562,7 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     if (rate && rate != RATE) die("AudioOut sample rate %d not supported (48 kHz only)", rate);
     aout *a = calloc(1, sizeof *a);
     pthread_mutex_init(&a->m, NULL); a->event = ev; a->ch = ch;
+    a->host_out = !lr && name && !strcmp(name, "AudioRenderer");   // PEANUTS: (aa_open's feeder ring default)
     atomic_init(&a->state, STATE_STOPPED); atomic_init(&a->vol, 0x3f800000u);
     atomic_init(&a->q_head, 0); atomic_init(&a->q_tail, 0);
     atomic_init(&a->rel_head, 0); atomic_init(&a->rel_tail, 0);

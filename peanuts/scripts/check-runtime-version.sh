@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build-time check for the assumption dev.peanuts.Installer hard-codes: RUNTIME_VERSION must equal dm/peanuts/rt/mods/mod_runtime.h's
 # DualScreenRuntimeVersion. No Java binding for that C++ constant exists (one would need new JNI surface, out of Installer.java's scope - see
-# dm/peanuts/peanuts.c's own PEANUTS touch point, rt_find_package only), so the two are kept in sync by hand. CRITIQUE-phase2b.md B "nice to have":
+# dm/peanuts/peanuts.c's own PEANUTS touch point, rt_find_package only), so the two are kept in sync by hand. A "nice to have" from review:
 # this script replaces copying the number by eye - it greps both sides and fails if they ever drift, at build time rather than after a runtime lift
 # ships with a stale refusal threshold (every package above the OLD number would wrongly be refused, or below the NEW one wrongly accepted).
 #

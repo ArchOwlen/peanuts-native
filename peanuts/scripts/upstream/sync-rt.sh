@@ -3,7 +3,7 @@
 # dm/peanuts/rt/PORT.md's documented lift procedure. NEVER writes into the worktree -- only
 # into a scratch dir, and only with --apply.
 #
-# CRITIQUE-phase1.md UPSTREAM §2 must-fix #6: the original draft compared against ~/eden's
+# Found in review: the original draft compared against ~/eden's
 # current HEAD. ~/eden is a shared working tree (feedback_shared_eden_build_sessions) that other
 # sessions check out to whatever they're working on -- it is very often NOT at the pinned tag,
 # and `git describe --tags` never equals the bare tag name exactly (it appends -N-g<sha> once

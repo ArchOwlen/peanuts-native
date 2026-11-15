@@ -15,13 +15,13 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * The companion's version history (UX-SPEC.md package 6, CRITIQUE-phase1.md's must-fix: the same GitHub Releases catalog as today, every release kept instead of
+ * The companion's version history (the same GitHub Releases catalog as today, every release kept instead of
  * only the newest). A Banana sheet (PUi.sheet) of every release Catalog knows for the game's title, newest first: date, release notes, size, whether it is
  * verified (dev.peanuts.Installer's sha256 check against the release's digest or a "&lt;asset&gt;.sha256" sibling - a release with neither is refused outright,
  * never installed as "unverified"), and which one is installed. Install / Switch to / Roll back per row - a version already on this device
  * (Installer.localVersions) switches instantly with no re-download, matching Eden Duo's companion manager. Entry point: {@link #open}, called with just the
  * title ID (GameSheet's "Versions" row); the game's name and companion root are found the same way {@link Library} does (a library scan, briefly cached - see
- * {@link #load}), off a worker thread - nothing here touches disk or the network on the main thread (AUDIT.md #6, CRITIQUE-phase2a.md §B).
+ * {@link #load}), off a worker thread - nothing here touches disk or the network on the main thread (found in review).
  */
 public final class CompanionVersions {
     private final Activity act;
@@ -45,7 +45,7 @@ public final class CompanionVersions {
 
     private boolean busy;
     private String busyText = "";
-    private long lastProgressRenderAt;   // throttles a download/verify's progress re-renders to ~4 Hz (CRITIQUE-phase2a.md §B)
+    private long lastProgressRenderAt;   // throttles a download/verify's progress re-renders to ~4 Hz (found in review)
 
     private CompanionVersions(Activity act, String titleId, Runnable onClose) { this.act = act; this.titleId = titleId; this.onClose = onClose; }
 
@@ -54,7 +54,7 @@ public final class CompanionVersions {
 
     /** As above, plus onClose: called when the sheet is dismissed, so a caller with its own installed-state cache (CompanionSection's installedKnown,
      * CatalogActivity's render()) can invalidate it and redraw - a switch made in here otherwise leaves that caller showing a stale version until something
-     * else happens to refresh it (CRITIQUE-phase2a.md §B, should-fix). */
+     * else happens to refresh it (found in review). */
     public static void open(Activity act, String titleId, Runnable onClose) {
         CompanionVersions s = new CompanionVersions(act, titleId, onClose);
         s.show();
@@ -71,8 +71,8 @@ public final class CompanionVersions {
     }
 
     // ---- A short-lived cache of the last library scan, so reopening this sheet (or opening it for a second title right after) doesn't always re-walk the
-    // whole game folder just to find one companionRoot (CRITIQUE-phase2a.md §B, should-fix; a real fix needs Library's own cache, which is another agent's
-    // file - see IMPL-B.md) ----
+    // whole game folder just to find one companionRoot (found in review; a real fix needs Library's own cache, which is outside this
+    // file) ----
     private static List<LibraryScanner.Title> titleCache;
     private static long titleCacheAt;
     private static final long TITLE_CACHE_TTL = 15_000;
@@ -95,7 +95,7 @@ public final class CompanionVersions {
                 buildId = runningBuildId(titleId);
                 String[] errOut = new String[1];
                 Map<String, List<CompanionPort.Item>> all = CompanionPort.fetchVersions(errOut);
-                err = errOut[0];   // CRITIQUE-phase2a.md §B: surfaced, not swallowed into a misleading empty "No companion" state
+                err = errOut[0];   // Found in review: surfaced, not swallowed into a misleading empty "No companion" state
                 v = CompanionPort.forTitle(all, titleId);
                 if (!v.isEmpty()) {
                     pkg = v.get(0).packageName;
@@ -107,7 +107,7 @@ public final class CompanionVersions {
                     v = filtered;
                 }
                 if (pkg != null && r != null) {
-                    CompanionPort.repair(r, pkg, act);   // self-heal a half-done swap before reading any state, not only before the next install/switch; ctx = act so this skips while the game is running (the lock alone does not cover that - CRITIQUE-phase2d.md B-2)
+                    CompanionPort.repair(r, pkg, act);   // self-heal a half-done swap before reading any state, not only before the next install/switch; ctx = act so this skips while the game is running (the lock alone does not cover that; found in review)
                     lv = CompanionPort.localVersions(r, pkg);
                     active = CompanionPort.installedVersion(r, pkg);
                     if ("?".equals(active)) active = null;   // a package.json with no installed.json: not a version this sheet can act on
@@ -143,7 +143,7 @@ public final class CompanionVersions {
         return null;
     }
 
-    /** Re-reads only the installed/local state after an install/switch/forget finishes - never on a progress tick (AUDIT.md #6's fix, applied here too) */
+    /** Re-reads only the installed/local state after an install/switch/forget finishes - never on a progress tick (the same fix as the settings section's cache) */
     private void refreshLocalState() {
         if (packageName == null || root == null) return;
         localVersions = CompanionPort.localVersions(root, packageName);
@@ -183,7 +183,7 @@ public final class CompanionVersions {
         if (!notes.isEmpty()) value.append("\n").append(notes);
         PUi.Setting s = new PUi.Setting(act, "🖥️", item.version + (isActive ? " · installed" : ""), notes.isEmpty() ? null : v -> showNotes(item));
         s.value(value.toString());
-        boolean installable = isLocal || (item.sha256 != null || item.sha256Url != null);   // CRITIQUE-phase2a.md §B: a digest-less release is refused by Installer anyway; grey it out here too rather than let the user hit the error
+        boolean installable = isLocal || (item.sha256 != null || item.sha256Url != null);   // Found in review: a digest-less release is refused by Installer anyway; grey it out here too rather than let the user hit the error
         if (!isActive) {
             String label = activeVersion == null ? "Install" : isOlderThanActive(item.version) ? "Roll back" : "Switch to";
             PUi.Kind kind = !isLocal ? PUi.Kind.PRIMARY : PUi.Kind.TONAL;
@@ -224,13 +224,13 @@ public final class CompanionVersions {
         new Thread(() -> {
             String err = null; String warning = null;
             try {
-                // ctx = act (CRITIQUE-phase2c.md §B, should-fix): refuses with "close the game first" if this app's own ":game" process is alive -
+                // ctx = act (found in review): refuses with "close the game first" if this app's own ":game" process is alive -
                 // swapping the active folder out from under a host that has it open breaks anything it loads lazily by path afterwards.
                 if (isLocal) warning = CompanionPort.activateLocalVersion(root, packageName, item.version, knownBuildId, act);
                 else warning = CompanionPort.install(item, root, act.getCacheDir(), (what, done, total) -> {
                     long now = System.currentTimeMillis();
                     boolean last = total > 0 && done >= total;
-                    if (!last && now - lastProgressRenderAt < 250) return;   // CRITIQUE-phase2a.md §B: throttle to ~4 Hz, not every single chunk
+                    if (!last && now - lastProgressRenderAt < 250) return;   // Found in review: throttle to ~4 Hz, not every single chunk
                     lastProgressRenderAt = now;
                     main.post(() -> { busyText = (what.equals("download") ? "Downloading " : what.equals("verify") ? "Verifying " : "Installing ") + item.version + (total > 0 ? " " + (done * 100 / total) + " %" : "") + "…"; render(); });
                 }, knownBuildId, act);
@@ -240,6 +240,7 @@ public final class CompanionVersions {
                 if (act.isFinishing() || act.isDestroyed()) { busy = false; return; }   // the screen closed during the work: no dialog on a gone window
                 busy = false;
                 refreshLocalState();
+                Haptics.play(act.getWindow().getDecorView(), ferr != null ? Haptics.Word.REJECT : Haptics.Word.CLICK);   // the install or switch ended: refused, or done
                 if (ferr != null) Toast.makeText(act, "Failed: " + ferr, Toast.LENGTH_LONG).show();
                 else if (fwarning != null) new AlertDialog.Builder(act).setTitle(item.version + " is active").setMessage(fwarning).setPositiveButton("OK", null).show();
                 else Toast.makeText(act, item.version + " is active. It loads at the game's next start.", Toast.LENGTH_LONG).show();
@@ -252,7 +253,7 @@ public final class CompanionVersions {
         PUi.confirmDanger(act, "Forget " + item.version + "?", "Its files are deleted from this device. It can be downloaded again from the catalog.", "Forget", () -> {
             busy = true; busyText = "Removing " + item.version + "…";
             render();
-            new Thread(() -> {   // CRITIQUE-phase2a.md §B: a recursive delete, off the main thread like every other disk operation here
+            new Thread(() -> {   // Found in review: a recursive delete, off the main thread like every other disk operation here
                 String err = null;
                 try { CompanionPort.forgetLocalVersion(root, packageName, item.version); } catch (IOException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
                 final String ferr = err;
@@ -270,9 +271,9 @@ public final class CompanionVersions {
         PUi.confirmDanger(act, "Remove the companion?", gameName + "'s companion (every version on this device) is deleted. The catalog can install it again. The game and its saves stay.", "Remove", () -> {
             busy = true; busyText = "Removing the companion…";
             render();
-            new Thread(() -> {   // CRITIQUE-phase2a.md §B: off the main thread
+            new Thread(() -> {   // Found in review: off the main thread
                 String err = null;
-                try { CompanionPort.remove(root, packageName, act); } catch (IOException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }   // ctx = act: refuses while the game is running (CRITIQUE-phase2c.md §B)
+                try { CompanionPort.remove(root, packageName, act); } catch (IOException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }   // ctx = act: refuses while the game is running (found in review)
                 final String ferr = err;
                 main.post(() -> {
                     busy = false;

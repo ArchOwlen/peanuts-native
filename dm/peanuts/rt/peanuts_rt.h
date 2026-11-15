@@ -25,6 +25,9 @@ typedef struct PnRtMemory {
     int (*read)(void* user, uint64_t addr, void* buf, size_t len);
     int (*write)(void* user, uint64_t addr, const void* buf, size_t len);
     uint8_t* (*pointer_at)(void* user, uint64_t addr, size_t len);
+    /// Optional: the game's heap, its base and the length the game has opened (0 / 0 until it opens one). Without it a module's
+    /// get_heap_begin is a fixed address of another host, and every read a module makes from the heap's start fails.
+    void (*heap_range)(void* user, uint64_t* base, uint64_t* open_len);
 } PnRtMemory;
 
 /// Optional UI sink: each publish is forwarded as it happens (the host may instead poll
@@ -86,12 +89,29 @@ typedef struct PnRtRomfs {
                 void* cb_user);
 } PnRtRomfs;
 
+/// The host's part in applying a package's load plan to the running game (peanuts_helper.cpp). All zero = no load plans.
+typedef struct PnRtCode {
+    void* user;
+    /// 1 when [addr, addr + len) of main holds an instruction the host's rewriter changed or moved, or when the host cannot tell.
+    int (*code_rewritten)(void* user, uint64_t addr, size_t len);
+    /// The offset of the guest's x18 slot in the block Bionic's TLS_SLOT_APP holds for each guest thread ([tpidr_el0 + 0x10]).
+    uint32_t slot18_offset;
+    /// `size` bytes (a multiple of 16 KiB) of zeroed, writable memory within a branch's reach of all of main's code, which the
+    /// caller may make executable and keeps for the life of the process. 0 when the host has none.
+    uint64_t (*code_block)(void* user, size_t size);
+    /// The length of main's code (text) from its base: a load plan may write only below its 16 KiB page end.
+    uint64_t text_end;
+} PnRtCode;
+
 typedef struct PnRtConfig {
     /// The package directory (contains package.json and dualscreen/). Required.
     const char* package_dir;
     /// The game's romfs extracted to a directory ("romfs:/..." assets). Optional (NULL = none:
     /// such assets are logged as missing and their widgets left blank).
     const char* romfs_dir;
+    /// Optional: the mods' RomFS folders the game reads before its own files (':'-separated, the first wins: the host's DM_ROMFS_OVERLAY).
+    /// They are layered over the game's RomFS for "romfs:", as a module sees LayeredFS mods on the emulator; "base:" stays without them.
+    const char* romfs_overlay_dirs;
     /// R5: a writable per-app data directory. Holds the persisted runtime flags
     /// (<data_dir>/dualscreen/persist), the player's "user:" assets (<data_dir>/dualscreen/user)
     /// and the private staging directory a package's native module is copied to before dlopen
@@ -128,6 +148,8 @@ typedef struct PnRtConfig {
     /// R6, optional: the game's RomFS through callbacks when `romfs_dir` is NULL (see PnRtRomfs).
     /// All fields NULL = none.
     PnRtRomfs romfs;
+    /// Optional: what the host gives for a package's load plan (guest helper); see PnRtCode. All zero = a plan is not applied.
+    PnRtCode helper;
 } PnRtConfig;
 
 /// Creates a runtime for `config`. NULL when the package has no usable manifest for the title

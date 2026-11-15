@@ -74,7 +74,7 @@ public final class RecommendJvmTest {
 
         // Fire Emblem's row (args[1]): Qualcomm's driver before 512.800 (the host's qcom_old) → an installed Turnip; the tested phone's 512.842 is not one
         List<Recommend.Row> fe = Recommend.parse(args[1]);
-        check(fe.size() == 1 && fe.get(0).driverRow(), "Fire Emblem's row: " + args[1]);
+        check(fe.size() == 2 && fe.get(0).driverRow() && !fe.get(1).driverRow(), "Fire Emblem's rows: " + args[1]);
         check(Recommend.driver(fe, honor) == null, "512.842 (" + honor.get("driver.version") + "): no recommendation");
         Map<String, String> thor = new LinkedHashMap<>(honor);
         thor.put("driver.version", String.format("%#x", (512 << 22) | (676 << 12) | 53));
@@ -83,6 +83,11 @@ public final class RecommendJvmTest {
         check(Recommend.driver(fe, thor) == null, "512.800.77: none");
         thor.put("driver.version", String.format("%#x", (512 << 22) | (676 << 12))); thor.put("driver.id", "18");
         check(Recommend.driver(fe, thor) == null, "another driver ID: none");
+        // and its upscaler row (any): FSR 3.1 on every driver the game starts with, the old Qualcomm one included, and before any readiness check; the driver row adds no upscaler
+        Map<String, String> old = new LinkedHashMap<>(honor);
+        old.put("driver.version", String.format("%#x", (512 << 22) | (676 << 12) | 53));
+        for (Map<String, String> f : java.util.Arrays.asList(honor, turnip, old, thor, null, facts()))
+            check(Recommend.values(fe, f).equals(Map.of(Recommend.UPSCALER, "fsr3")) && Recommend.index(Recommend.DLSS_MODES, Recommend.values(fe, f).get(Recommend.UPSCALER)) == 3, "Fire Emblem's upscaler: FSR 3.1 on " + f);
 
         // What is kept of a readiness answer: the facts a match reads, no names
         String kept = Recommend.keep(new String(Files.readAllBytes(Paths.get(args[0])), StandardCharsets.UTF_8));
@@ -133,7 +138,17 @@ public final class RecommendJvmTest {
         List<Recommend.Row> oot = Recommend.parse(args[2]);
         check(Recommend.values(oot, gf).equals(Map.of("res_preset", "performance", "vegetation", "off")), "Ocarina of Time's values from GLES's facts: " + Recommend.values(oot, gf));
         check("system".equals(Recommend.driver(oot, gf)), "Ocarina of Time's driver from GLES's facts: " + Recommend.driver(oot, gf));
-        check(Recommend.values(oot, Readiness.facts("")).isEmpty() && Recommend.driver(oot, Readiness.facts("")) == null, "no facts at all: nothing (the card stays away)");
+        Map<String, String> thorOld = new LinkedHashMap<>(gf);
+        thorOld.put("driver.version", "0x802a4035");
+        check(Recommend.driver(oot, thorOld) == null, "Ocarina of Time: Qualcomm 0x802a4035 (Adreno 740): no system driver");
+        thorOld.put("driver.version", "0x80320040");
+        check("system".equals(Recommend.driver(oot, thorOld)), "Ocarina of Time: Qualcomm 0x80320040: system driver");
+        // top bit set: the compare is unsigned 32-bit, never a signed int
+        for (String[] c : new String[][] {{"0x8031ffff", "n"}, {"0x80320000", "y"}, {"0xffffffff", "y"}, {"0x7fffffff", "n"}, {"0x0", "n"}}) {
+            thorOld.put("driver.version", c[0]);
+            check("y".equals(c[1]) == "system".equals(Recommend.driver(oot, thorOld)), "Ocarina of Time gate at " + c[0] + ": " + Recommend.driver(oot, thorOld));
+        }
+        check(Recommend.values(oot, Readiness.facts("")).equals(Map.of("res_preset", "performance", "vegetation", "off")) && Recommend.driver(oot, Readiness.facts("")) == null, "no facts at all: the any row (Performance, Full vegetation off) and no driver");
         check(Recommend.glFacts("Qualcomm", "OpenGL ES 3.2 Mesa 25.1.0").equals("gpu.vendor=0x5143\ndriver.id=13\n"), "Mesa on an Adreno");
         check(Recommend.glFacts("ARM", "OpenGL ES 3.2 v1.r44p0-01eac0").equals("gpu.vendor=0x13b5\ndriver.id=9\n"), "Arm's own driver");
         check(Recommend.glFacts("Google", "x").isEmpty() && Recommend.glFacts(null, null).isEmpty() && Recommend.keep("").isEmpty(), "an unknown vendor: nothing");

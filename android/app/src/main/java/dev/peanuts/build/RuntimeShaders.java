@@ -55,22 +55,13 @@ final class RuntimeShaders {
     }
 
     /**
-     * Whether the title compiles shaders at run time at all: its profile's shader_map.tsv (in the packer's unpacked repository, PackEngine.repo()) names GLSLC run-time
-     * sources ("_runtime" packages, dm/games/README.md). A pack can miss shaders for other reasons (a game version the map was not made from: Mario Kart 8 Deluxe's 135),
+     * Whether the title compiles shaders at run time at all: its profile's shader_map.tsv (in the APK's tools.zip) names GLSLC run-time
+     * sources (/glslc_capture/ paths, dm/games/README.md). A pack can miss shaders for other reasons (a game version the map was not made from: Mario Kart 8 Deluxe's 135),
      * and those no game run can capture
      */
-    static boolean compilesAtRunTime(Context c, String titleId) {
-        try {
-            File repo = (File) Upstream.call(Upstream.k("PackEngine"), null, "repo", new Class<?>[0]);
-            File map = new File(repo, "dm/games/" + titleId + "/shader_map.tsv");
-            if (!map.isFile()) return false;
-            try (java.io.BufferedReader r = Files.newBufferedReader(map.toPath(), StandardCharsets.UTF_8)) {
-                for (String l; (l = r.readLine()) != null; ) if (!l.startsWith("#") && l.contains("_runtime")) return true;
-            }
-        } catch (ReflectiveOperationException | IOException | RuntimeException e) {
-            Log.w(TAG, "runtime shaders: profile map: " + e);
-        }
-        return false;
+    static boolean compilesAtRunTime(Context c, String titleId) throws IOException {
+        // PackEngine has no repo() method; PackNative.repo() also starts CPython and belongs in :pack only.
+        return RuntimeShaderMap.compilesAtRunTime(c.getAssets().open("pack/tools.zip"), titleId);
     }
 
     static File captureDir(File work) { return new File(work, "glslc_capture"); }
@@ -178,12 +169,12 @@ final class RuntimeShaders {
         List<String> out = new ArrayList<>();
         for (String l : (text == null ? "" : text).split("\n")) if (!l.trim().isEmpty() && !l.trim().startsWith(key)) out.add(l);
         out.add(line);
-        return String.join("\n", out);
+        return String.join("\n", out) + "\n";   // every line ended: an append to the file (another tool's line) never runs into the last one (Engage's env.txt read "DMSH_VK_XLATE_J=4DMSH_VK_XLATE_J=4")
     }
 
     static String withoutLine(String text, String key) {
         List<String> out = new ArrayList<>();
         for (String l : (text == null ? "" : text).split("\n")) if (!l.trim().isEmpty() && !l.trim().startsWith(key + "=")) out.add(l);
-        return String.join("\n", out);
+        return out.isEmpty() ? "" : String.join("\n", out) + "\n";   // as withLine
     }
 }

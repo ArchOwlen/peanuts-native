@@ -80,6 +80,24 @@ int main(int argc, char **argv) {
         for (unsigned k = 0; k < p->res_levels[i].nl && k < 12; k++) printf(",%llu:%u", (unsigned long long)p->res_levels[i].l[k].off, p->res_levels[i].l[k].len);
         printf("\n");
     }
+    printf("event_wait=%d\n", (int)p->event_wait); printf("occlusion_split_pass=%d\n", (int)p->occlusion_split_pass);
+    printf("low_ram_place_part_mb=%d\n", (int)p->low_ram_place_part_mb); printf("low_ram_img_cache_max_mb=%d\n", (int)p->low_ram_img_cache_max_mb);
+    printf("low_ram_app_pool_mb=%d\n", (int)p->low_ram_app_pool_mb); printf("render_default_out=%s\n", p->render_default_out);
+    printf("render_quality=%d,%d,%d,%d\n", (int)p->render_quality[0], (int)p->render_quality[1], (int)p->render_quality[2], (int)p->render_quality[3]);
+    printf("nrender_cfg=%d\n", (int)p->nrender_cfg);
+    for (int i = 0; i < (int)p->nrender_cfg; i++) {
+        const dm_pf_render_cfg_t *r = &p->render_cfg[i];
+        printf("render_cfg[%d]=%s,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u", i, r->build, (unsigned long long)r->table, r->n, r->stride, r->out_off, r->ren_off, r->orig_w, r->orig_h, r->max_w, r->max_h, r->min_h);
+        for (unsigned k = 0; k < r->n && k < 8; k++) printf(",%ux%u/%ux%u", r->sz[k][0], r->sz[k][1], r->sz[k][2], r->sz[k][3]);
+        printf("\n");
+    }
+    printf("nrt_pool=%d\n", (int)p->nrt_pool);
+    for (int i = 0; i < (int)p->nrt_pool; i++) {
+        const dm_pf_rt_pool_t *t = &p->rt_pool[i];
+        printf("rt_pool[%d]=%s,%s,%llu,%u,%u,%u,%u", i, t->build, t->module, (unsigned long long)t->off, t->word, t->base_mb, t->nt, t->out_h);
+        for (unsigned k = 0; k < t->nt && k < 4; k++) printf(",%u=%ux%u", t->mb[k], t->max_w[k], t->max_h[k]);
+        printf("\n");
+    }
     printf("has_nvn_api=%d\n", (int)p->has_nvn_api);
     printf("nvn_api_major=%d\n", (int)p->nvn_api_major);
     printf("nvn_api_minor=%d\n", (int)p->nvn_api_minor);

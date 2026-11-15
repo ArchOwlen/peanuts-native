@@ -6,7 +6,7 @@
 # "Since we last synced" is measured against the merge-base of HEAD and the upstream target, not
 # a stored marker and not the upstream tip. A stored marker can go stale (forgotten after a
 # manual rebase) and defaulting to the upstream tip makes `since..target` empty, so every report
-# silently says "no change" (CRITIQUE-phase1.md UPSTREAM §2 must-fix #1). The merge-base needs no
+# silently says "no change" (found in review). The merge-base needs no
 # bookkeeping: right after upstream-update.sh's rebase, HEAD's merge-base with the target *is*
 # the last synced commit, by construction.
 #
@@ -52,7 +52,7 @@ upstream_state_write() {
 # so vk_android_build.py's own heavier import chain is never executed). A hand-kept file list
 # here previously missed dmsh_atomic.py, dmsh_pull.py/.metal, dmsh_alpha.py, dmsh_logic.py,
 # dmsh_mesh.py, dmsh_ampere.py, nvn/dmsh_abi.h, dmsh_abi.py, ios_metal.py and the vendored
-# Ryujinx .cs sources (CRITIQUE-phase2a.md D-2b) -- this is the authoritative source instead.
+# Ryujinx .cs sources (found in review) -- this is the authoritative source instead.
 upstream_shader_chain_files() {
     python3 - <<'PYEOF'
 import importlib.util, os, re, ast
@@ -77,7 +77,7 @@ PYEOF
 # i.e. we have never locally edited this file, so it is safe to take upstream's version of it
 # wholesale. False (exit 1) if we have local edits to this file (even if upstream also changed
 # it) -- those paths must never be blind-checked-out, or a local change silently reverts
-# (CRITIQUE-phase1.md UPSTREAM §2 must-fix #2: the "two-dot diff" bug in the original drafts).
+# (found in review: the "two-dot diff" bug in the original drafts).
 upstream_file_is_unmodified_by_us() {
     file="$1"
     base="$2"

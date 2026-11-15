@@ -88,7 +88,7 @@ final class SaveUi {
     /** Runs work off the main thread with a wait dialog; done gets null or the error */
     private static void run(MainActivity a, Game g, String wait, Work work, Done done) {
         if (!take(g.titleId)) return;
-        AlertDialog w = new AlertDialog.Builder(a).setMessage(wait).setCancelable(false).show();
+        AlertDialog w = new PadFocus.Builder(a).setMessage(wait).setCancelable(false).show();
         new Thread(() -> {
             String err = null;
             Object r = null;
@@ -131,6 +131,44 @@ final class SaveUi {
                     + "The app never deletes a backup.", b.dir.getPath()).setPositiveButton("OK", null).show();
         });
     }
+
+    // PEANUTS begin: Delete save data (the game page's Saves tab). The save is backed up first, checked, where Back up saves puts its copies (or in app
+    // storage when backups go out as a .zip), so Restore saves can bring it back; then every file of the save's parts is deleted and the game starts as new
+    static void delete(MainActivity a, Game g) {
+        if (!ready(a, g, "delete the save")) return;
+        File save = Folders.save(a, g);
+        if (save == null || !hasSave(save)) { a.error(g.name + " has no save: nothing to delete."); return; }
+        String st = stamp();
+        File to = target(a, g);
+        Ui.confirmDanger(a, "Delete " + g.name + "'s save data?", "The game starts from the beginning the next time. The save is backed up first (checked), so "
+                + "Restore saves can bring it back. No backup is deleted.\n\nSave: " + save + "\nBackup of it: " + new File(to, st),
+                "Delete", () -> {
+                    if (!ready(a, g, "delete the save")) return;
+                    run(a, g, "Backing up, then deleting " + g.name + "'s save…", () -> {
+                        SaveStore.Backup b = SaveStore.backup(save, to, st);
+                        try (SaveStore.Lock l = SaveStore.lock(save)) {   // the save's lock again for the delete (a game started since the backup holds it: nothing is deleted then)
+                            for (File part : SaveStore.parts(save).values()) { File[] kids = part.listFiles(); if (kids != null) for (File k : kids) wipe(k); }
+                        }
+                        return b;
+                    }, (r, err) -> {
+                        if (err != null) {
+                            Ui.explain(a, "Save not deleted", r == null && !hasSave(save) ? "The save is gone, but something went wrong at the end." : "Something went wrong. What is left of the save is as it was; "
+                                    + "if a backup was made it is in Restore saves.", err + "\nSave: " + save).setPositiveButton("OK", null).show();
+                            return;
+                        }
+                        SaveStore.Backup b = (SaveStore.Backup) r;
+                        Ui.explain(a, "Save data deleted", g.name + " starts from the beginning. The old save (" + b.files + " files, " + SaveStore.size(b.bytes)
+                                + ") is in Restore saves.", b.dir.getPath()).setPositiveButton("OK", null).show();
+                    });
+                });
+    }
+
+    private static void wipe(File f) throws IOException {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) wipe(k);
+        if (!f.delete() && f.exists()) throw new IOException("could not delete " + f);
+    }
+    // PEANUTS end
 
     /** The backup made in app storage, then written as a zip to the picked document, read back and checked */
     private static void exportTo(MainActivity a, Game g, Uri doc) {
@@ -177,7 +215,7 @@ final class SaveUi {
             labels[i] = SaveStore.when(b.name) + "\n" + b.files + " files, " + SaveStore.size(b.bytes) + (b.device ? " (with the device save)" : "") + from;
         }
         labels[l.size()] = "Import save… (a .zip or a folder)";
-        new AlertDialog.Builder(a).setTitle(l.isEmpty() ? "No backups of " + g.name + " here yet" : "Restore " + g.name + "'s save from")
+        new PadFocus.Builder(a).setTitle(l.isEmpty() ? "No backups of " + g.name + " here yet" : "Restore " + g.name + "'s save from")
                 .setItems(labels, (d, w) -> {
                     if (w == l.size()) importPick(a, g);
                     else confirm(a, g, l.get(w).dir, SaveStore.when(l.get(w).name), null);
@@ -188,7 +226,7 @@ final class SaveUi {
     /** Import save…: a .zip or a folder, through the system picker */
     static void importPick(MainActivity a, Game g) {
         if (!ready(a, g, "import")) return;
-        new AlertDialog.Builder(a).setTitle("Import " + g.name + "'s save from")
+        new PadFocus.Builder(a).setTitle("Import " + g.name + "'s save from")
                 .setItems(new String[] {"A .zip (from Back up saves, or a zipped save folder)", "A save folder"}, (d, w) -> {
                     pendingFor = g;
                     if (w == 0) {

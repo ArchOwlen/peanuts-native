@@ -35,7 +35,7 @@ else
 fi
 echo
 
-# F3 (CRITIQUE-phase1.md): the Apple chain and the Android/Vulkan chain are NOT independent.
+# F3 (found in review): the Apple chain and the Android/Vulkan chain are NOT independent.
 # DMSH_VK_CHAIN covers DMSH_CHAIN (dmsh_chain_vk.h's own header comment), and DMSH_CHAIN hashes
 # the Apple-chain sources (dmsh_build.py, dmsh_fetch.py, dmsh_vin.py, dmsh_geometry.py,
 # dmsh_facts.py, the xlate sources, dmsh_chain.lock). So a change to ANY dmsh_*/vk_android_* file

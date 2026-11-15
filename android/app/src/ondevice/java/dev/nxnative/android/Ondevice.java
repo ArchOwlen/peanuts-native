@@ -305,6 +305,7 @@ final class Ondevice {
             if (f == null || !f.isFile()) { job = null; return; }
             try {
                 job = Job.read(f);
+                if (!job.modArgs().isEmpty()) job = null;   // PEANUTS: a build with code mods an earlier app remembered: never this panel's job (see onMessage)
             } catch (IOException e) {
                 // being renamed over, or damaged: keep the last one
             }
@@ -334,6 +335,11 @@ final class Ondevice {
             if (m.what != PackService.MSG_STATE) return false;
             Bundle d = m.getData();
             Job j = Job.of(new File(d.getString("file", "")), d.getString("job", "{}"));
+            // PEANUTS: the packer tells every bound client of whatever job it runs, also a build with code mods (Job.modArgs, dev.peanuts.build.Prepare.runModded),
+            // which is not remembered so that this panel does not follow it. Taken here it became the panel's job, and when it was done show() put its pack,
+            // the variant's, into the game list as the game's own (addGame): the game's page and its Mods section then took the variant for the game's build,
+            // and when the mod was deleted the game had no pack. Such a job is the Mods section's alone
+            if (j != null && !j.modArgs().isEmpty()) return true;
             if (j != null) job = j;
             jobAlive = d.getBoolean("alive");
             show();
@@ -403,7 +409,7 @@ final class Ondevice {
         void tryAnyway() {
             Job j = job;
             if (j == null || alive()) return;
-            new AlertDialog.Builder(a).setTitle("Try anyway?").setMessage(PrepareText.ANYWAY_WARNING)
+            new PadFocus.Builder(a).setTitle("Try anyway?").setMessage(PrepareText.ANYWAY_WARNING)
                     .setPositiveButton("Try anyway", (d, w) -> {
                         if (a.needAccess(j.dump())) return;
                         try {
@@ -440,6 +446,7 @@ final class Ondevice {
 
         /** The finished job's game into the list (its dump and pack); a picked pack folder (Folders) follows to the new pack */
         void addGame(Job j) {
+            if (!j.modArgs().isEmpty()) return;   // PEANUTS: a build with code mods has a pack of its own, never the game's list entry (onMessage)
             Prefs.open(a, "ondevice").edit().putString("added", addedKey(j)).apply();
             if (listed(j)) return;
             Pack p;
@@ -642,7 +649,7 @@ final class Ondevice {
                 Game.put(a, g);   // one card per game (GameList)
                 a.refresh();
                 show();
-                new AlertDialog.Builder(a).setTitle("Ready to play").setMessage("Its pack fits: nothing needs preparing.\n\nPack: " + packDir).setPositiveButton("OK", null).show();
+                new PadFocus.Builder(a).setTitle("Ready to play").setMessage("Its pack fits: nothing needs preparing.\n\nPack: " + packDir).setPositiveButton("OK", null).show();
             } catch (Exception e) {
                 a.error("Cannot use " + packDir + ": " + e.getMessage());
             }
@@ -661,7 +668,7 @@ final class Ondevice {
         }
 
         void confirm(String t, String msg, String yes, Runnable r) {
-            new AlertDialog.Builder(a).setTitle(t).setMessage(msg).setPositiveButton(yes, (d, w) -> r.run()).setNegativeButton("Cancel", null).show();
+            new PadFocus.Builder(a).setTitle(t).setMessage(msg).setPositiveButton(yes, (d, w) -> r.run()).setNegativeButton("Cancel", null).show();
         }
 
         void startService(Job j) {

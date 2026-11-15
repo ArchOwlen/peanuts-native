@@ -34,6 +34,9 @@ No game-specific rewriter cuts, SDK cuts or host branches are needed for the tes
 
 ## Audio and memory
 
+<!-- PEANUTS: Android shared-font report, investigated 2026-11-13. -->
+- **Open: startup crash without firmware fonts (Android).** A Peanuts test build `4319fcf` on an AYN Thor with Turnip 26.0.0 R8 loads all 9,858 shaders, falls back to Android's `RobotoStatic-Regular.ttf` (305,656 bytes), and crashes at `main+0x8b37c`, address `0x38`, with a null pointer and `0x25a1` in the registers. The same-sized font read from a Thor loads in FreeType but has no U+25A1 (white square); the owner's firmware standard and extended fonts both have that glyph. This supports a missing fallback glyph as the cause, but a controlled boot with and without firmware fonts remains untested. The host already contains the `ScalableFontEngine::LoadFont` BFTTF-to-TTF correction, so the crash address alone does not establish a regression in that correction. Configure the owner's firmware fonts through Settings before retesting; no additional host workaround is justified yet.
+
 - **Current:** the SDK audio renderer runs at 48 kHz, 240 samples per frame, 96 voices and a six-input DeviceSink. The Mac callback reports non-silent output and no underruns in the tested route.
 - The first dungeon corridor settles around 1.7–1.8 GB resident with 1.3 GB allocated by Metal. Level transitions change the footprint; the seven-minute repeat ends at 1,831 MB resident / 1,261 MB Metal, with a stable 490-pool count and no continuing growth in the stationary corridor windows.
 - The corridor runs at the game's 60 fps when the Mac window is presenting. Missing shader-pair tables and an archive built for the wrong depth caused first-use pipeline hitches (see [Rendering and shaders](#rendering-and-shaders)). Window-inactive timing is not a gameplay frame-rate measurement.

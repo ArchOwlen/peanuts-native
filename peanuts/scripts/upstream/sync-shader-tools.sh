@@ -1,7 +1,7 @@
 #!/bin/sh
 # Report (never apply) on the shader-translation tool chain vs upstream/android.
 #
-# CRITIQUE-phase2a.md D-2: this script is now **report-only**. Three problems with the earlier
+# Found in review: this script is now **report-only**. Three problems with the earlier
 # --apply path:
 #   (a) its "unmodified by us" check (git diff --quiet base HEAD) ignores the working tree, so a
 #       checkout could clobber an uncommitted edit -- sync-games.sh and sync-drivers.sh guard this

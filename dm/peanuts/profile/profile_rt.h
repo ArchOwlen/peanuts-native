@@ -1,4 +1,4 @@
-// PEANUTS: the generic host's runtime game profile (one libnxhost.so for every title, -PnxGenericHost=true; design/platform/IMPL-GENERIC.md).
+// PEANUTS: the generic host's runtime game profile (one libnxhost.so for every title, -PnxGenericHost=true).
 // This struct is the binary layout `gen_runtime_profile.py` writes into each title's <id>.profile.bin (packed, no padding: every field below is read back
 // by profile_rt_load() with the same offsets, in the same order). Do not reorder or resize a field without bumping DM_PROFILE_SCHEMA_VERSION in
 // gen_runtime_profile.py and rebuilding every title's .profile.bin; a mismatched schema hash is refused at load (profile_rt_load returns an error string).
@@ -17,8 +17,12 @@
 #define DM_PROFILE_DRS_CTL_CAP 8
 #define DM_PROFILE_RES_LEVELS_CAP 8
 #define DM_PROFILE_RES_LEVELS_LISTS 12
+#define DM_PROFILE_RENDER_CFG_CAP 4
+#define DM_PROFILE_RENDER_CFG_SLOTS 8   // dm/host/render_cfg.h RCFG_MAX
+#define DM_PROFILE_RT_POOL_CAP 4
+#define DM_PROFILE_RT_POOL_TIERS 4   // dm/host/rt_pool.h RTP_TIERS
 
-// Natural C alignment, not packed (CRITIQUE-generic.md should-fix: #pragma pack(1) let call sites take a typed pointer into an unaligned uint64_t field -
+// Natural C alignment, not packed (found in review: #pragma pack(1) let call sites take a typed pointer into an unaligned uint64_t field -
 // UB even though AArch64 tolerates the actual load). gen_runtime_profile.py's Packer mirrors these same alignment rules field by field when it writes a
 // title's profile.bin, so the two stay in step; DM_PROFILE_LAYOUT_SIZE (schema_stamp.h, generated) plus the _Static_assert in profile_rt.c is the backstop
 // if they ever drift (a same-size reorder would otherwise pass the plain sizeof check).
@@ -33,6 +37,13 @@ typedef struct { char build[48]; uint64_t params, pick, budget, preset; } dm_pf_
 // Field names match dm/host/hle_fpslock.c's own steps_row_t exactly (ptr_off, mode, count, nderef, deref), so DM_RUNTIME_PROFILE's lock_find() can point
 // its local steps_row_t-shaped pointer straight at g_profile.fps_steps without a field-by-field translation at that call site.
 typedef struct { char build[48]; uint64_t ptr_off; uint32_t mode, count; uint32_t nderef; uint64_t deref[3]; } dm_pf_fps_steps_t;
+
+// render_cfg / rt_pool rows: the same fields, in the same order, as dm/host/render_cfg.h rcfg_row_t and dm/host/rt_pool.h rtpool_row_t, with the build/module
+// strings held inline instead of pointed to (loader.c dm_pf_rcfg_rows / dm_pf_rtpool_rows build those host row types over these at first use)
+typedef struct { char build[48]; uint64_t table; uint32_t n, stride, out_off, ren_off; uint32_t sz[DM_PROFILE_RENDER_CFG_SLOTS][4];
+                 uint32_t orig_w, orig_h, max_w, max_h, min_h; } dm_pf_render_cfg_t;
+typedef struct { char build[48]; char module[16]; uint64_t off; uint32_t word, base_mb, nt;
+                 uint32_t mb[DM_PROFILE_RT_POOL_TIERS], max_w[DM_PROFILE_RT_POOL_TIERS], max_h[DM_PROFILE_RT_POOL_TIERS]; uint32_t out_h; } dm_pf_rt_pool_t;
 
 // One title's profile, loaded once at host start (nxhost_main, before anything else reads it) from DM_PROFILE_PATH (profile_rt_load).
 // Field names mirror DM_GAME_* macro names lower-cased; dm/peanuts/profile/game_profile_generic.h is what call sites actually see
@@ -65,9 +76,14 @@ typedef struct {
     uint32_t nfps_steps; dm_pf_fps_steps_t fps_steps[DM_PROFILE_FPS_STEPS_CAP];
     uint32_t ndrs_ctl; dm_pf_drs_ctl_t drs_ctl[DM_PROFILE_DRS_CTL_CAP];
     uint32_t nres_levels; dm_pf_res_levels_t res_levels[DM_PROFILE_RES_LEVELS_CAP];
+
+    uint32_t event_wait, occlusion_split_pass, low_ram_place_part_mb, low_ram_img_cache_max_mb, low_ram_app_pool_mb;
+    char render_default_out[16]; uint32_t render_quality[4];
+    uint32_t nrender_cfg; dm_pf_render_cfg_t render_cfg[DM_PROFILE_RENDER_CFG_CAP];
+    uint32_t nrt_pool; dm_pf_rt_pool_t rt_pool[DM_PROFILE_RT_POOL_CAP];
 } dm_game_profile_t;
 
-// A few checkpoints along the layout (CRITIQUE-generic.md should-fix), so a field inserted or resized in the wrong place fails the build here, at the
+// A few checkpoints along the layout (found in review), so a field inserted or resized in the wrong place fails the build here, at the
 // exact field, rather than only showing up as a total-size mismatch (profile_rt.c's _Static_assert against DM_PROFILE_LAYOUT_SIZE) that still has to be
 // tracked down by hand.
 _Static_assert(offsetof(dm_game_profile_t, id) == 8, "magic+schema must be exactly 8 bytes before id");
@@ -78,6 +94,8 @@ _Static_assert(offsetof(dm_game_profile_t, mesh_prepass_cut) % 8 == 0, "dm_pf_me
 _Static_assert(offsetof(dm_game_profile_t, fps_steps) % 8 == 0, "dm_pf_fps_steps_t has uint64_t members: must be 8-byte aligned");
 _Static_assert(offsetof(dm_game_profile_t, drs_ctl) % 8 == 0, "dm_pf_drs_ctl_t has uint64_t members: must be 8-byte aligned");
 _Static_assert(offsetof(dm_game_profile_t, res_levels) % 8 == 0, "dm_pf_res_levels_t has uint64_t members: must be 8-byte aligned");
+_Static_assert(offsetof(dm_game_profile_t, render_cfg) % 8 == 0, "dm_pf_render_cfg_t has uint64_t members: must be 8-byte aligned");
+_Static_assert(offsetof(dm_game_profile_t, rt_pool) % 8 == 0, "dm_pf_rt_pool_t has uint64_t members: must be 8-byte aligned");
 _Static_assert(sizeof(dm_game_profile_t) % 8 == 0, "the whole struct must round to its own (8-byte) alignment, like any C array of it would");
 
 extern dm_game_profile_t g_profile;   // the loaded profile; zeroed (all "off"/0/"") until profile_rt_load succeeds

@@ -102,7 +102,7 @@ mod_view_default.h, mod_input_tokens.h (their functionality lives inside the fil
 |---|---|
 | mods/mod_runtime.h | `friend struct PnRtAccess;` so peanuts_rt.cpp can switch `current_page` and read `tick_count`/page id/module state for pn_rt_set_page / pn_rt_status (Tick itself is reached without a friend: the CoreTiming shim keeps the scheduled event and pn_rt_tick fires it). |
 | mods/mod_assets.cpp | `#if !PNRT` around `SerialVfsFile` + `OpenPrivateRomFS` (Eden loader/PatchManager/NCA chain); `OpenGameRomFS()` body replaced by `root = system.RomfsRoot()`; the `sysfont:` source's archive opener replaced by `system.SysfontRoot()` (no system NAND). |
-| mods/mod_romfs_sources.cpp (R5) | `BuildBase` = `system.RomfsRoot()` ("base:" is the same extracted dir as "romfs:"), `BuildAoc` = nullptr ("aoc:" never available; the Eden bodies stay under `#else`). |
+| mods/mod_romfs_sources.cpp (R5) | `BuildBase` = `system.RomfsBaseRoot()` ("base:" is the game's RomFS without its mods' folders; "romfs:" has them layered over it when the host names any, `PnRtConfig::romfs_overlay_dirs`), `BuildAoc` = nullptr ("aoc:" never available; the Eden bodies stay under `#else`). |
 | mods/mod_module_services.cpp (R5) | `ResolveTitleSaveDirectory` = `system.SaveRoot()` (PnRtConfig::save_dir) instead of the save-data HLE + profile manager. |
 | mods/mod_module.cpp | `GameModule::Load`'s build-id check accepts the host's 16-hex-digit (8-byte, zero-padded) build id as a prefix of a manifest's full 20-byte id and vice versa (one PNRT hunk at the `build_ids` any_of). |
 
@@ -126,7 +126,7 @@ Everything else in `mods/` is byte-identical to Eden v1.3.5.1.
 | core/core_timing.h | `CreateEvent` keeps the callback; `ScheduleLoopingEvent` registers it; `FireAll()` = one tick |
 | core/file_sys/vfs/vfs.h, vfs_types.h | `VfsFile`/`VfsDirectory` (GetName, GetSize, Read, ReadAllBytes, ReadBytes, GetFile, GetSubdirectory, GetFiles, GetSubdirectories, GetFileRelative) over std::filesystem; `OpenHostDirectory`, `OpenHostFile`, `MakeSyntheticDir` |
 | core/file_sys/{content_archive,patch_manager,registered_cache,romfs}.h, core/hle/service/filesystem/*.h | empty |
-| core/hle/kernel/k_process.h, svc_types.h | `KProcess`/`KPageTable`/`KThread` (ApplicationProcess() returns nullptr; every lifted use null-checks), `GetInteger`, `Svc::ThreadContext`. k_process.h ends with `#include "core/core.h"` because mod_state.cpp / mod_runtime.cpp reach `Core::System` through it in Eden |
+| core/hle/kernel/k_process.h, svc_types.h | `KProcess`/`KPageTable`/`KThread` (one process; its page table is three atomic fields, 0 until `pn_rt_tick` has the game's heap from `PnRtMemory::heap_range`, see "The game's heap" below), `GetInteger`, `Svc::ThreadContext`. k_process.h ends with `#include "core/core.h"` because mod_state.cpp / mod_runtime.cpp reach `Core::System` through it in Eden |
 | core/loader/loader.h | `AppLoader::ReadIcon` (host-supplied JPEG bytes, empty = none) |
 | video_core/dsmod/aux_routing.h, video_core/gpu.h | **the UI sink**: `AuxRouting` keeps the latest frame (PublishUi / PublishUiWith / PublishUiPartial / ClearUi / TakeUi) and forwards to an optional `UiSink` of host callbacks; touch mailbox (SetTouch/GetTouch); `PublishAuxTexture`/`PublishMapFadeTextures(Tiles)`/`PublishComposite`/`ClearComposite` accepted and dropped (GPU composite path off); `TileMask`, `DiffTiles`, `UiDiffEnabled()` = false; `Quad`; haptic sink |
 | input_common/drivers/virtual_gamepad.h | `VirtualGamepad` (same VirtualButton enum) forwarding to a `PadSink` of function pointers; `InputSubsystem::GetVirtualGamepad()` |
@@ -266,7 +266,7 @@ RomFS-relative, '/'-separated, no leading slash; callbacks must be thread-safe (
 tick thread). Shim: `FileSys::OpenProviderDirectory(const PnRtRomfs&)` (vfs.h / shim.cpp):
 `ProviderDir` / `ProviderFile` -- a file holds its handle for the VfsFile's life and reads ranges
 through `read` (no whole-image loads); `pn_rt_create` sets `System::romfs_root` to it, so
-"romfs:" and "base:" (BuildBase = RomfsRoot) both resolve through it. No lifted file changed.
+"romfs:" and "base:" both resolve through it ("romfs:" under the mods' folders when there are any). No lifted file changed.
 
 Host side (dm/peanuts/peanuts_nup.{h,c}, C, over dm/host/nup_image.h): `pn_nup_open(spec)` opens
 the package DM_ROMFS names (`<game>.nup:update/<v>/romfs`) as layer 0 and, when the selector is
@@ -292,6 +292,34 @@ bytes, only_base.txt and sub/a.txt from the base, zstd sub/b.txt 300,000 bytes, 
 per name). ASan (detect_leaks=1) clean on all three. arm64 libpeanuts_rt.a builds with
 `OpenProviderDirectory` and all `pn_rt_*`; peanuts_nup.c compiles for aarch64-linux-android33
 (needs plat_sha256 and the ZSTD_* symbols the host already links).
+
+## Load plans, the game's heap, mods' folders (2026-11-14)
+
+Lifted files touched: mod_romfs_sources.cpp (the `BuildBase` row above) and mod_module_host.cpp
+(the log hunks of the last point).
+
+- **Load plans** (peanuts_helper.cpp, `PnRtConfig::helper`): a package's mailbox, patches of main and
+  guest helper are applied to the running game in `pn_rt_create`, before the runtime loads the
+  package's module (`PeanutsHelper::Install`; the file's head comment has the steps and the x18
+  stubs). The host gives the block (`code_block`: the unused end of main's patch area or the
+  loader's 1 MiB after the last module, so a plan's code + mailbox larger than that finds no room),
+  says which runs of main its rewriter changed (`code_rewritten`) and where main's code ends
+  (`text_end`). One install per process. A refused plan is one log line ("the package's load plan
+  is not installed ...") and the package runs without helper and mailbox.
+- **The game's heap** (`PnRtMemory::heap_range`): `pn_rt_tick` writes the base and the opened
+  length to the page table shim once the game has a heap, and `ModRuntime::HeapLow` / `HeapHigh`
+  (lifted, unchanged) cache base and base + opened + 1 GiB at the first ask. When the game opens
+  more later, `pn_rt_tick` raises the cached end (`PnRtAccess::RaiseHeapHigh`); it never moves
+  back, and a closed heap keeps its last bounds (reads of unmapped pages fail in the host's
+  accessor, they do not fault).
+- **Mods' folders** (`PnRtConfig::romfs_overlay_dirs`, the host's DM_ROMFS_OVERLAY): "romfs:" is a
+  `LayeredDir` (shim.cpp) of those folders over the game's RomFS, the first wins; a folder that is
+  missing is skipped and names are matched exactly, as the game's own mount does (hle_fs.c).
+  "base:" stays the game's RomFS alone.
+- **Module values in the log** (mod_module_host.cpp, PEANUTS hunks): integers whose name ends in
+  `_failures`, `_hidden`, `_supported`, `_request` or `_version` and texts whose name ends in `.diag`
+  are logged when they change; `DM_RT_VALUES=1` logs every integer a module publishes (3000 lines
+  at most).
 
 ## R7 (2026-11-12): engines -- the engine-specific decoders are lifted
 
@@ -398,14 +426,15 @@ arguments stay page ids), so a module package can be run against a game RomFS.
   `read_save_file` only when `save_dir` is passed (the game's save folder, plain files).
 - Texture readback (runtime 24) not advertised: modules keep their fallback.
 - Guest bridge (Call/Sequence actions, spies, patches, `OnGuestBreakpoint`) still stubbed
-  (NCE conditions, as before). Guest mailbox {0,0}.
+  (NCE conditions, as before). The guest mailbox is {0,0} unless the package's load plan was
+  installed (peanuts_helper.cpp, "Load plans" below).
 - The rt_test module run only proves load + default/tab pages with zero memory; module pages
   that read real game state are untested here.
 
 ## Known gaps / R2c candidates (history)
 
-- `Core::System::ApplicationProcess()` is nullptr: heap-region sweeps (ArrayFind/PlayerFind
-  points) use the fixed fallback window; hosts can fill `System::process` later.
+- (closed) heap-region sweeps (ArrayFind/PlayerFind points) used the fixed fallback window; the
+  host now hands the game's heap (`PnRtMemory::heap_range`, "The game's heap" below).
 - The page is published at ~30 Hz (every other tick) from the runtime's own redraw worker
   thread; the host must keep calling pn_rt_tick for frames to appear.
 - `Settings::IsNceEnabled()` = true permanently: no BRK guest bridge, by design -- Call/Sequence/

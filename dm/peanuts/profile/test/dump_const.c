@@ -86,6 +86,24 @@ int main(void) {
           for (unsigned k = 0; k < r[i].nl && k < 12; k++) printf(",%llu:%u", r[i].l[k].off, r[i].l[k].len);
           printf("\n");
       } }
+    printf("event_wait=%d\n", (int)DM_GAME_EVENT_WAIT); printf("occlusion_split_pass=%d\n", (int)DM_GAME_OCCLUSION_SPLIT_PASS);
+    printf("low_ram_place_part_mb=%d\n", (int)DM_GAME_LOW_RAM_PLACE_PART_MB); printf("low_ram_img_cache_max_mb=%d\n", (int)DM_GAME_LOW_RAM_IMG_CACHE_MAX_MB);
+    printf("low_ram_app_pool_mb=%d\n", (int)DM_GAME_LOW_RAM_APP_POOL_MB); printf("render_default_out=%s\n", DM_GAME_RENDER_DEFAULT_OUT);
+    { static const int q[4] = DM_GAME_RENDER_QUALITY; printf("render_quality=%d,%d,%d,%d\n", q[0], q[1], q[2], q[3]); }
+    printf("nrender_cfg=%d\n", (int)DM_GAME_NRENDER_CFG);
+    { static const struct { const char *build; unsigned long long table; unsigned n, stride, out_off, ren_off, sz[8][4], ow, oh, mw, mh, min; } r[] = DM_GAME_RENDER_CFG;
+      for (int i = 0; i < DM_GAME_NRENDER_CFG; i++) {
+          printf("render_cfg[%d]=%s,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u", i, r[i].build, r[i].table, r[i].n, r[i].stride, r[i].out_off, r[i].ren_off, r[i].ow, r[i].oh, r[i].mw, r[i].mh, r[i].min);
+          for (unsigned k = 0; k < r[i].n && k < 8; k++) printf(",%ux%u/%ux%u", r[i].sz[k][0], r[i].sz[k][1], r[i].sz[k][2], r[i].sz[k][3]);
+          printf("\n");
+      } }
+    printf("nrt_pool=%d\n", (int)DM_GAME_NRT_POOL);
+    { static const struct { const char *build, *module; unsigned long long off; unsigned word, base, nt, mb[4], w[4], h[4], out_h; } t[] = DM_GAME_RT_POOL;
+      for (int i = 0; i < DM_GAME_NRT_POOL; i++) {
+          printf("rt_pool[%d]=%s,%s,%llu,%u,%u,%u,%u", i, t[i].build, t[i].module, t[i].off, t[i].word, t[i].base, t[i].nt, t[i].out_h);
+          for (unsigned k = 0; k < t[i].nt && k < 4; k++) printf(",%u=%ux%u", t[i].mb[k], t[i].w[k], t[i].h[k]);
+          printf("\n");
+      } }
 #ifdef DM_GAME_NVN_API_MAJOR
     printf("has_nvn_api=1\n"); printf("nvn_api_major=%d\n", (int)DM_GAME_NVN_API_MAJOR); printf("nvn_api_minor=%d\n", (int)DM_GAME_NVN_API_MINOR);
 #else

@@ -97,7 +97,7 @@ public final class CatalogActivity extends Activity {
                     PUi.confirmDanger(this, "Remove the companion?", name + "'s companion is deleted from " + froot + ". The game and its saves stay.", "Remove", () -> {
                         new Thread(() -> {   // off the UI thread: the delete walks shared storage and waits for the package's lock
                             String err = null;
-                            try { Installer.remove(froot, item.packageName, this); }   // ctx = this: refuses while the game is running (CRITIQUE-phase2c.md §B)
+                            try { Installer.remove(froot, item.packageName, this); }   // ctx = this: refuses while the game is running (found in review)
                             catch (java.io.IOException | RuntimeException e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
                             final String ferr = err;
                             ui.post(() -> {

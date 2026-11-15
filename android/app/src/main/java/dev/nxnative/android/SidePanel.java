@@ -64,7 +64,7 @@ final class SidePanel extends FrameLayout {
     }
 
     // The ids of the choices a rebuild gives the focus back to (restyle)
-    private static final int ID_SIZE = 5000, ID_TEXT = 5100, ID_FIT = 5200, ID_MAP = 5300, ID_ONE = 5400, ID_RES = 5500, ID_RES_PRESET = 5590;
+    private static final int ID_SIZE = 5000, ID_TEXT = 5100, ID_FIT = 5200, ID_MAP = 5300, ID_ONE = 5400, ID_RES = 5500, ID_RES_PRESET = 5590, ID_CONSOLE = 5600 /* PEANUTS: the two buttons of Console mode */;
 
     SidePanel(Activity a, Rows rows) {
         super(a);
@@ -388,6 +388,24 @@ final class SidePanel extends FrameLayout {
         if (tab == TAB_CONTROLS) { controls(); return; }
         if (tab == TAB_GENERAL) { general(); return; }
 
+        // PEANUTS begin: Console mode (Docked / Handheld) while the game runs, for a game whose Resolution does not set the mode (ScreenMode): the host changes the
+        // operation mode and posts the console's change notifications, as when a Switch is taken out of its dock (Native.graphicsModeSet with the scale following the
+        // mode, hle_oe.c nxhost_graphics_mode_set); the choice is kept for the game
+        if (ScreenMode.fixed(game()) == null) {
+            head("Console mode");
+            RadioGroup cm = new RadioGroup(act);
+            for (int k = 0; k < 2; k++) { RadioButton b = new RadioButton(act); b.setId(ID_CONSOLE + k); b.setText(ScreenMode.NAMES[k]); cm.addView(b); }
+            cm.check(ID_CONSOLE + ScreenMode.mode(act, game()));
+            cm.setOnCheckedChangeListener((gr, id) -> {
+                int m = id - ID_CONSOLE;
+                ScreenMode.set(act, game(), m);
+                if (act instanceof GameActivity && !Native.graphicsModeSet(-1, 1 - m)) Native.note("Console mode: this host cannot change it while the game runs; it applies at the next start");
+                restyle(id);
+            });
+            box.addView(cm);
+            note("Changes now, as when a Switch leaves its dock, and is kept for this game. A game may take the new picture size only at its next scene, or at its next start.");
+        }
+        // PEANUTS end
         head("Frame rate cap");   // the game's own frame rate; frame generation (below, its own heading) adds frames on top
         caps = new RadioGroup(act);
         if (Prefs.limited(game())) {   // a frame limit, no locking (Prefs.PACE_CAPS)
@@ -438,12 +456,13 @@ final class SidePanel extends FrameLayout {
             box.addView(hold);
         }
         fpsNow = note("");
-        if (Prefs.dlssGame(game()) || GameUpscaler.shown(act, game())) {   // right under the frame rate cap: the Upscaler (the game's own upscaler and the window's scaling to the screen), for games whose network it replaces; for a game on the DLSS stand-in (no network to replace), the stand-in's modes with Motion clarity / sharpness
+        boolean simple = Prefs.simpleRes(act, game());   // a game with Resolution presets, tester rows off: no Upscaler or Dynamic resolution here (Settings › Help › Tester settings)
+        if (!simple && (Prefs.dlssGame(game()) || GameUpscaler.shown(act, game()))) {   // right under the frame rate cap: the Upscaler (the game's own upscaler and the window's scaling to the screen), for games whose network it replaces; for a game on the DLSS stand-in (no network to replace), the stand-in's modes with Motion clarity / sharpness
             GameUpscaler.rows(act, game(), box);
             note(act instanceof GameActivity && ((GameActivity) act).live() ? "Applies from the next frame, kept for this game (the same setting as Game settings › Upscaler)."
                     : "Applies at the next start (this run takes no live changes: DM_CTL is off).");
         }
-        if (Prefs.drsGame(game())) {
+        if (Prefs.drsGame(game()) && !simple) {
             TextView drsHead = head("Dynamic resolution");   // the render size's range (Prefs.DRS), applied at each step; the heading shows it
             box.addView(DrsSlider.view(act, Prefs.drs(act, game()), drsHead::setText, i -> { Prefs.drs(act, game(), i); Native.drsSet(Prefs.DRS[i][0], Prefs.DRS[i][1]); }));
         }
@@ -529,19 +548,22 @@ final class SidePanel extends FrameLayout {
      */
     private void resolutionRow() {
         Profile p = Profile.of(game());
+        if (p != null && p.renderCfg()) { renderRows(p); return; }
         if (p == null || !p.hasResolution()) return;
         head("Resolution");
         boolean now = p.resolutionLive() && act instanceof GameActivity;
         java.util.List<ResPresets.Preset> ps = ResPresets.presets(p);
         if (!ps.isEmpty()) {
             String rc = Prefs.resolutionChoice(act, game());
-            Button pr = row(ID_RES_PRESET, "Resolution", ResPresets.label(ps, rc));
+            boolean simple = Prefs.simpleRes(act, game());   // the tester rows are off (Settings › Help): the profile's choices alone
+            Button pr = row(ID_RES_PRESET, "Resolution", ResPresets.ADVANCED.equals(rc) && simple ? "Custom setup" : ResPresets.label(ps, rc));
             pr.setOnClickListener(v -> {
-                String[] labels = new String[ps.size() + 1];
-                for (int k = 0; k < ps.size(); k++) labels[k] = ps.get(k).label + " \u00b7 " + ps.get(k).detail();
-                labels[ps.size()] = "Advanced (window and 3D scene set apart)";
+                String recPreset = Prefs.rec(act, game(), Recommend.RES_PRESET);
+                String[] labels = new String[simple ? ps.size() : ps.size() + 1];   // the same choices and words as Game settings › Resolution
+                for (int k = 0; k < ps.size(); k++) labels[k] = ResPresets.itemText(ps.get(k), k == 0, ps.get(k).id.equals(recPreset));
+                if (!simple) labels[ps.size()] = "Advanced (for testers)\nwindow and 3D scene set apart";
                 ResPresets.Preset cur0 = ResPresets.of(ps, Prefs.resolutionChoice(act, game()));
-                new AlertDialog.Builder(act).setTitle("Resolution").setSingleChoiceItems(labels, cur0 != null ? ps.indexOf(cur0) : ps.size(), (d, w) -> {
+                new AlertDialog.Builder(act).setTitle("Resolution").setSingleChoiceItems(labels, cur0 != null ? ps.indexOf(cur0) : simple ? -1 : ps.size(), (d, w) -> {
                     Prefs.resPreset(act, game(), w < ps.size() ? ps.get(w).id : ResPresets.ADVANCED);   // the game's own setting: the next start takes it too
                     if (now) {
                         int[] m = p.resolutionLive(Prefs.startWindow(act, game()));
@@ -551,9 +573,8 @@ final class SidePanel extends FrameLayout {
                     restyle(ID_RES_PRESET);
                 }).setNegativeButton("Cancel", null).show();
             });
-            note(now ? "The window changes now; the 3D scene at the next start. Kept for this game (the same setting as Game settings › Resolution)."
-                    : "Applies at the next start (the same setting as Game settings › Resolution).");
-            if (!ResPresets.ADVANCED.equals(rc)) return;
+            note(ResPresets.NOTE + " Kept for this game (the same setting as Game settings › Resolution).");
+            if (!ResPresets.ADVANCED.equals(rc) || simple) return;
         }
         String winTitle = ps.isEmpty() ? "Game resolution" : "Advanced \u00b7 Window";
         String cur = Prefs.gameWindow(act, game());
@@ -594,6 +615,44 @@ final class SidePanel extends FrameLayout {
         note(now ? "Applies now: the game resizes its picture within a few frames. Kept for this game (the same setting as Game settings › Game resolution)."
                 + (p.resolution.contains("/console") ? " The larger sizes run the game as on a docked console." : "")
                 : "Applies at the next start (the same setting as Game settings › Game resolution).");
+    }
+
+    /**
+     * Resolution, Upscaling quality and Graphics quality of a game whose profile has a render_cfg row: three radio groups, drawn as the Frame rate cap's, labels from the string
+     * resources (RenderLabels). A pick is the game's own setting (Prefs.render, the next start takes it). While the game runs, Resolution and Upscaling quality change at once
+     * (Native.renderSet: the host writes them at the game's next notification 31); Graphics quality changes at once the same way. A pick whose render size needs a larger render
+     * target pool than the game started with is clamped by the host until the next start, and only then one line says so (Profile.renderRestartNote)
+     */
+    private void renderRows(Profile p) {
+        boolean now = act instanceof GameActivity;
+        Profile.Render cur = Prefs.render(act, p, game()), start = now ? ((GameActivity) act).startRender() : null;
+        RenderLabels l = new RenderLabels(act);
+        String[] outs = p.renderOutputs();
+        java.util.function.BiConsumer<Profile.Render, Integer> pick = (r, focus) -> {
+            Prefs.render(act, game(), r);
+            int[] live = p.renderLive(cur, r);
+            if (now && live != null && !Native.renderSet(live[0], live[1], live[2])) Native.note("Resolution: this host cannot change it live; it applies at the next start");
+            restyle(focus);
+        };
+        head(l.resTitle);
+        RadioGroup ro = new RadioGroup(act);
+        for (int i = 0; i < outs.length; i++) { RadioButton b = new RadioButton(act); b.setId(ID_RES + 1 + i); b.setText(l.out(p, outs[i])); ro.addView(b); }
+        ro.check(ID_RES + 1 + Math.max(0, java.util.Arrays.asList(outs).indexOf(cur.out)));
+        ro.setOnCheckedChangeListener((gr, id) -> pick.accept(new Profile.Render(outs[id - ID_RES - 1], cur.pct, cur.quality), id));
+        box.addView(ro);
+        head(l.upscaleTitle);
+        RadioGroup ru = new RadioGroup(act);
+        for (int i = 0; i < Profile.RENDER_PCTS.length; i++) { RadioButton b = new RadioButton(act); b.setId(ID_RES + 20 + i); b.setText(l.pct(Profile.RENDER_PCTS[i])); ru.addView(b); }
+        ru.check(ID_RES + 20 + Math.max(0, GameSettings.indexOfPct(cur.pct)));
+        ru.setOnCheckedChangeListener((gr, id) -> pick.accept(new Profile.Render(cur.out, Profile.RENDER_PCTS[id - ID_RES - 20], cur.quality), id));
+        box.addView(ru);
+        head(l.gfxTitle);
+        RadioGroup rg = new RadioGroup(act);
+        for (int i = 0; i < 2; i++) { RadioButton b = new RadioButton(act); b.setId(ID_RES + 40 + i); b.setText(l.gfx[i]); rg.addView(b); }
+        rg.check(ID_RES + 40 + (cur.quality ? 0 : 1));
+        rg.setOnCheckedChangeListener((gr, id) -> pick.accept(new Profile.Render(cur.out, cur.pct, id == ID_RES + 40), id));
+        box.addView(rg);
+        if (start != null && p.renderRestartNote(cur, start, null, Prefs.lowRam(act))) note(l.restartNote);
     }
 
     /** Picture: Fit / Stretch and the size (GameActivity.picture: live through DM_CTL, kept for this game), then the position on this screen (TouchControls) */

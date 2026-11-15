@@ -3,7 +3,8 @@
 Banana's Home (`dev.nxnative.android.MainActivity`) is the one home: its game box is filled by `Library.fill`, its Settings page starts with `LibrarySettings.add`,
 its pickers' results pass through `LibrarySettings.result`, its Manage sheet has one Peanuts row (`GameSheet.open`). The look comes from `PUi`, a verbatim copy of
 upstream's package-private `Ui` on the same `R.color`/`R.drawable` resources (`diff Ui.java PUi.java | grep -v '^[<>] *\(package\|import dev\|public\)'` is the
-drift check; re-copy when upstream changes `Ui.java`).
+drift check; re-copy when upstream changes `Ui.java`). The five `dev.peanuts.ui.Feel` lines of `Ui.java` (marked `PEANUTS`) are not copied: Peanuts' screens
+call `Haptics` themselves, and both would play.
 
 ## Upstream hooks (each one line, tagged `PEANUTS`)
 
@@ -30,7 +31,17 @@ drift check; re-copy when upstream changes `Ui.java`).
   (`CompanionPort`) off the main thread; a scanned game that is ready goes into upstream's list (`Upstream.addToList`) so Play and Manage are Banana's own.
 - `GameSheet` — the game's dialog: Base / Update / DLC / Companion rows, Build or Rebuild, Add keys… when prod.keys are missing. Its Choose/Add pickers come back
   through `LibrarySettings.result` (requests 65, 66).
-- `LibrarySettings` — Settings › Library: folders, keys, firmware fonts, Rescan, Companions; the pickers (also the first-run card's and the sheet's).
+- `LibrarySettings` — Settings › Library: folders, keys, firmware, Rescan, Haptics (System / Off), Motion (System / Reduced), Companions; the pickers
+  (also the first-run card's and the sheet's).
+- `Haptics`, `Motion`: the launcher's feedback, six haptic words (TICK, CLICK, HEAVY, EDGE, DONE, REJECT) and six motion tokens (SNAP, FOCUS, ENTER, EXIT,
+  EMPHASIS, PROGRESS), called from `Library`, `GameSheet`, `LibrarySettings` and `CompanionVersions`, never from inside `PUi` (it stays a verbatim copy). No
+  upstream hook: the D-pad's focus haptic rides on the key listeners the library's own views have, the app-in-front flag and the focus after a game on
+  activity lifecycle callbacks `Library.fill` registers, and the sheet and launch animations are resources in `src/peanuts/res` found by name. Animations
+  write alpha, translation and scale only, and none runs while a direction is held. `Library.render` skips a rebuild that would show the same thing, and a
+  rebuild keeps the focus (by title ID) and the scroll position.
+- `Feel`: the same words and tokens for the pages upstream draws (a game's page, held cover; Settings and Home's cards through the same widgets), called from
+  marked one-line hooks in upstream's `Ui`, `PadFocus`, `MainActivity` and `GameSettings` and from `dev.peanuts.settings`. The table: `dev/peanuts/settings/HOOKS.md`,
+  section 4. `Haptics` and `Motion` themselves still take no upstream hook.
 - `LibraryScanner`, `Upstream`, `CompanionPort`, `ImporterPort`, `BuildPort` — as before (reflection into upstream and the sibling Peanuts packages).
 
 ## Launching a Ready game

@@ -330,6 +330,7 @@ static int init_once(void) {
     void vka_driver_notes(void); vka_driver_notes();   // what driver_open did before the log was open (the Turnip UBWC hint)
     if (!V.placed && !V.fd_alias) VRED("no placed maps or exported guest memory alias: guest memory stays anonymous and the GPU sees no memory pool");
     if (!swap) VRED("no VK_KHR_swapchain: nothing is presented");
+    vka_rs_init();   // PEANUTS: DM_RES_SCALE, and the device's depth blits said in the log (vka_tex.c vka_resscale.inc)
     vka_present_init();
     return 1;
 }
@@ -820,7 +821,7 @@ static int sblk_idle(const sblk *b, uint64_t done, uint64_t udone) { return b->f
 static sblk *sblk_new(VkDeviceSize n) {
     sblk *b = calloc(1, sizeof *b); b->size = n;
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};   // indirect: the {count, 1, 1} copies of indirect mesh draws (vka_exec.c mdx_copy)
+                                                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT};   // indirect: the {count, 1, 1} copies of indirect mesh draws (vka_exec.c mdx_copy). PEANUTS: texel: the copy of a buffer texture (vka_draw.c tbuf_view)
     if (vk.vkCreateBuffer(V.dev, &bi, NULL, &b->buf)) { free(b); return NULL; }
     VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, b->buf, &mr);
     uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);

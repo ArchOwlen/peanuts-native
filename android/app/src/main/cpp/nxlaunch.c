@@ -399,6 +399,15 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_openLog(JNIEnv *env, jcl
     (void)cls; char *lp = jstr(env, log); int r = log_open(lp); free(lp); return r;
 }
 JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_hasSelftest(JNIEnv *env, jclass cls) { (void)env; (void)cls; return nxhost_vk_selftest != NULL; }
+// PEANUTS: the selftest's environment (the picked GPU driver: DM_VK_DRIVER), set before its Vulkan device is made and written to its log, as start does for a game
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_selftestEnv(JNIEnv *env, jclass cls, jobjectArray envs) {
+    (void)cls;
+    for (jsize i = 0, n = envs ? (*env)->GetArrayLength(env, envs) : 0; i < n; i++) {
+        char *kv = jstr(env, (jstring)(*env)->GetObjectArrayElement(env, envs, i)); char *eq = strchr(kv, '=');
+        if (eq && eq > kv) { *eq = 0; setenv(kv, eq + 1, 1); fprintf(stderr, "[nxlaunch] env %s=%s\n", kv, eq + 1); }
+        free(kv);
+    }
+}
 // Blocks for about frames / 60 s: call it on a thread of its own. 0 = every check passed; -1 = this host has no selftest
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jclass cls, jobject surface, jint frames) {
     (void)cls; if (!nxhost_vk_selftest) return -1;
@@ -505,6 +514,13 @@ void nxhost_graphics_mode_set(int scale, int opmode);   // hle_oe.c: -1 = the ga
 JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_graphicsModeSet(JNIEnv *env, jclass cls, jint scale, jint opmode) {
     (void)env; (void)cls; if (!nxhost_graphics_mode_set) return JNI_FALSE;
     nxhost_graphics_mode_set(scale, opmode); return JNI_TRUE;
+}
+// Resolution and Upscaling quality of a game with a render_cfg row, live from the in-game panel (Native.renderSet): the host keeps the setting pending and posts notification 31
+#pragma weak nxhost_render_set
+void nxhost_render_set(int outh, int pct, int quality);   // hle_render.c: -1 keeps one
+JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_renderSet(JNIEnv *env, jclass cls, jint outh, jint pct, jint quality) {
+    (void)env; (void)cls; if (!nxhost_render_set) return JNI_FALSE;
+    nxhost_render_set(outh, pct, quality); return JNI_TRUE;
 }
 // Dynamic resolution, live from the in-game panel (Native.drsSet)
 #pragma weak nxhost_drs_set

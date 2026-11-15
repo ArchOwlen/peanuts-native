@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "core/core.h"
 #include "core/mods/mod_module.h"
 #include "core/mods/mod_runtime.h"
+#include "peanuts_helper.h"
 #include "peanuts_rt.h"
 
 namespace Core::Mods {
@@ -43,6 +45,14 @@ struct PnRtAccess {
             return "-";
         }
         return rt.manifest.pages[std::min(rt.current_page, rt.manifest.pages.size() - 1)].id;
+    }
+    /// The end of the heap the runtime found (HeapLow's cached bounds) follows a heap the game opened further; it never moves
+    /// back. Nothing to do before the first ask: that one reads the page table's fields as they are then.
+    static void RaiseHeapHigh(ModRuntime& rt, u64 high) {
+        std::scoped_lock lock{rt.heap_bounds_mutex};
+        if (rt.heap_low.load(std::memory_order_relaxed) != 0 && rt.heap_high.load(std::memory_order_relaxed) < high) {
+            rt.heap_high.store(high, std::memory_order_release);
+        }
     }
     static u64 Ticks(const ModRuntime& rt) {
         return rt.tick_count;
@@ -172,6 +182,25 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
         LOG_INFO(Core, "peanuts_rt: game romfs served by the host's provider callbacks{}",
                  rt->romfs.list != nullptr ? "" : " (no directory listing)");
     }
+    // The mods' folders over the game's RomFS, as the game reads them ("romfs:"); "base:" keeps the game's own files
+    sys.romfs_base_root = sys.romfs_root;
+    if (config->romfs_overlay_dirs != nullptr && *config->romfs_overlay_dirs != 0) {
+        std::vector<FileSys::VirtualDir> layers;
+        const std::string all{config->romfs_overlay_dirs};
+        for (size_t at = 0; at <= all.size();) {
+            const size_t end = std::min(all.find(':', at), all.size());
+            if (end > at) {
+                if (auto d = FileSys::OpenHostDirectory(all.substr(at, end - at))) layers.push_back(std::move(d));
+            }
+            at = end + 1;
+        }
+        if (!layers.empty()) {
+            const size_t n = layers.size();
+            if (sys.romfs_root) layers.push_back(sys.romfs_root);
+            sys.romfs_root = FileSys::MakeLayeredDir(std::move(layers));
+            LOG_INFO(Core, "peanuts_rt: game romfs under {} mod folder(s): {}", n, all);
+        }
+    }
     if (config->save_dir != nullptr) {
         sys.save_root = FileSys::OpenHostDirectory(config->save_dir);
     }
@@ -217,6 +246,14 @@ PnRt* pn_rt_create(const PnRtConfig* config) {
                   config->package_dir, config->title_id);
         return nullptr;
     }
+    // The package's load plan (its mailbox and guest helper), before the runtime loads the package's module: the module
+    // takes the mailbox from the system when it is configured (mod_module_services.cpp)
+    if (config->helper.code_rewritten != nullptr) {
+        const auto helper = PeanutsHelper::Install(sys, *config, build_id);
+        if (!helper.installed && !helper.error.empty()) {
+            LOG_WARNING(Core, "peanuts_rt: the package's load plan is not installed (no guest helper, no mailbox): {}", helper.error);
+        }
+    }
     rt->runtime.emplace(sys, std::move(*manifest));
     rt->runtime->SetMainMemoryParameters(config->main_base, config->main_size);
     rt->runtime->Initialize();
@@ -230,6 +267,27 @@ void pn_rt_destroy(PnRt* rt) {
 void pn_rt_tick(PnRt* rt) {
     if (rt == nullptr) {
         return;
+    }
+    // The game's heap, once it has one (it opens it after this runtime starts): ModRuntime::HeapLow asks the page table for it.
+    // A game that opens more of it later (SetHeapSize again) moves the end: a module's sweep to get_heap_end then covers the new part
+    if (rt->memory.heap_range != nullptr) {
+        if (auto* const process = rt->system.ApplicationProcess(); process != nullptr) {
+            constexpr u64 Slack = 0x40000000ULL; // the same margin HeapLow adds
+            uint64_t base = 0, open = 0;
+            rt->memory.heap_range(rt->memory.user, &base, &open);
+            auto& pt = process->GetPageTable();
+            if (base != 0 && open != 0 && pt.GetHeapRegionStart() == 0) {
+                pt.normal_memory_size = open;
+                pt.heap_size = open + Slack;
+                pt.heap_start = base;
+            } else if (base != 0 && base == pt.GetHeapRegionStart() && open > pt.GetNormalMemorySize()) {
+                pt.heap_size = open + Slack;
+                pt.normal_memory_size = open;
+                if (rt->runtime) {
+                    Core::Mods::PnRtAccess::RaiseHeapHigh(*rt->runtime, base + open + Slack);
+                }
+            }
+        }
     }
     rt->system.core_timing.FireAll();
 }

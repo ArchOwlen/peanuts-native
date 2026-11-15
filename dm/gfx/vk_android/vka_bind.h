@@ -60,10 +60,14 @@ extern int vka_texu_elem;
 // *why set when the draw cannot run correctly. Storage buffers of global memory (SBUF, SBUF_UBO, UBO_PTR): with the library's ssbo_align (header; DMSH_VK_SSBO_ALIGN) they are
 // bound at their address rounded down to it, the range grown by the difference (the shader adds it back); with 0 (an older library) at the exact address, and one off the
 // device's dev_align refuses the draw. An UNKNOWN record refuses it too. *uses_pool is set when the shader reads set 1 (the texture or sampler pool)
+// PEANUTS: *uses_pool bits: VKA_POOL_READS the shader reads set 1 (pools); VKA_POOL_DYN it has dynamic handle arrays (DMSH_VK_KIND_TEX_DYN / SAMP_DYN), so c2 holds slot indices
+#define VKA_RF_DYN 0x80   // PEANUTS: vka_res.flags: an element of a dynamic handle array (most elements hold nothing the shader reads: nothing is reported for them)
+#define VKA_POOL_READS 1
+#define VKA_POOL_DYN 2
 int vka_walk(const vka_bstate *s, int nvn_stage, const dmsh_vk_entry *e, const dmsh_vk_bind *b, uint32_t ssbo_align, uint64_t dev_align, vka_read_fn rd, void *rd_ctx,
              vka_res *out, int max, int *uses_pool, char *why, size_t whyn);
 // Fills a driver segment as the GPU's driver would (nvn_mtl.m encode_args NVN_RB_DRV0 / DRV2 / PUSH): DMSH_DRV_SIZE bytes for banks 0 and 2, DMSH_PUSH_SIZE for the push bank.
-// pool: the shader reads the pools (c2 then holds the handles without the pools' bases, as the game wrote them)
+// pool: VKA_POOL_READS: the shader reads the pools (c2 then holds the handles without the pools' bases, as the game wrote them); VKA_POOL_DYN: c2 holds slot indices (PEANUTS)
 void vka_drv_fill(const vka_bstate *s, int nvn_stage, int bank, int pool, uint8_t *d);
 size_t vka_drv_size(int bank);
 // The handle the driver's c2 holds at byte off for a stage (nvn_mtl.m c2_handle), and a combined texture slot's handle (tex_slot_h: past slot 31 an image slot shares the word)

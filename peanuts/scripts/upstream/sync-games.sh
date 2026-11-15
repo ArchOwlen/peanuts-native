@@ -2,7 +2,7 @@
 # Per-title report (and, gated, a scoped pull) of a game profile from upstream/android.
 #
 # The whole-tree rebase (peanuts/scripts/upstream-update.sh) is the only routine update path
-# (CRITIQUE-phase1.md UPSTREAM §2 must-fix #3): a game.tsv change often depends on a game.py or
+# (found in review): a game.tsv change often depends on a game.py or
 # host change landing in the SAME upstream commit, and game.py silently ignores unknown keys, so
 # a profile pulled on its own can look fine and simply not apply. This script is a report by
 # default, and --apply only proceeds when every upstream commit touching this titleid's profile

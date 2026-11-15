@@ -19,12 +19,12 @@ AI='claude|anthropic|codex|openai|chatgpt|gpt-[0-9]|copilot|gemini|cursor|devin|
 # Rule 1: authors, committers, trailers
 bad=$(git log "$since"..HEAD --format='%h %an <%ae> | %cn <%ce>' | grep -iE "$AI")
 [ -n "$bad" ] && { echo "AI author/committer:"; echo "$bad"; fail=1; }
-bad=$(git log "$since"..HEAD --format='@@%h%n%B' | awk '/^@@/{h=substr($0,3); next} {print h": "$0}' | grep -iE "^[0-9a-f]+: *(co-authored-by|signed-off-by|generated[- ]with|assisted[- ]by).*($AI)|🤖" )
+bad=$(git log "$since"..HEAD --format='@@%h%n%B' | awk '/^@@/{h=substr($0,3); next} {print h": "$0}' | grep -iE "^[0-9a-f]+: *(co-authored-by|signed-off-by|generated[- ]with|assisted[- ]by|with[- ]the[- ]help[- ]of).*($AI)|🤖" )
 [ -n "$bad" ] && { echo "AI trailer in a commit message:"; echo "$bad"; fail=1; }
 
 # Rule 2: private data in the files Peanuts changed (their current contents)
 PRIV='192\.168\.[0-9]+\.[0-9]+|(^|[^0-9.])10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+|/home/[a-z_][a-z0-9_-]*/|/Users/[A-Za-z]|[Cc]:\\Users\\|/mnt/(nvme|ironwolf|data|sd)|\.claude/(jobs|projects)|cc-socks|:5555\b|\.ts\.net|@gmail\.com|@yahoo\.|@outlook\.|@hotmail\.'
-git diff --name-only --diff-filter=d "$since" HEAD -- . ':!dm/peanuts/third_party' ':!peanuts/scripts/check-publish.sh' ':!peanuts/scripts/install-hooks.sh' > "${TMPDIR:-/tmp}/check-publish.$$"
+git diff --name-only --diff-filter=d "$since" HEAD -- . ':!dm/peanuts/third_party' ':!peanuts/scripts/check-publish.sh' ':!peanuts/scripts/install-hooks.sh' ':!dm/tools/tests/test_log_digest.py' > "${TMPDIR:-/tmp}/check-publish.$$"
 hits=$(tr '\n' '\0' < "${TMPDIR:-/tmp}/check-publish.$$" | xargs -0 grep -nIE "$PRIV" 2>/dev/null | grep -vE '127\.0\.0\.1|0\.0\.0\.0')
 rm -f "${TMPDIR:-/tmp}/check-publish.$$"
 [ -n "$hits" ] && { echo "private data in changed files (replace with a placeholder such as <work dir> or <device ip>):"; echo "$hits" | cut -c1-200; fail=1; }

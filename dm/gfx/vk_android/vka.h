@@ -8,6 +8,7 @@
 #include <vulkan/vulkan_android.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdlib.h>   // PEANUTS: getenv/atoi (vka_red_repeat)
 #include "../nvn/nvn_obj.h"
 #include "../../host/dm.h"
 #include "vka_fmtlist.h"
@@ -15,7 +16,10 @@
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 #define VRED(...) LOG("[RED] vk: " __VA_ARGS__)
-#define VRED_ONCE(...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) VRED(__VA_ARGS__); } while (0)
+// PEANUTS: DM_VK_RED_REPEAT=<n> prints each VRED_ONCE site up to n times (default 1, as before): a failure that recurs later in a run, after its first
+// print, was silent (Mario Kart 8 Deluxe's black attract race, issue #6, printed nothing while it was black)
+static inline int vka_red_repeat(void) { static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_RED_REPEAT"); n = e && atoi(e) > 0 ? atoi(e) : 1; } return n; }
+#define VRED_ONCE(...) do { static _Atomic int once_; if (atomic_fetch_add(&once_, 1) < vka_red_repeat()) VRED(__VA_ARGS__); } while (0)   // PEANUTS: repeat (above)
 
 #define VKA_GLOBAL_FNS(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties) X(vkEnumerateInstanceLayerProperties) X(vkEnumerateInstanceVersion)
 #define VKA_INSTANCE_FNS(X) \
@@ -227,7 +231,7 @@ uint64_t vks_bytes_nolock(void);
 // Guest RAM is anonymous memory; each NVN memory pool becomes placed Vulkan memory at its own address when it is made (mtl_pool_add) and anonymous again when it goes (mtl_pool_del):
 // the CPU and GPU see the same bytes. A placed range is a segment with one VkBuffer over it
 int vka_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off, VkDeviceAddress *bda);   // 1 = [addr, addr + len) lies in one placed segment
-int vka_mem_release(uintptr_t lo, uintptr_t hi);    // the host gives [lo, hi) back: segments there are given back first; 0 = the host releases the range itself
+int vka_mem_release(uintptr_t lo, uintptr_t hi);    // the host gives [lo, hi) back: segments there are given back first; 0 = the host releases the range itself   // PEANUTS: a segment it covers part of stays, less that part (vka_holes.h)
 uint64_t vka_addr_run(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // bytes from addr (at most len) in the segment that holds addr, 0 = none
 void vka_mem_join_due(void);   // the replay thread at a submission's start: joins the parts of pools placed by parts that a range given to the GPU lies across (vka_mem.c)
 int vka_pool_bda(uint64_t addr, VkDeviceAddress *bda);   // the device address of a pool byte (the table the binding side reads)
@@ -263,6 +267,7 @@ typedef struct vka_img {
     int refs, inited, gpu_owned, cpu_dirty;
     int is_video;
     uint64_t last_frame;
+    uint64_t linger;         // PEANUTS: the frame a GPU-drawn image's last texture object was finalized in, kept for one of the same storage and shape (vka_tex.c linger_*); 0 = not lingering
     uint64_t pool_frame;     // the last prune that found a live texture pool slot naming it (vka_tex_prune_locked): shaders may read it through the pool, so it is in use
     uint64_t last_fence;
     int no_storage;          // remaking it with storage use was refused (img_storage_upgrade): not tried again
@@ -301,7 +306,44 @@ typedef struct vka_img {
     // The texture cache's own bookkeeping (vka_tex.c "Live images"): its place in the live list + 1 (0: not in it), the next live image in its storage address's chain,
     // and the video pool registrations count (dm_codec_video_epoch) at which it was last checked for lying in a video pool
     int live_ix; struct vka_img *mnext; uint64_t vep;
+    // PEANUTS: resolution scale (vka_resscale.inc): rsc: its VkImage is DM_RES_SCALE times the texture's size (w, h are the image's, d.width / d.height the texture's);
+    // rs_no: it is not to be scaled (what it is, or its shape was denied): not asked again
+    uint8_t rsc, rs_no;
+    // PEANUTS: region writes queued for it and not yet copied (vka_tex.c mtl_tex_write_region; each holds a reference): it is not evicted meanwhile, and a pool drop
+    // takes them back (rw_cancel_locked), since both give the image up whatever its reference count says
+    uint32_t rw_pend;
 } vka_img;
+// PEANUTS begin: resolution scale (DM_RES_SCALE, restart only): vka_resscale.h the arithmetic, vka_resscale.inc (in vka_tex.c) the images and what the rest is for
+#include "vka_resscale.h"
+extern uint32_t vka_rs_q;   // the factor in quarters (VKRS_ONE = 1x: off), set once by vka_rs_init before anything is replayed
+static inline int vka_rs_on(void) { return vka_rs_q != VKRS_ONE; }
+// Why a scaled image went back to 1x (counted; the first 16 of each logged)
+enum { RS_WHY_PASS_MIX, RS_WHY_B2T, RS_WHY_T2B, RS_WHY_STORAGE, RS_WHY_COPY_KIND, RS_WHY_RESOLVE, RS_WHY_FETCH_MIX, RS_WHY_STANDIN, RS_WHY_UPLOAD, RS_WHY_N };
+// The counts of the `res scale:` statistics line (written by the recording thread, or under the texture cache's lock; read for the line without either)
+typedef struct {
+    uint64_t up, up_no_mem, busy, down[RS_WHY_N];   // images scaled; not scaled for their size; a change put off because a holder read the image; scaled down, by reason
+    uint64_t skip;                                   // work left out once because a change of scale could not be made then (a draw, a copy, a clear, a binding)
+    uint64_t conv;                                   // texture copies between a scaled and an unscaled image, done as a converting blit
+    uint64_t pass_s, pass_1, pass_forced;            // passes over scaled targets; over targets at 1x; of those, ones with a target that could have been scaled
+    uint64_t fd_all, fd_none, fd_mixed;              // draws and dispatches of a shader that fetches by pixel: all its 2D textures scaled, none, some
+    uint64_t deny_full;
+    uint64_t ctx_key;                                // the shader of the draw being recorded, for a scale-down's log line
+} vka_rs_stat;
+extern vka_rs_stat vka_rs_st;
+extern _Atomic uint32_t vka_rs_sh[3];   // shaders made while the scale is on: all, with the fetch helper, with a pixel fetch or size query and no helper (vka_shader.c)
+extern pthread_mutex_t vka_rs_mu;       // a holder outside the recording thread reads a held image's size, scale and handle under it; a change of scale only tries it
+void vka_rs_init(void);
+int vka_tex_rs_can(vka_img *im);                                  // im could be scaled now
+int vka_tex_rs_up(vka_img *im, VkCommandBuffer cb);               // 1 = scaled (now or already), 0 = not and not later, -1 = not this time; no render pass open in cb
+int vka_tex_rs_down(vka_img *im, VkCommandBuffer cb, int why);    // 1 = at 1x (now or already), 0 = it could not be made 1x now; no render pass open in cb
+void vka_rs_stats(char *b, size_t n, double frames);
+int vka_rp_rs(const p_set_rt *rt, int has_rt);                    // vka_draw.c: the targets brought to one scale: 1 scaled, 0 at 1x, -1 not possible this time
+// A rectangle of the texture's level 0 as im's pixels (unchanged for an unscaled image); 0 = nothing of it lies inside
+static inline int vka_rs_rect(const vka_img *im, int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
+    if (!im->rsc) return 1;
+    return vkrs_region(x, w, (uint32_t)im->d.width, vka_rs_q) && vkrs_region(y, h, (uint32_t)im->d.height, vka_rs_q);
+}
+// PEANUTS end
 // Texture level lv as a level of im (a sparse or soft texture's image starts at level im->base): 0 when the image does not hold it
 static inline int vka_img_lv(const vka_img *im, uint32_t *lv) { return vksoft_lv(im->base, im->levels, lv); }
 // The layers a render target view of level lv can name: a 3D texture's slices at that level (drawn into through 2D / 2D-array views, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT), else the array layers
@@ -321,6 +363,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line);
 // Before a write is recorded into im (an attachment, a clear, a copy destination, a storage image): a zero-shared image gets memory of its own, cleared (vka_tex.c img_own).
 // Call it before taking a view of im for the write. Any thread that records (takes the table lock); no render pass may be open in cb unless upload batches are on
 void vka_tex_own(vka_img *im, VkCommandBuffer cb);
+void vka_lrz_touch(VkCommandBuffer cb, vka_img *cur, int loads);   // PEANUTS: Adreno LRZ across depth buffers (vka_tex.c, DM_VK_LRZ_TOUCH)
 // Before a copy out of im, or into its texture level dst_level (-1: a copy out of it): a soft texture (vka_soft.h) the game copies from, or into at its finest level, is made
 // whole again from its storage and stays whole (vka_tex.c soft_harden). Any thread that records; no render pass may be open in cb unless upload batches are on
 void vka_tex_soft_copy(vka_img *im, int dst_level, VkCommandBuffer cb);
@@ -365,9 +408,13 @@ void vka_gp_commit(VkCommandBuffer cb, uint64_t fence);
 void vka_gp_sub_frame(uint64_t f);
 void vka_img_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to);
 // NVN2's DLSS stand-in upscalers (vka_dlss.c): mode 2 = FSR 1 with the jitter taken out, 3 = Snapdragon GSR2 3-pass; writes the output rectangle of d (level dl) from
-// the input rectangle of s (level sl), outside any render pass. Returns the mode done (3, or 2 when GSR2 lacks depth / motion), 0 = not done (the caller blits)
-int vka_dlss_fsr3(VkCommandBuffer cb, vka_img *src, vka_img *dst, vka_img *depth, vka_img *motion, const p_dlss_t2t *o);   // vka_fsr3.c: FSR 3.1 for DM_VK_DLSS=4; 0 = not done (the caller falls back to FSR 1)
-int vka_dlss_run(VkCommandBuffer cb, const p_dlss *o, int mode, vka_img *s, uint32_t sl, int sx, int sy, int iw, int ih, vka_img *d, uint32_t dl, int dx, int dy, int ow, int oh);
+// the input rectangle of s (level sl), outside any render pass. Returns the mode done (3, or 2 when GSR2 lacks depth / motion), 0 = not done (the caller blits).
+// sfmt: the input texture's view format (an sRGB texture's decodes; its image may be shared with the UNORM twin); enc: the output texture is sRGB (stored as its UNORM
+// twin), so the result is written sRGB-encoded
+int vka_dlss_fsr3(VkCommandBuffer cb, vka_img *src, VkFormat sfmt, vka_img *dst, int enc, vka_img *depth, vka_img *motion, const p_dlss_t2t *o);   // vka_fsr3.c: FSR 3.1 for DM_VK_DLSS=4; 0 = not done (the caller falls back to FSR 1)
+int vka_dlss_run(VkCommandBuffer cb, const p_dlss *o, int mode, vka_img *s, uint32_t sl, VkFormat sfmt, int sx, int sy, int iw, int ih, vka_img *d, uint32_t dl, int enc, int dx, int dy, int ow, int oh);
+int vka_dlss_scale(VkCommandBuffer cb, VkImageView in, int sx, int sy, int iw, int ih, uint32_t tw, uint32_t th, vka_img *d, uint32_t dl, int dx, int dy, int ow, int oh, int enc);   // a scaled copy, sRGB-encoded with enc
+int vka_dlss_ready(void);   // the stand-in's pipelines are made (vka_dlss_scale can run)
 // The control line "screenshot" (vka_ctl.c): the present copies the window texture's crop into its command buffer, then hands the texels to the PNG writer once that submission is done
 void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, VkFormat fmt, int cx, int cy, int cw, int ch);
 void vka_ctl_shot_done(VkFence fence);
@@ -386,6 +433,7 @@ VkFormat vka_tex_id_vkfmt(int id);   // the format texture ID id is viewed in, n
 VkImageView vka_tex_id_view_bits(int id, VkCommandBuffer cb, VkImageLayout *layout);   // a storage view of its image as R32_UINT (4-byte texels), not written into the bindless table (vka_tex.c)
 int vka_tex_id_pending_rec(int id, uint8_t dim);
 int vka_tex_id_storage_pending(int id);            // texture ID id's image exists without storage use and would be remade with it at its next storage binding (a draw ends its pass first)
+int vka_tex_id_tbuf(int id, int want, int storage, uint64_t *addr, uint64_t *bytes, VkFormat *fmt, uint32_t *texel);   // PEANUTS: a buffer texture's elements as a texel buffer: guest address, bytes, view format (vka_tex.c)
 int vka_tex_id_class(int id);                       // the numeric class of texture ID id's view format: 1 uint, 2 sint, 0 other
 int vka_tex_id_class_rec(int id);                   // the same, memoized for the recording thread (by the ID's registration version)
 VkSampler vka_samp_id_rec(int id);
@@ -417,6 +465,7 @@ typedef struct vka_shader {
     struct vka_memu_sh *memu_d;         // a task / mesh shader drawn through compute: its layout and compute / vertex forms (vka_memu.c), made at its first draw
     uint8_t memu;                       // such a form itself: 1 a task / mesh shader as compute (the arena, records and push constant in its layout), 2 a generated vertex shader (the arena)
     uint64_t chash;                     // its library entry's hash (vka_shlib_entry_hash), for the pipeline cache's stamp (vka_pso.c); 0 = not in the library
+    uint8_t rs_fetch;                   // PEANUTS: it reads the support buffer's render_scale[1 + i] (a fetch by pixel or a size query of a 2D texture: vka_resscale.h vkrs_spv_scan), read only while DM_RES_SCALE is on
 } vka_shader;
 // An instanced variant's key (vka_draw.c's instanced runs): its base shader's key XOR this. It is no key of the shader library, and the variant depends on the uniform
 // binding it was made for, which a pipeline key does not record: the prewarm list records the base key and the binding instead (pwrec.inst)
@@ -588,9 +637,9 @@ void vka_present_init(void);
 // The overlay's counts (vka_fps.c): each image the present thread handed to the swapchain (shown), the game's own or a generated one; frame generation's state
 void vka_fps_note(int shown, int generated);
 void vka_fps_fg(int state, int mult);
-// Frame generation (vka_framegen.c; LSFG in lsfg/, GPL-3.0-or-later): for the game frame about to be presented (its window texture, crop, period and timeline value), the images
+// Frame generation (vka_framegen.c; LSFG in lsfg/, GPL-3.0-or-later): for the game frame about to be presented (its window texture, crop, period, timeline value and NVN format), the images
 // to present before it (gen, at most VKA_FG_MAX, the present takes its own references), how long each image of this frame should stay (hold, seconds; 0 = the game's period)
 // and the output period for the window's frame rate (0 = frame generation off). Present thread only
 enum { VKA_FG_MAX = 3 };
-int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence, vka_img **gen, double *hold, double *out_period);
+int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence, int format, vka_img **gen, double *hold, double *out_period);
 uint64_t vka_refresh_ns(void);   // vka_present.c: the panel's refresh period in ns from display timing, 0 when not known (present thread)

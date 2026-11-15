@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # PEANUTS: generates the generic host's runtime profile data from dm/games/game.py's own header() output - never from game.tsv directly, so this stays
-# coupled only to header()'s public text contract, not to game.py's internal variable names (which churn: F11 in design/platform/CRITIQUE-phase1.md,
+# coupled only to header()'s public text contract, not to game.py's internal variable names (which churn, found in review:
 # upstream added DM_GAME_* macros 56->62 across 73 commits). dm/games/game.py is upstream and must not be edited for this (PEANUTS.md rule 4).
 #
 # Usage: gen_runtime_profile.py profile <title id> <out.bin>   (one title's dm_game_profile_t, binary, packed - see profile_rt.h)
+#        gen_runtime_profile.py profile-modules <title id> <out.bin> <mod1,mod2,...>
+#                                                          (same, with the MODULES/NMOD macros replaced by the given list - a modded variant build
+#                                                          whose mods add a module past game.tsv's own row, dm/tools/pack_android.py --modules; the
+#                                                          generic host reads this file instead of the title's shipped asset when it sits beside the
+#                                                          pack as profile.bin, dev.peanuts.build.GenericProfile.envLines(Context,String,File))
 #        gen_runtime_profile.py seed <title id> <out.bin>      (the title's vk_prewarm.bin, copied verbatim; empty file when it has none)
 #        gen_runtime_profile.py schema-stamp <out.c>           (the schema version this script's field tables imply, as a small .c; compiled once into the generic host)
 #        gen_runtime_profile.py schema                          (prints the schema version, for scripts)
@@ -37,17 +42,21 @@ SCALAR = {
     'ROMFS_SUBST': ('romfs_subst', 'str'), 'NWINDOW_FN': ('nwindow_fn', 'int'), 'NSUBGROUP_ONE_LANE': ('nsubgroup_one_lane', 'int'),
     'NMESH_VEGETATION_CUT': ('nmesh_vegetation_cut', 'int'), 'NMESH_PREPASS_CUT': ('nmesh_prepass_cut', 'int'), 'NFPS_STEPS': ('nfps_steps', 'int'),
     'NDRS_CTL': ('ndrs_ctl', 'int'), 'NRES_LEVELS': ('nres_levels', 'int'),
+    'EVENT_WAIT': ('event_wait', 'int'), 'OCCLUSION_SPLIT_PASS': ('occlusion_split_pass', 'int'), 'LOW_RAM_PLACE_PART_MB': ('low_ram_place_part_mb', 'int'),
+    'LOW_RAM_IMG_CACHE_MAX_MB': ('low_ram_img_cache_max_mb', 'int'), 'LOW_RAM_APP_POOL_MB': ('low_ram_app_pool_mb', 'int'),
+    'RENDER_DEFAULT_OUT': ('render_default_out', 'str'), 'NRENDER_CFG': ('nrender_cfg', 'int'), 'NRT_POOL': ('nrt_pool', 'int'),
 }
 # PRESENCE: macros header() emits only when the game.tsv key is set (optional; absent means "the host decides some other way", e.g. by SDK version).
 PRESENCE = {'SHARED_FONT_TTF': 'shared_font_ttf', 'NVN_API_MAJOR': 'nvn_api_major', 'NVN_API_MINOR': 'nvn_api_minor'}
 # ARRAY: macros used upstream only as a `static const T x[] = DM_GAME_FOO;` initializer - the nine sites game_profile_generic.h leaves undefined
 # on purpose (see its header comment). Each needs its own literal parser (the C-literal shapes are fixed by game.py, checked against game.py's own
 # tests by check-all below) and a fixed-capacity encoder matching profile_rt.h.
-ARRAY_NAMES = {'MODULES', 'DISPLAY_VERSIONS', 'WINDOW_FN', 'SUBGROUP_ONE_LANE', 'MESH_VEGETATION_CUT', 'MESH_PREPASS_CUT', 'FPS_STEPS', 'DRS_CTL', 'RES_LEVELS'}
+ARRAY_NAMES = {'MODULES', 'DISPLAY_VERSIONS', 'WINDOW_FN', 'SUBGROUP_ONE_LANE', 'MESH_VEGETATION_CUT', 'MESH_PREPASS_CUT', 'FPS_STEPS', 'DRS_CTL', 'RES_LEVELS',
+               'RENDER_CFG', 'RENDER_QUALITY', 'RT_POOL'}
 
 KNOWN = set(SCALAR) | set(PRESENCE) | ARRAY_NAMES
 
-# CRITIQUE-generic.md G-2: the schema must cover the *layout* (field order, sizes, capacities), not only the known-macro-name set - a same-size field
+# Found in review: the schema must cover the *layout* (field order, sizes, capacities), not only the known-macro-name set - a same-size field
 # reorder or type-width change keeps every macro name the same and would otherwise pass unnoticed. LAYOUT is profile_rt.h's dm_game_profile_t field list,
 # by hand, in its exact declared order, as (field name, C type) pairs: both this hash and DM_PROFILE_LAYOUT_SIZE (schema_stamp, from the real encoder
 # output) feed into the schema, and profile_rt.c's _Static_assert(sizeof(dm_game_profile_t) == DM_PROFILE_LAYOUT_SIZE, ...) catches the struct drifting
@@ -66,6 +75,10 @@ LAYOUT = [
     ('nmesh_vegetation_cut', 'u32'), ('mesh_vegetation_cut', 'u64[128]'), ('nmesh_prepass_cut', 'u32'), ('mesh_prepass_cut', 'row[64]:u64x4'),
     ('nfps_steps', 'u32'), ('fps_steps', 'row[8]:char[48]+u64+u32+u32+u32+u64[3]'), ('ndrs_ctl', 'u32'), ('drs_ctl', 'row[8]:char[48]+u64x4'),
     ('nres_levels', 'u32'), ('res_levels', 'row[8]:char[48]+u64+u32+u32+row[12]:u64+u32'),
+    ('event_wait', 'u32'), ('occlusion_split_pass', 'u32'), ('low_ram_place_part_mb', 'u32'), ('low_ram_img_cache_max_mb', 'u32'), ('low_ram_app_pool_mb', 'u32'),
+    ('render_default_out', 'char[16]'), ('render_quality', 'u32[4]'),
+    ('nrender_cfg', 'u32'), ('render_cfg', 'row[4]:char[48]+u64+u32x4+u32[8][4]+u32x5'),
+    ('nrt_pool', 'u32'), ('rt_pool', 'row[4]:char[48]+char[16]+u64+u32x3+u32[4]x3+u32'),
 ]
 
 
@@ -191,11 +204,11 @@ def parse_res_levels(rhs, n):
     return out
 
 
-# --- binary encoding: natural C struct alignment, not packed (CRITIQUE-generic.md should-fix: #pragma pack(1) let call sites take a typed pointer into an
+# --- binary encoding: natural C struct alignment, not packed (found in review: #pragma pack(1) let call sites take a typed pointer into an
 # unaligned uint64_t field, UB even though AArch64 tolerates the actual load). Packer mirrors the C compiler's own layout rules (each field aligned to its
 # own size, a struct's size rounded up to its own largest member alignment, so an array of structs has uniform stride) - the one thing that must stay in
 # step with profile_rt.h's field order by hand; DM_PROFILE_LAYOUT_SIZE (schema_stamp) and the _Static_assert in profile_rt.c catch the two drifting apart.
-CAPS = dict(modules=8, display_versions=16, window_fn=8, subgroup_one_lane=16, mesh_vegetation_cut=128, mesh_prepass_cut=64, fps_steps=8, drs_ctl=8, res_levels=8)
+CAPS = dict(modules=8, display_versions=16, window_fn=8, subgroup_one_lane=16, mesh_vegetation_cut=128, mesh_prepass_cut=64, fps_steps=8, drs_ctl=8, res_levels=8, render_cfg=4, rt_pool=4)
 
 
 def pad(s, n):
@@ -262,6 +275,48 @@ def row_res_levels(build, table, n, nl, lists12):
     return p.finish()
 
 
+RCFG_SLOTS = 8   # rcfg_row_t's RCFG_MAX (dm/host/render_cfg.h)
+RTP_TIERS = 4    # rtpool_row_t's RTP_TIERS (dm/host/rt_pool.h)
+
+
+def parse_render_cfg(rhs, n):
+    if n == 0: return []
+    out = []
+    for row in split_top(unbrace(rhs))[:n]:
+        p = split_top(unbrace(row))
+        sz = [tuple(as_int(x) for x in split_top(unbrace(e))) for e in split_top(unbrace(p[6]))]
+        out.append((unq(p[0]), as_int(p[1]), as_int(p[2]), as_int(p[3]), as_int(p[4]), as_int(p[5]), sz, [as_int(x) for x in p[7:12]]))
+    return out
+
+
+def parse_rt_pool(rhs, n):
+    if n == 0: return []
+    out = []
+    for row in split_top(unbrace(rhs))[:n]:
+        p = split_top(unbrace(row))
+        out.append((unq(p[0]), unq(p[1]), as_int(p[2]), as_int(p[3]), as_int(p[4]), as_int(p[5]),
+                    [as_int(x) for x in split_top(unbrace(p[6]))], [as_int(x) for x in split_top(unbrace(p[7]))], [as_int(x) for x in split_top(unbrace(p[8]))], as_int(p[9])))
+    return out
+
+
+def row_render_cfg(build, table, n, stride, out_off, ren_off, sz, tail):
+    p = Packer(); p.raw(build, 48); p.u64(table)
+    for v in (n, stride, out_off, ren_off): p.u32(v)
+    for i in range(RCFG_SLOTS):
+        for v in (list(sz[i]) if i < len(sz) else [0, 0, 0, 0]): p.u32(v)
+    for v in tail: p.u32(v)
+    return p.finish()
+
+
+def row_rt_pool(build, module, off, word, base, nt, mb, w, h, out_h):
+    p = Packer(); p.raw(build, 48); p.raw(module, 16); p.u64(off)
+    for v in (word, base, nt): p.u32(v)
+    for a in (mb, w, h):
+        for i in range(RTP_TIERS): p.u32(a[i] if i < len(a) else 0)
+    p.u32(out_h)
+    return p.finish()
+
+
 def pack_rows(rows, cap, zero_row):
     """cap already-built (bytes, alignment) rows into one (bytes, alignment); slots past len(rows) get zero_row (a (bytes, alignment) of the same row
     type with every field 0/"", built even when there are zero real rows - a title's count alone must not change this table's per-row size/alignment)."""
@@ -272,7 +327,27 @@ def pack_rows(rows, cap, zero_row):
     return p.finish()
 
 
-def build_profile_bytes(g):
+MOD_MEMORY_KEYS = {'mem_reserve': 'MEM_RESERVE', 'mem_alias': 'MEM_ALIAS', 'app_pool': 'APP_POOL'}
+
+
+def mod_memory(title_id):
+    """{macro: value text} from mod_memory.tsv for this title: rows `<title ID> <key> <value>`, key one of MOD_MEMORY_KEYS, '#' comments"""
+    out = {}
+    f = HERE / 'mod_memory.tsv'
+    if not f.is_file(): return out
+    for line in f.read_text().splitlines():
+        cells = line.split('#', 1)[0].split()
+        if len(cells) != 3 or cells[0].upper() != str(title_id).upper(): continue
+        if cells[1] not in MOD_MEMORY_KEYS: sys.exit(f'gen_runtime_profile.py: mod_memory.tsv: {cells[1]} is not one of {sorted(MOD_MEMORY_KEYS)}')
+        try: as_int(cells[2])   # a number, or this stops here
+        except ValueError: sys.exit(f'gen_runtime_profile.py: mod_memory.tsv: {cells[0]} {cells[1]}: {cells[2]} is not a number')
+        out[MOD_MEMORY_KEYS[cells[1]]] = cells[2]
+    return out
+
+
+def build_profile_bytes(g, modules_override=None):
+    """modules_override: a modded variant build's own module list (dm/tools/pack_android.py --modules, dev.peanuts.build.ModBuild.Plan.modules),
+    replacing game.tsv's MODULES/NMOD for this one profile.bin; None (the normal path) uses header()'s own values, byte for byte as before."""
     d = parse_defines(gamepy.header(g))
     unknown = set(d) - KNOWN
     if unknown: sys.exit(f'gen_runtime_profile.py: {g.id}: game.py header() emits unknown macro(s) {sorted(unknown)} - add them to SCALAR/PRESENCE/ARRAY_NAMES '
@@ -280,13 +355,20 @@ def build_profile_bytes(g):
     missing = {n for n in SCALAR if n not in d}
     if missing: sys.exit(f'gen_runtime_profile.py: {g.id}: header() did not emit expected scalar macro(s) {sorted(missing)} (game.py changed shape?)')
 
+    # A modded variant's memory (mod_memory.tsv beside this file): a mod's larger files can need more of the application pool than the game's profile gives the
+    # game itself, and the profile's own numbers stay as tested for the game without mods (its memory lies where it did)
+    if modules_override is not None:
+        for key, value in mod_memory(g.id).items(): d[key] = value
+
     def val(name): return d[name]
 
-    for cnt, cap, label in ((as_int(val('NMOD')), CAPS['modules'], 'modules'), (len(parse_display_versions(val('DISPLAY_VERSIONS'))), CAPS['display_versions'], 'display_versions'),
+    nmod_count = len(modules_override) if modules_override is not None else as_int(val('NMOD'))
+    for cnt, cap, label in ((nmod_count, CAPS['modules'], 'modules'), (len(parse_display_versions(val('DISPLAY_VERSIONS'))), CAPS['display_versions'], 'display_versions'),
                             (as_int(val('NWINDOW_FN')), CAPS['window_fn'], 'window_fn'), (as_int(val('NSUBGROUP_ONE_LANE')), CAPS['subgroup_one_lane'], 'subgroup_one_lane'),
                             (as_int(val('NMESH_VEGETATION_CUT')), CAPS['mesh_vegetation_cut'], 'mesh_vegetation_cut'),
                             (as_int(val('NMESH_PREPASS_CUT')), CAPS['mesh_prepass_cut'], 'mesh_prepass_cut'), (as_int(val('NFPS_STEPS')), CAPS['fps_steps'], 'fps_steps'),
-                            (as_int(val('NDRS_CTL')), CAPS['drs_ctl'], 'drs_ctl'), (as_int(val('NRES_LEVELS')), CAPS['res_levels'], 'res_levels')):
+                            (as_int(val('NDRS_CTL')), CAPS['drs_ctl'], 'drs_ctl'), (as_int(val('NRES_LEVELS')), CAPS['res_levels'], 'res_levels'),
+                            (as_int(val('NRENDER_CFG')), CAPS['render_cfg'], 'render_cfg'), (as_int(val('NRT_POOL')), CAPS['rt_pool'], 'rt_pool')):
         if cnt > cap: sys.exit(f"gen_runtime_profile.py: {g.id}: {label} has {cnt} rows, past this script's fixed capacity {cap} (raise CAPS['{label}'] and the matching cap in profile_rt.h)")
 
     p = Packer()
@@ -306,7 +388,8 @@ def build_profile_bytes(g):
     has_api = 'NVN_API_MAJOR' in d
     p.u32(int(has_api)); p.u32(as_int(d.get('NVN_API_MAJOR', '0'))); p.u32(as_int(d.get('NVN_API_MINOR', '0')))
 
-    nmod = as_int(val('NMOD')); mods = parse_modules(val('MODULES'))
+    if modules_override is not None: nmod, mods = len(modules_override), list(modules_override)
+    else: nmod = as_int(val('NMOD')); mods = parse_modules(val('MODULES'))
     p.u32(nmod)
     rows = Packer()
     for i in range(CAPS['modules']): rows.raw(mods[i] if i < len(mods) else '', 32)
@@ -355,6 +438,22 @@ def build_profile_bytes(g):
     rl_rows = [row_res_levels(b_, table, lvln, nl, (lists + [(0, 0)] * 12)[:12]) for b_, table, lvln, nl, lists in rl]
     b, a = pack_rows(rl_rows, CAPS['res_levels'], zrl); p.sub(b, a)
 
+    for n in ('EVENT_WAIT', 'OCCLUSION_SPLIT_PASS', 'LOW_RAM_PLACE_PART_MB', 'LOW_RAM_IMG_CACHE_MAX_MB', 'LOW_RAM_APP_POOL_MB'): p.u32(as_int(val(n)))
+    p.raw(unq(val('RENDER_DEFAULT_OUT')), 16)
+    rq = [as_int(x) for x in split_top(unbrace(val('RENDER_QUALITY')))]
+    assert len(rq) == 4, rq
+    for v in rq: p.u32(v)
+
+    nrc = as_int(val('NRENDER_CFG')); rc = parse_render_cfg(val('RENDER_CFG'), nrc)
+    p.u32(nrc)
+    zrc = row_render_cfg('', 0, 0, 0, 0, 0, [], [0] * 5)
+    b, a = pack_rows([row_render_cfg(*r) for r in rc], CAPS['render_cfg'], zrc); p.sub(b, a)
+
+    nrt = as_int(val('NRT_POOL')); rt = parse_rt_pool(val('RT_POOL'), nrt)
+    p.u32(nrt)
+    zrt = row_rt_pool('', '', 0, 0, 0, 0, [], [], [], 0)
+    b, a = pack_rows([row_rt_pool(*r) for r in rt], CAPS['rt_pool'], zrt); p.sub(b, a)
+
     out, _ = p.finish()
     return out
 
@@ -370,6 +469,9 @@ def main():
     a = sys.argv[1:]
     if len(a) == 3 and a[0] == 'profile':
         g = gamepy.load(a[1]); Path(a[2]).write_bytes(build_profile_bytes(g))
+    elif len(a) == 4 and a[0] == 'profile-modules':
+        g = gamepy.load(a[1]); modules = [m for m in a[3].split(',') if m]
+        Path(a[2]).write_bytes(build_profile_bytes(g, modules_override=modules))
     elif len(a) == 3 and a[0] == 'seed':
         g = gamepy.load(a[1]); p = g.dir / gamepy.SEED
         Path(a[2]).write_bytes(p.read_bytes() if p.is_file() else b'')
@@ -382,7 +484,8 @@ def main():
         for g in games: build_profile_bytes(g)   # raises/exits on any unknown macro or shape mismatch
         print(f'gen_runtime_profile.py check-all: {len(games)} profiles, all macros known, schema {schema_version():#010x}, layout {layout_size()} bytes')
     else:
-        sys.exit('usage: gen_runtime_profile.py profile <id> <out.bin> | seed <id> <out.bin> | schema-stamp <out.h> | schema | check-all')
+        sys.exit('usage: gen_runtime_profile.py profile <id> <out.bin> | profile-modules <id> <out.bin> <mod1,mod2,...> | seed <id> <out.bin> | '
+                 'schema-stamp <out.h> | schema | check-all')
 
 
 if __name__ == '__main__':

@@ -32,6 +32,7 @@ def install():
             args = tool_lock.xlate_command(args[0]) + list(args[1:])
         return run(args, *a, **k)
     subprocess.run = run_
+    if os.name != 'nt': return   # PEANUTS: Linux needs only the translator's start (scripts/pack_android.py starts this file there too); the rest is Windows's
 
     ntf = tempfile.NamedTemporaryFile
     @functools.wraps(ntf)
@@ -82,6 +83,6 @@ def expand_args(args):
 
 
 if __name__ == '__main__':
-    if os.name == 'nt': install()
+    if os.name == 'nt' or sys.platform.startswith('linux'): install()   # PEANUTS: Linux, for the translator (the repository's apphost is the Mac's)
     sys.argv = [BUILD] + expand_args(sys.argv[1:])
     runpy.run_path(BUILD, run_name='__main__')

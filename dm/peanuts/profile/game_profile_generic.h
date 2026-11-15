@@ -6,6 +6,8 @@
 // anything else runs (nxhost_main, nxreplay's main, and the Oodle worker's entry - profile_rt_load()). No per-title text or binary data is compiled in:
 // this header is the same bytes for every title.
 //
+// Three more are left undefined for the same reason and converted the same way: DM_GAME_RENDER_CFG, DM_GAME_RENDER_QUALITY, DM_GAME_RT_POOL (hle_render.c and
+// loader.c read g_profile.render_cfg / render_quality / rt_pool, through dm_pf_rcfg_rows() / dm_pf_rtpool_rows() for the two row tables).
 // Nine macros are deliberately left undefined here: DM_GAME_MODULES, DM_GAME_DISPLAY_VERSIONS, DM_GAME_WINDOW_FN, DM_GAME_SUBGROUP_ONE_LANE,
 // DM_GAME_MESH_VEGETATION_CUT, DM_GAME_MESH_PREPASS_CUT, DM_GAME_FPS_STEPS, DM_GAME_DRS_CTL, DM_GAME_RES_LEVELS. Each of those is used upstream only as
 // a `static const T x[] = DM_GAME_FOO;` brace initializer, which must be a compile-time constant - there is no way to make it read runtime data through
@@ -14,7 +16,7 @@
 // takes the untouched `#else` branch with today's compiled-in macro. If this header is in use and one of those nine macros is still referenced
 // unconverted somewhere, the build fails with "undeclared" at that line - that failure is intentional: it is the build guard for a missed site.
 //
-// This file is hand-written, not generated (CRITIQUE-generic.md §3: an earlier draft of this comment claimed otherwise). What gen_runtime_profile.py
+// This file is hand-written, not generated (found in review: an earlier draft of this comment claimed otherwise). What gen_runtime_profile.py
 // generates is the per-title profile.bin, from dm/games/game.py's own header() output; it checks that header() never emits a macro name outside its
 // own SCALAR/PRESENCE/ARRAY_NAMES tables (peanuts/scripts/check-runtime-profile.sh runs that, as check-all, over every profile under dm/games and fails
 // the same way) - but a new SCALAR macro needing a `#define` here, and a new ARRAY_NAMES macro needing a converted call site, are both edits a person
@@ -74,6 +76,14 @@
 #define DM_GAME_NFPS_STEPS (g_profile.nfps_steps)
 #define DM_GAME_NDRS_CTL (g_profile.ndrs_ctl)
 #define DM_GAME_NRES_LEVELS (g_profile.nres_levels)
+#define DM_GAME_EVENT_WAIT (g_profile.event_wait)
+#define DM_GAME_OCCLUSION_SPLIT_PASS (g_profile.occlusion_split_pass)
+#define DM_GAME_LOW_RAM_PLACE_PART_MB (g_profile.low_ram_place_part_mb)
+#define DM_GAME_LOW_RAM_IMG_CACHE_MAX_MB (g_profile.low_ram_img_cache_max_mb)
+#define DM_GAME_LOW_RAM_APP_POOL_MB (g_profile.low_ram_app_pool_mb)
+#define DM_GAME_RENDER_DEFAULT_OUT (g_profile.render_default_out)
+#define DM_GAME_NRENDER_CFG (g_profile.nrender_cfg)
+#define DM_GAME_NRT_POOL (g_profile.nrt_pool)
 
 // Presence macros: upstream's #ifdef/#if-defined call sites are themselves converted (hle_sdk16.c, hle_nvn.c) to read g_profile.has_x at run time under
 // #ifdef DM_RUNTIME_PROFILE; nothing here needs to fake "definedness". Kept as plain reads for anywhere else that just wants the value when present.

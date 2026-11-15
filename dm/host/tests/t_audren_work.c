@@ -89,6 +89,7 @@ void dm_guest_thread_join(void *tt) {
     joins++;
 }
 uint64_t now_ns(void) { return 0; }
+__thread _Atomic int dm_host_work;   // PEANUTS: dm.h's host-work count (hle_thread.c), which the render lock's waiters raise
 void *dm_pcmout_open(int ch) { (void)ch; return NULL; }
 void dm_pcmout_close(void *k) { (void)k; }
 void dm_pcmout_start(void *k) { (void)k; }
@@ -101,7 +102,35 @@ void hle_bind_system_event(void *ev, int ac) {
 }
 uint32_t hle_dup_readable_handle(uint32_t h) { assert(h == 0x1002); return 0x1003; }
 
+// PEANUTS: a thread that waits for the render lock counts as blocked (host work), so the same-core handoff of the render thread's signal of the game's renderer event
+// (which it makes holding that lock) ends when the woken sound thread's catch-up render waits for it: the deadlock of Metroid Dread's issue #8
+static _Atomic(_Atomic int *) lock_waiter_work;
+static _Atomic int lock_waiter_done;
+static void *lock_waiter(void *arg) {
+    (void)arg;
+    atomic_store(&lock_waiter_work, &dm_host_work);
+    render_lock(); render_unlock();
+    assert(atomic_load(&dm_host_work) == 0);
+    atomic_store(&lock_waiter_done, 1);
+    return NULL;
+}
+static void render_lock_wait_is_host_work(void) {
+    pthread_t th; int counted = 0;
+    render_lock(); render_lock(); render_unlock();   // the render thread's lock, and the nested one of its render
+    assert(!pthread_create(&th, NULL, lock_waiter, NULL));
+    for (int i = 0; i < 5000 && !counted; i++) {   // up to 5 s for the waiter to block
+        _Atomic int *w = atomic_load(&lock_waiter_work);
+        counted = w && atomic_load(w) == 1;
+        if (!counted) usleep(1000);
+    }
+    assert(counted && !atomic_load(&lock_waiter_done));
+    render_unlock();
+    pthread_join(th, NULL);
+    assert(atomic_load(&lock_waiter_done));
+}
+
 int main(void) {
+    render_lock_wait_is_host_work();
     uint8_t param[P_SIZE] = {0}, saved[P_SIZE];
     const uint32_t words[] = {48000, 240, 132, 19, 138, 1, 16, 0, 0, 85, 1800, 0, 0, 0x38564552};
     memcpy(param, words, sizeof words);

@@ -79,6 +79,7 @@ add_library(peanuts_rt STATIC
   ${PNRT_THIRD_PARTY}/bc_decoder/bc_decoder.cpp
   ${PNRT_THIRD_PARTY}/astc/video_core/textures/astc.cpp
   peanuts_rt.cpp
+  peanuts_helper.cpp
 )
 target_compile_features(peanuts_rt PUBLIC cxx_std_20)
 target_include_directories(peanuts_rt

@@ -18,7 +18,7 @@ import java.util.Map;
 /**
  * Upstream's launcher classes (dev.nxnative.android, package-private) read through reflection, as dev.peanuts.Games does, so no upstream file needs a hook: the APK's
  * profiles (BuildConfig.NX_PROFILES, public), a dump's or .nup's title ID (Pack.titleIdOf), a .nup's packages (Nup.open().packages), SAF URIs → paths (PathUtil),
- * the game list and its readiness (Game.load, Game.ready) and the pack for a game (Folders.packFor). Everything that reads files runs off the main thread.
+ * the game list and its readiness (Game.load, Game.ready). Everything that reads files runs off the main thread.
  */
 final class Upstream {
     private static final String P = "dev.nxnative.android.";
@@ -147,15 +147,6 @@ final class Upstream {
             m.invoke(a, g);
             return true;
         } catch (Throwable t) { Log.w("peanuts", "launch: " + cause(t)); return false; }
-    }
-
-    /** The pack folder upstream would use for a game (Folders.packFor: the picked one, the app's packs/<id>, beside or inside the game, <id>-work/<any>); null without one */
-    static File packFor(Context c, File game, String titleId) {
-        try {
-            Method m = Class.forName(P + "Folders").getDeclaredMethod("packFor", Context.class, File.class, String.class);
-            m.setAccessible(true);
-            return (File) m.invoke(null, c, game, titleId);
-        } catch (Throwable t) { Log.w("peanuts", "packFor " + game + ": " + cause(t)); return null; }
     }
 
     private static Field field(Class<?> k, String n) throws NoSuchFieldException { Field f = k.getDeclaredField(n); f.setAccessible(true); return f; }

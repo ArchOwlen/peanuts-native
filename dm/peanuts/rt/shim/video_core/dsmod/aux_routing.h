@@ -387,6 +387,10 @@ public:
         std::scoped_lock lk{ui_mutex};
         ui_sink = sink_;
     }
+    /// PNRT: number of UI frames stored so far (diagnostics).
+    u64 UiSerial() const {
+        return ui_serial.load();
+    }
     UiSink ui_sink{};
     static constexpr u64 NoLayer = 0; // VI layer ids start at 1
 

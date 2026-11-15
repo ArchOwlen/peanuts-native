@@ -303,6 +303,10 @@ void peanuts_tick(void) {
 // The game's RomFS (DM_ROMFS) is the runtime's romfs root: a plain folder as a directory, a .nup's inner path through the provider callbacks of peanuts_nup.c.
 #include <android/log.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "peanuts_nup.h"
 
 static int g_rt_tried;
@@ -321,6 +325,85 @@ static void rt_ranges_refresh(void) {
     qsort(r, n, sizeof r[0], range_cmp);
     pthread_mutex_lock(&g_rd_mu); memcpy(g_rd, r, n * sizeof r[0]); g_nrd = n; g_rd_at = time(NULL); pthread_mutex_unlock(&g_rd_mu);
 }
+// The game's code as its file has it. The process runs main rewritten (dm/tools/patch_nso.py: x18 sites, cuts, patches), so the bytes in memory differ from the file's at
+// the runs of main.changed.tsv; a package's module that hashes a function to know the build, or decodes its instructions for an address, then fails on every function
+// with such a run (Fire Emblem: Three Houses: 2 of the 42 its monastery map needs, so the page waited for ever). main.orig.bin has the file's bytes of those runs, in the
+// table's order: a read by the runtime gets them in place of the rewritten ones, and a direct pointer into that part of main is refused (the caller then reads).
+// A pack made before the rewriter wrote main.orig.bin has none: the runtime reads the rewritten code, as before, until the game is built again
+typedef struct { uint64_t a; uint32_t len, pos; } orig_run;
+static orig_run *g_or; static int g_nor; static uint8_t *g_orig; static uint64_t g_or_lo, g_or_hi;
+static void rt_orig_load(uint64_t main_base) {
+    const char *d = dm_main_dir(); if (!d || g_nor) return;
+    char p[900]; snprintf(p, sizeof p, "%s/main.changed.tsv", d);
+    FILE *f = fopen(p, "r"); if (!f) return;
+    int cap = 0, n = 0; orig_run *r = NULL; uint32_t pos = 0; char line[128];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        char *e; uint64_t off = strtoull(line, &e, 16); if (e == line) continue;
+        uint64_t len = strtoull(e, NULL, 16); if (!len || len > (1u << 24)) continue;
+        if (n == cap) { cap = cap ? cap * 2 : 1024; orig_run *nr = realloc(r, (size_t)cap * sizeof *r); if (!nr) { free(r); fclose(f); return; } r = nr; }
+        r[n++] = (orig_run){main_base + off, (uint32_t)len, pos}; pos += (uint32_t)len;
+    }
+    fclose(f);
+    snprintf(p, sizeof p, "%s/main.orig.bin", d);
+    int fd = n ? open(p, O_RDONLY) : -1; uint8_t *b = fd >= 0 ? malloc(pos) : NULL;
+    ssize_t got = b ? read(fd, b, pos) : -1; char one; int more = b && read(fd, &one, 1) == 1;
+    if (fd >= 0) close(fd);
+    if (got != (ssize_t)pos || more) {
+        __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion: %s (%d changed runs of main, %u bytes): the runtime reads main's code as rewritten; build the game again for the file's own bytes",
+                            fd < 0 ? "no main.orig.bin in the pack" : "main.orig.bin is not the size main.changed.tsv says", n, pos);
+        free(b); free(r); return;
+    }
+    g_or = r; g_orig = b; g_or_lo = r[0].a; g_or_hi = r[n - 1].a + r[n - 1].len; g_nor = n;
+    __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion: main's code is read as its file has it (%d rewritten runs, %u bytes from main.orig.bin)", n, pos);
+}
+static void rt_orig_apply(uint64_t addr, uint8_t *buf, size_t len) {
+    if (!g_nor || addr >= g_or_hi || addr + len <= g_or_lo) return;
+    int lo = 0, hi = g_nor;   // the first run that ends after addr
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_or[mid].a + g_or[mid].len <= addr) lo = mid + 1; else hi = mid; }
+    for (int i = lo; i < g_nor && g_or[i].a < addr + len; i++) {
+        uint64_t a = g_or[i].a > addr ? g_or[i].a : addr, b = g_or[i].a + g_or[i].len < addr + len ? g_or[i].a + g_or[i].len : addr + len;
+        memcpy(buf + (a - addr), g_orig + g_or[i].pos + (a - g_or[i].a), (size_t)(b - a));
+    }
+}
+// For a package's load plan (rt/peanuts_helper.cpp): 1 when [addr, addr + len) holds a run of main the rewriter changed or moved, or when its list is not there
+static int rt_code_rewritten(void *u, uint64_t addr, size_t len) {
+    (void)u;
+    if (!g_nor) return 1;
+    if (addr >= g_or_hi || addr + len <= g_or_lo) return 0;
+    int lo = 0, hi = g_nor;
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_or[mid].a + g_or[mid].len <= addr) lo = mid + 1; else hi = mid; }
+    return lo < g_nor && g_or[lo].a < addr + len;
+}
+// The game's heap for a module's get_heap_begin (Pokemon Sword's companion reads everything from the heap's start)
+static void rt_heap_range(void *u, uint64_t *base, uint64_t *open_len) { (void)u; size_t n = 0; dm_guest_heap_range(base, &n); *open_len = n; }
+// Room for a package's guest helper (rt/peanuts_helper.cpp): the end of the gap the loader leaves inaccessible between main's patch area and its base (a main with the patch
+// area before the base, loader.c map_image: 16 or 32 MB, of which the patches take a few), else free pages just past the last module. A branch in main reaches either
+static uint64_t rt_code_block(void *u, size_t size) {
+    (void)u;
+    module_t *m = module_named("main");
+    if (!m || !size || (size & 0x3FFF)) return 0;
+    if (m->patch_off < 0 && (uint64_t)-m->patch_off >= m->patch_len + size) {
+        uint8_t *a = (uint8_t *)m->base - size;
+        if (mprotect(a, size, PROT_READ | PROT_WRITE)) return 0;
+        memset(a, 0, size);
+        return (uint64_t)(uintptr_t)a;
+    }
+    // Past the last module, not past main: the modules stand back to back (loader.c's module arena), so with main first and others after it there is no free page
+    // behind main (Pokemon Sword: main, subsdk0, subsdk1, sdk; its companion's helper found no room). A branch reaches 128 MB either way: the search ends 120 MB from
+    // main's base, and the helper's own linking refuses a branch that does not reach
+    { extern void *dm_module_arena_tail(size_t size);   // loader.c: the pages it keeps after the last module, where nothing else can be in the way
+      void *t = dm_module_arena_tail(size);
+      if (t) { if ((uint64_t)(uintptr_t)t + size - (uint64_t)(uintptr_t)m->base <= (120u << 20)) return (uint64_t)(uintptr_t)t; } }
+    uint64_t top = (uint64_t)(uintptr_t)m->base + m->size, lim = (uint64_t)(uintptr_t)m->base + (120u << 20);
+    for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro && (uint64_t)(uintptr_t)g_mod[i].base + g_mod[i].size > top) top = (uint64_t)(uintptr_t)g_mod[i].base + g_mod[i].size;
+    for (uint64_t at = (top + 0xFFFF) & ~0xFFFFull; at + size <= lim; at += 0x10000) {
+        void *p = mmap((void *)(uintptr_t)at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == (void *)(uintptr_t)at) return at;
+        if (p != MAP_FAILED) munmap(p, size);
+    }
+    return 0;
+}
 static int rt_range_has(uint64_t addr, size_t len) {   // [addr, addr+len) inside one cached readable range
     pthread_mutex_lock(&g_rd_mu);
     int lo = 0, hi = g_nrd - 1, ok = 0;
@@ -331,8 +414,9 @@ static int rt_range_has(uint64_t addr, size_t len) {   // [addr, addr+len) insid
 static int rt_mem_read(void *u, uint64_t addr, void *buf, size_t len) {
     (void)u;
     if (time(NULL) - g_rd_at > 2) rt_ranges_refresh();
-    if (rt_range_has(addr, len)) { memcpy(buf, (const void *)(uintptr_t)addr, len); return 1; }
+    if (rt_range_has(addr, len)) { memcpy(buf, (const void *)(uintptr_t)addr, len); rt_orig_apply(addr, buf, len); return 1; }
     if (plat_mem_read(addr, buf, len)) return 0;
+    rt_orig_apply(addr, buf, len);
     // Readable but not in the cache: maybe a new mapping, so refresh, but at most every 500 ms. Some pages read memory that stays outside the cached ranges
     // (Animal Crossing's, every tick), and a /proc/self/maps parse per such read held the tick thread at 100 % (~140 ms a tick, the page at ~7 Hz).
     struct timespec m; clock_gettime(CLOCK_MONOTONIC, &m);
@@ -340,10 +424,38 @@ static int rt_mem_read(void *u, uint64_t addr, void *buf, size_t len) {
     if (now - miss_at >= 500) { miss_at = now; rt_ranges_refresh(); }
     return 1;
 }
-static int rt_mem_write(void *u, uint64_t addr, const void *buf, size_t len) { (void)u; return plat_mem_write(addr, buf, len) == 0; }
+// A guest write: process_vm_writev (plat_mem_write) first. Reads of the cached ranges are plain memcpys, so a seccomp policy that refuses process_vm_* (ENOSYS / EPERM)
+// was never noticed on the read side, but it fails every write - and a companion's writes (Octopath Traveler 0 hiding its party HUD and raising the command panel on the
+// top screen) all go through here. The fallback copies through a pipe: write(2) the bytes in, read(2) them out at the guest address; the kernel copies to the user page and
+// fails with EFAULT on an unmapped or read-only one instead of faulting, as process_vm_writev does. The first fallback and the first total failure are logged once
+static int rt_pipe_write(uint64_t addr, const void *buf, size_t len) {
+    int p[2]; if (pipe2(p, O_CLOEXEC)) return -1;
+    size_t done = 0;
+    while (done < len) {
+        size_t k = len - done > 4096 ? 4096 : len - done;
+        if (write(p[1], (const uint8_t *)buf + done, k) != (ssize_t)k) break;
+        if (read(p[0], (void *)(uintptr_t)(addr + done), k) != (ssize_t)k) break;
+        done += k;
+    }
+    close(p[0]); close(p[1]);
+    return done == len ? 0 : -1;
+}
+static int rt_mem_write(void *u, uint64_t addr, const void *buf, size_t len) {
+    (void)u;
+    if (!plat_mem_write(addr, buf, len)) return 1;
+    static atomic_int via_pipe, failed;
+    int e = errno;
+    if (!rt_pipe_write(addr, buf, len)) {
+        if (!atomic_exchange(&via_pipe, 1)) __android_log_print(ANDROID_LOG_INFO, "peanuts", "companion guest writes: process_vm_writev failed (errno %d at 0x%" PRIx64 "), writing through a pipe instead", e, addr);
+        return 1;
+    }
+    if (!atomic_exchange(&failed, 1)) __android_log_print(ANDROID_LOG_WARN, "peanuts", "companion guest write of %zu bytes at 0x%" PRIx64 " failed (vm errno %d, pipe errno %d)", len, addr, e, errno);
+    return 0;
+}
 static uint8_t *rt_mem_pointer(void *u, uint64_t addr, size_t len) {
     (void)u; uint8_t b;
     if (!len) return NULL;
+    if (g_nor && addr < g_or_hi && addr + len > (g_or_lo & ~(uint64_t)0xfff)) return NULL;   // main's rewritten part: read through rt_mem_read (rt_orig_apply)
     if (time(NULL) - g_rd_at > 2) rt_ranges_refresh();
     if (rt_range_has(addr, len)) return (uint8_t *)(uintptr_t)addr;
     if (addr + (len - 1) < addr) return NULL;   // the span wraps
@@ -425,7 +537,7 @@ static uint64_t rt_running_title(void) {
 // same title exist in one root and which one readdir() returns first is filesystem order, i.e. random. Skip both known transient suffixes explicitly so a stray never
 // competes with the real active folder.
 //
-// PEANUTS (round 3, CRITIQUE-phase2b.md §B "early recovery"): Installer.repair() only runs when the app itself next touches the package (opening a settings
+// PEANUTS (round 3, "early recovery"): Installer.repair() only runs when the app itself next touches the package (opening a settings
 // screen, starting another install) - a player who launches the game straight after a kill that landed between the two renames of a swap gets no companion at
 // all, because the active folder is genuinely missing and ".old"/".new" are both skipped. Rather than wait for the app side, a second pass here falls back to
 // a parked "<pkg>.old" (never ".new" - an extraction in progress has no business being loaded) when no root has an active folder for the title, logging that
@@ -505,12 +617,14 @@ static void rt_start(void) {
     }
     c.package_dir = dir;
     c.romfs_dir = base_romfs[0] ? base_romfs : NULL;
+    c.romfs_overlay_dirs = getenv("DM_ROMFS_OVERLAY");   // the mods' folders the game's rom: mount reads first (hle_fs.c): a companion sees the files the game sees (Luminescent Platinum's companion tells the mod by one of its files)
     c.title_id = title;
     // The whole NSO build id when the launcher hands it (PN_BUILD_ID, dev.peanuts.build.GameEnv: 64 hex digits; the host's own is the first 8 bytes): a package's native
     // module may list whole ids and refuse a prefix. Taken only when it begins with the host's
     const char *full = getenv("PN_BUILD_ID");
     c.build_id_hex = full && strlen(full) >= strlen(m->build_id) && !strncasecmp(full, m->build_id, strlen(m->build_id)) ? full : m->build_id;
     c.main_base = (uint64_t)(uintptr_t)m->base;
+    rt_orig_load(c.main_base);
     c.main_size = m->size;
     c.panel_w = 1240; c.panel_h = 1080;
     // R5: the runtime's own data (persisted flags, "user:" assets, and the staging folder a package's native module is copied to before dlopen) lives in the app's
@@ -526,10 +640,11 @@ static void rt_start(void) {
     mkdir(data_dir, 0700);
     c.data_dir = data_dir;
     c.save_dir = getenv("DM_SAVE");
-    c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer;
+    c.memory.read = rt_mem_read; c.memory.write = rt_mem_write; c.memory.pointer_at = rt_mem_pointer; c.memory.heap_range = rt_heap_range;
     c.pad.set_button = rt_pad_button; c.pad.set_stick = rt_pad_stick;
     c.ui.publish_ui = rt_ui_publish; c.ui.publish_ui_partial = rt_ui_publish_partial;
     c.haptics.pulse = rt_haptic;
+    c.helper.code_rewritten = rt_code_rewritten; c.helper.slot18_offset = (uint32_t)plat_slot_key_entry(PLAT_SLOT_K18); c.helper.code_block = rt_code_block; c.helper.text_end = m->text_end;   // a package's load plan: rt/peanuts_helper.cpp
     c.log = rt_log; c.log_level = 2;
     g_rt = pn_rt_create(&c);
     atomic_store(&g_rt_state, g_rt ? 1 : 3);

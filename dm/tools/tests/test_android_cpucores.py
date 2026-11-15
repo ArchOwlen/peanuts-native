@@ -53,7 +53,9 @@ class Workers(unittest.TestCase):
         self.assertEqual(got['workers'], '3')
 
     def test_service_sets_it(self):
-        self.assertIn('PackEngine.setenv("DMSH_VK_PROCS", String.valueOf(CpuCores.shaderWorkers()))', SERVICE.read_text())
+        text = SERVICE.read_text()   # PEANUTS: the count is CpuCores.shaderWorkers() sized down for the phone's memory (BuildMemory)
+        self.assertIn("CpuCores.shaderWorkers()", text)
+        self.assertIn('PackEngine.setenv("DMSH_VK_PROCS", String.valueOf(shaderWorkers))', text)
 
 
 if __name__ == '__main__':

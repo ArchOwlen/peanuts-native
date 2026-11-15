@@ -103,7 +103,11 @@ static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadca
 // blocks swapped, a click
 static pthread_mutex_t g_render_mu; static pthread_once_t g_render_mu_once = PTHREAD_ONCE_INIT;
 static void render_mu_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_render_mu, &a); pthread_mutexattr_destroy(&a); }
-static void render_lock(void) { pthread_once(&g_render_mu_once, render_mu_init); pthread_mutex_lock(&g_render_mu); }
+// PEANUTS: a guest thread that waits for this lock counts as blocked (dm_host_mutex_lock, hle_thread.c's same-core wake handoff): the render thread holds it through the SDK's signal of
+// the game's renderer event, the signal wakes the game's sound thread (a higher priority on the same core), and the handoff waits until that thread blocks. The sound thread's update
+// then waited for this lock for its catch-up render (a timer-driven update just before the event's own, nothing rendered since the one before), a wait the host counted as running:
+// neither side ever went on, the renderer stopped for good and the game's cutscene clock with it (Metroid Dread, issue #8: the game's 45,692nd render)
+static void render_lock(void) { pthread_once(&g_render_mu_once, render_mu_init); dm_host_mutex_lock(&g_render_mu); }
 static void render_unlock(void) { pthread_mutex_unlock(&g_render_mu); }
 
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
@@ -131,27 +135,36 @@ static void render_main(void *arg) {
     // bursts rendered catch-up frames (Fire Emblem: Three Houses: 550 per 2000) and the sound dragged
     uint64_t next = now_ns();
     while (atomic_load(&g_open)) {
+        int held = 0;   // PEANUTS: the output held the thread back (see the pacing below)
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
             if (b) { free_list[nfree++] = b; break; }
-            dm_pcmout_wait(out, 10);
+            held = 1; dm_pcmout_wait(out, 10);
             if (!atomic_load(&g_open)) break;
         }
         if (!nfree) break;
         uint64_t t = now_ns();   // PEANUTS: clock pacing (see above)
         if (t > next + FRAME_NS * NBUF) next = t;   // far behind (the output stopped, the thread held off): render now, the cadence starts afresh
+        // PEANUTS: held back by a full output, the cadence starts afresh too. The clock is 0.5 % fast, so the output's queue fills in the end; Android's output then hands
+        // back four blocks at once every 20 ms, and the thread, behind its clock by the wait, rendered them back to back and stalled again: frames and renderer events in
+        // bursts, the game's updates in the gaps (300 catch-up frames per 2000 in Fire Emblem: Three Houses). From the release on it renders one frame per 5 ms again
+        else if (held && t > next) next = t;
         else if (next > t) { struct timespec ts = {0, (long)(next - t)}; nanosleep(&ts, NULL); }
         next += FRAME_NS - FRAME_NS / 200;
         const int16_t *src; int got;
         render_lock();   // PEANUTS: render lock (see above)
         uint32_t h = atomic_load(&g_cq_head);
         if (h != atomic_load(&g_cq_tail)) { src = g_cq[h % CQ]; got = g_cq_n[h % CQ]; atomic_store(&g_cq_head, h + 1); cq_popped(); }   // play queued catch-up output first
-        else { g_frame_n = 0; exec(g_handle[0], g_handle[1]); src = g_frame; got = g_frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
-        render_unlock();   // PEANUTS: render lock (see above)
+        else { g_frame_n = 0; exec(g_handle[0], g_handle[1]); src = g_frame; got = g_frame_n; cq_popped(); }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event. PEANUTS: cq_popped wakes an update that waits for this render (h_ars_Update)
+        // PEANUTS: the frame is copied out before the lock is released. Taking a frame off a full queue wakes the update that waits for room (cq_popped), and its catch-up
+        // render goes into the slot just taken: copied after the unlock, the block played was that newer frame, the frame taken was never played, and the newer one played
+        // again in its turn four blocks later. Fire Emblem: Three Houses keeps the queue full (one update in four renders a catch-up frame): 16.6 % of its sounding 5 ms
+        // blocks were exact copies of the block four before, heard as crackle; Animal Crossing: New Horizons the same
         int n = got ? got : 240;
         gbuf *b = free_list[--nfree];
         if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
         b->size = (uint64_t)n * 4;
+        render_unlock();   // PEANUTS: render lock (see above)
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
@@ -537,6 +550,23 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
     static Result (*orig)(void *, void *, size_t, void *, size_t, const void *, size_t); if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
     static uint64_t last_r = ~0ull;
     uint64_t u = atomic_fetch_add(&g_updates, 1) + 1, r = atomic_load(&g_renders);
+    // PEANUTS: an update with nothing rendered since the one before first waits for the render thread's next frame (at most 15 ms; DM_AUDREN_WAIT=0: no wait, as before), and
+    // renders a catch-up frame only when none came. The console's renderer runs by its own 5 ms timer whatever the game does, so a sound thread that wakes late and updates
+    // twice in a row moves nothing there; a catch-up frame here ran the voices 5 ms ahead of the clock each time. Fire Emblem: Three Houses streams its music through a
+    // voice's four 5 ms wave buffers and refills them by the clock: one update in four rendered a catch-up frame, the voice reached buffers not refilled yet, and a quarter
+    // of the sounding blocks were exact copies of the block 20 ms before (crackle); Animal Crossing: New Horizons the same
+    if (last_r != ~0ull && r == last_r) {
+        static int wait_on = -1; if (wait_on < 0) { const char *e = getenv("DM_AUDREN_WAIT"); wait_on = !e || atoi(e); }
+        if (wait_on && atomic_load(&g_cq_tail) == atomic_load(&g_cq_head)) {   // (no queued frame: the render thread renders its next one itself)
+            struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 15000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            pthread_mutex_lock(&g_cq_mu);
+            dm_host_work++;   // a wait for the render thread is not a thread running on its core (see render_lock)
+            while (atomic_load(&g_open) && atomic_load(&g_renders) == r && !pthread_cond_timedwait(&g_cq_cv, &g_cq_mu, &dl)) {}
+            dm_host_work--;
+            pthread_mutex_unlock(&g_cq_mu);
+            r = atomic_load(&g_renders);
+        }
+    }
     if (last_r != ~0ull && r == last_r) {
         uint64_t c = atomic_fetch_add(&g_catchups, 1) + 1;
         if (c <= 3) LOG("audren: no frame rendered before update %llu, rendering a catch-up frame first (%llu so far)", (unsigned long long)u, (unsigned long long)c);
@@ -544,7 +574,9 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
         if (t - atomic_load(&g_cq_head) >= CQ) {   // queue full: wait for the render thread to play one (every 5 ms), so catch-up frames keep real time; at most 50 ms (an output that stopped)
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 50000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
             pthread_mutex_lock(&g_cq_mu);
+            dm_host_work++;   // PEANUTS: a wait for the render thread is not a thread running on its core (same-core handoff, see render_lock)
             while (atomic_load(&g_open) && t - atomic_load(&g_cq_head) >= CQ && !pthread_cond_timedwait(&g_cq_cv, &g_cq_mu, &dl)) {}
+            dm_host_work--;   // PEANUTS
             pthread_mutex_unlock(&g_cq_mu);
         }
         // PEANUTS: render lock around the catch-up render too (see above), so it cannot cross a render-thread render
@@ -556,6 +588,12 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
     Result res = orig(sys, o, on, p, pn, in, inn);
     last_r = atomic_load(&g_renders);
     return res;
+}
+
+// PEANUTS: the renderer's state for the thread dump (hle_thread.c svc_thread_dump): a stalled audio clock shows as a render count that stops while the updates go on
+void dm_audren_dump(void) {
+    LOG("audren: %s, %llu renders, %llu updates (%llu catch-up), catch-up queue %u of %d", atomic_load(&g_open) ? "open" : "closed", (unsigned long long)atomic_load(&g_renders),
+        (unsigned long long)atomic_load(&g_updates), (unsigned long long)atomic_load(&g_catchups), (unsigned)(atomic_load(&g_cq_tail) - atomic_load(&g_cq_head)), CQ);
 }
 
 // Output device: one built-in speaker, stereo (the audio device service still goes through IPC; the host answers directly)

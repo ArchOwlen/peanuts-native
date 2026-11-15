@@ -4,6 +4,7 @@
 // fields instead of a real page table (0 = unknown: the runtime uses its fallback window).
 #pragma once
 
+#include <atomic>
 #include <vector>
 
 #include "common/common_types.h"
@@ -18,17 +19,18 @@ inline u64 GetInteger(u64 v) {
 
 class KPageTable {
 public:
-    u64 heap_start{};
-    u64 heap_size{};
-    u64 normal_memory_size{};
+    // Written by pn_rt_tick (the tick thread) once the game has a heap, read from any thread that asks a module host for it
+    std::atomic<u64> heap_start{};
+    std::atomic<u64> heap_size{};
+    std::atomic<u64> normal_memory_size{};
     [[nodiscard]] u64 GetHeapRegionStart() const {
-        return heap_start;
+        return heap_start.load();
     }
     [[nodiscard]] u64 GetHeapRegionSize() const {
-        return heap_size;
+        return heap_size.load();
     }
     [[nodiscard]] u64 GetNormalMemorySize() const {
-        return normal_memory_size;
+        return normal_memory_size.load();
     }
 };
 

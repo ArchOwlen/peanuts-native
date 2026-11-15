@@ -696,7 +696,7 @@ __attribute__((visibility("default"))) void nxhost_drs_set(int min_pct, int max_
 }
 static void drs_install(void) {
     module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro
     dm_pf_drs_ctl_t *rows = g_profile.drs_ctl;
 #else
     static const struct { const char *build; uint64_t params, pick, budget, preset; } rows[] = DM_GAME_DRS_CTL;

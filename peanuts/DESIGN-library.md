@@ -18,7 +18,7 @@ Overlay rules still apply (PEANUTS.md): new code only under `dev/peanuts/…` an
 
 Matching: an NSP/XCI's title id and type come from its content metadata (CNMT: base, patch = update, add-on = DLC); an update's base is title id with the low 11 bits = 0x800 → base; a DLC's base = (title id >> 12 << 12) | 0 … use the CNMT "application id" field. Updates/DLC are listed under the base game they belong to.
 
-## Importer C API — `dm/peanuts/import/nximport.h` (agent A), JNI in `dm/peanuts/import/nximport_jni.c` → `dev.peanuts.importer.Native`
+## Importer C API — `dm/peanuts/import/nximport.h`, JNI in `dm/peanuts/import/nximport_jni.c` → `dev.peanuts.importer.Native`
 
 ```c
 typedef struct NxImportInfo { char title_id[17]; char app_id[17]; int kind; /* 0 base 1 update 2 dlc */ unsigned version; char name[256]; char publisher[256]; } NxImportInfo;
@@ -32,14 +32,14 @@ const char *nximport_last_error(void);
 ```
 The `.nup` layout and compression are upstream's (`dm/host/nup_image.h`, `scripts/pack_dump.py` for the folder layout: `base/exefs`, `base/romfs`, `update/<version>/exefs|romfs`, `addon/<title id>/romfs`); write the format the host reads (uncompressed entries are fine; `DM_NUP_ZSTD` entries optional).
 
-## Library UI — `dev.peanuts.ui` (agent B)
+## Library UI — `dev.peanuts.ui`
 
 - `SetupActivity`: first run (or Settings › Setup): pick `prod.keys` (SAF, copied to `files/keys/`), pick firmware folder (optional; extracts fonts via `Native.firmwareFonts`), pick game folder (required; All files access flow as upstream's `Folders`), optional update folder and DLC folder. Stored in `dev.peanuts` prefs (`PeanutsPrefs`).
 - `LibraryActivity` (the LAUNCHER entry, replacing `CatalogActivity`'s): scans the roots, groups by base title id, shows cards: art (icon from the file via `Native.icon`, or the catalog's GameTDB art later), name, status chip: **Ready** (pack present and fits, per upstream `PackFind`/`Game`), **Build** (needs import and/or Prepare), **No profile** (title not in the APK's `BuildConfig.NX_PROFILES`). Tap: Ready → Play (start `GameActivity` as upstream's `Game`/`FrontendLaunch` does, by title id); else → `GameSheet`.
-- `GameSheet` (bottom sheet / dialog): rows Base (file, version), Update (newest found; "add…" to pick another), DLC (list; add…), Companion (catalog state: not available / available x.y / installed x.y), and **Build**. Build hands off to agent C's `BuildPipeline`.
+- `GameSheet` (bottom sheet / dialog): rows Base (file, version), Update (newest found; "add…" to pick another), DLC (list; add…), Companion (catalog state: not available / available x.y / installed x.y), and **Build**. Build hands off to `BuildPipeline`.
 - Reuse upstream classes read-only through `dev.peanuts.Games` (reflection) where needed; never edit upstream UI.
 
-## Build pipeline + settings integration — `dev.peanuts.build` and `dev.peanuts.settings` (agent C)
+## Build pipeline + settings integration — `dev.peanuts.build` and `dev.peanuts.settings`
 
 - `BuildPipeline.start(ctx, sheetState)`: (1) if base is NSP/XCI → `Native.writeNup` into `<game folder>/<Name>/<Name>.nup` with progress (foreground service with notification, resumable per step); (2) add the `.nup` to upstream's game list the way `--es add_game` does (call `AdbControl`/`Ondevice` paths via intents to `MainActivity`, exactly as adb does: `--es ondevice_dump <nup> --ez ondevice_start true`, then the panel's Start — find and call the service directly if an intent cannot start it); (3) install the chosen companion (reuse `dev.peanuts.Installer`/`Catalog`); (4) report progress back to the sheet (LiveData/callback) and finish with Ready.
 - Companion in game settings: one `PEANUTS` hook in upstream's game settings screen (`GameSettings.java` — find the right place, e.g. after the GPU driver row) adds a **Companion** section built by `dev.peanuts.settings.CompanionSection.view(ctx, titleId)`: current version, Install/Update/Remove, "Open on second screen: Physical/Off" (stored in prefs for later use). The old `CatalogActivity` stays as a fallback but loses its launcher entry.

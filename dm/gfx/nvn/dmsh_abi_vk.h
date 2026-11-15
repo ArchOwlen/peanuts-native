@@ -81,6 +81,9 @@
 #define DMSH_VK_KIND_GMEM_LOG 21         // gmem_log: the write log of those stores, STORAGE_BUFFER, cleared per draw or dispatch
 #define DMSH_VK_KIND_SHARED_SPILL 22     // shared_spill: a compute program's shared memory past DMSH_VK_SHARED_MAX, STORAGE_BUFFER, the record's bytes per workgroup slice. Workgroup w
                                          // (linear index (z * groups y + y) * groups x + x) uses slice w mod (the bound range / bytes); slices not cleared (shared memory starts undefined)
+#define DMSH_VK_KIND_TEX_DYN 23          // tex_dyn: Ryujinx's fallback array of 32 buffer textures (<stage>_tb_cb0_40000000, UNIFORM_TEXEL_BUFFER, profile key tex_dyn_slots): element k = the texture in
+                                         // slot k (combined, else separate slot DMSH_SEPTEX_SLOT0 + k). The shader's own c2 words are then slot indices (vka_walk sets bit 2 of *uses_pool, vka_drv_fill reads it)
+#define DMSH_VK_KIND_SAMP_DYN 24         // samp_dyn: the same array of 32 samplers (<stage>_s_cb0_40000000, SAMPLER): element k = the separate sampler in slot k, else the sampler of the combined handle in texture slot k
 #define DMSH_VK_KIND_UNKNOWN 255         // ?: not placed; the replay refuses the shader
 
 // Binding record flags

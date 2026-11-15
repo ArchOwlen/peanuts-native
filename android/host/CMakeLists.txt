@@ -45,6 +45,29 @@ endforeach()
 file(GLOB HOST_C CONFIGURE_DEPENDS ${HOST}/*.c)
 list(REMOVE_ITEM HOST_C ${HOST}/hle_movie_avc.c)   # VideoToolbox: dm/host/plat/movie_avc_android.c stands in
 list(APPEND HOST_C ${HOST}/plat/plat_android.c ${HOST}/plat/movie_avc_android.c ${HOST}/plat/front_android.c)
+# Local wireless (nn::ldn) over IP: pokopia-native's portable co-op module, wired by dm/host/hle_coop.c and inert unless DM_COOP is set. The module is a pinned
+# third-party source the tree vendors separately (dm/third_party/pokopia-coop by default; -DNX_COOP_VENDOR_DIR=<dir> builds against a copy elsewhere). Where it is absent
+# the host builds as before: NX_COOP_VENDOR=0, dm_coop_node() is NULL and every hook keeps its offline answer
+# Tested dependency: Dittobyte/Recompia runtime/third_party/pokopia-coop at 75dae2f2ccdada74e6b8ba12ea7de30560a84221.
+# Preserve the MIT originals' notices and Recompia extension attribution. Vendoring/licence changes are a separate maintainer-owned version bump.
+set(NX_COOP_VENDOR_DIR "${TP}/pokopia-coop" CACHE PATH "The portable co-op module's sources (coop.h and its .c files)")
+set(NX_COOP_VENDOR 0)
+if(EXISTS "${NX_COOP_VENDOR_DIR}/coop.h")
+  set(COOP_C)
+  if(NOT EXISTS "${NX_COOP_VENDOR_DIR}/coop_int.h")
+    message(FATAL_ERROR "Incomplete co-op module: missing coop_int.h in NX_COOP_VENDOR_DIR")
+  endif()
+  foreach(part ldn vnet mpnet plat auth disc)
+    if(NOT EXISTS "${NX_COOP_VENDOR_DIR}/coop_${part}.c")
+      message(FATAL_ERROR "Incomplete co-op module: missing coop_${part}.c in NX_COOP_VENDOR_DIR")
+    endif()
+    list(APPEND COOP_C "${NX_COOP_VENDOR_DIR}/coop_${part}.c")
+  endforeach()
+  list(APPEND HOST_C ${COOP_C})
+  set(NX_COOP_VENDOR 1)
+else()
+  message(STATUS "co-op module not found at ${NX_COOP_VENDOR_DIR}: local wireless stays offline (NX_COOP_VENDOR=0)")
+endif()
 # Audio (AAudio, in hle_audio.c), AAC and H.264 (AMediaCodec), input, motion, rumble and the JNI bindings: dm/host/android
 file(GLOB HOST_ANDROID_C CONFIGURE_DEPENDS ${HOST}/android/*.c)
 list(APPEND HOST_C ${HOST_ANDROID_C})
@@ -99,9 +122,9 @@ function(nxhost_add tgt game)
   add_dependencies(${tgt} ${tgt}_seed)
   target_link_libraries(${tgt} PRIVATE peanuts_rt)   # PEANUTS: the companion runtime
   set_target_properties(${tgt} PROPERTIES LINKER_LANGUAGE CXX)   # PEANUTS: link with the C++ driver so libc++ comes in (the host is C)
-  target_include_directories(${tgt} PRIVATE ${GEN}/${game} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST})
+  target_include_directories(${tgt} PRIVATE ${GEN}/${game} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST} ${NX_COOP_VENDOR_DIR})
   # DM_NUP_ZSTD: compressed files of a NUP container are decompressed with zstddec (dm/host/nup_image.h)
-  target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
+  target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD NX_COOP_VENDOR=${NX_COOP_VENDOR} $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
   # As the Mac host (-O1 -g -Wall -Wno-unused-function). Hidden visibility: the assembly reaches C symbols with adrp, which a shared library allows only for symbols it binds itself
   # -Wno-format: the host prints uint64_t with %ll* (unsigned long long on Darwin, unsigned long on Linux: the same 64 bits)
   target_compile_options(${tgt} PRIVATE -O1 -g -Wall -Wno-unused-function -Wno-format -fvisibility=hidden)
@@ -113,7 +136,7 @@ function(nxhost_add tgt game)
   target_link_libraries(${tgt} PRIVATE vpx dav1d zstddec aaudio mediandk android log m dl z)   # libvulkan.so is opened at run time (vka_dev.c)
 endfunction()
 
-# PEANUTS: one libnxhost.so for every title (-PnxGenericHost=true, design/platform/IMPL-GENERIC.md), no per-title game_profile.h/vk_prewarm_seed.h custom
+# PEANUTS: one libnxhost.so for every title (-PnxGenericHost=true), no per-title game_profile.h/vk_prewarm_seed.h custom
 # command: the include path points at dm/peanuts/profile's fixed stand-ins instead (game_profile_generic.h, vk_prewarm_seed_generic.h, both named
 # game_profile.h / vk_prewarm_seed.h on that path so dm.h's #include "game_profile.h" and vka_pso.c's #include "vk_prewarm_seed.h" need no edit), and
 # dm/peanuts/profile/profile_rt.c (the runtime loader) plus a schema stamp (one per build, not per title) are compiled in.
@@ -121,7 +144,7 @@ function(nxhost_add_generic tgt)
   set(PROFILE_DIR ${ROOT}/dm/peanuts/profile)
   set(GEN_INC ${GEN}/generic)
   # configure_file (not file(COPY)) re-runs whenever the source changes, even on an incremental build with no reconfigure, so editing
-  # game_profile_generic.h/vk_prewarm_seed_generic.h cannot silently leave a stale copy on the include path (CRITIQUE-generic.md should-fix).
+  # game_profile_generic.h/vk_prewarm_seed_generic.h cannot silently leave a stale copy on the include path (found in review).
   configure_file(${PROFILE_DIR}/game_profile_generic.h ${GEN_INC}/game_profile.h COPYONLY)
   configure_file(${PROFILE_DIR}/vk_prewarm_seed_generic.h ${GEN_INC}/vk_prewarm_seed.h COPYONLY)
   set(SCHEMA_H ${GEN}/schema_stamp.h)
@@ -132,8 +155,8 @@ function(nxhost_add_generic tgt)
   add_library(${tgt} SHARED ${HOST_C} ${GFX_C} ${ASM_OUT} ${PROFILE_DIR}/profile_rt.c ${SCHEMA_H})
   target_link_libraries(${tgt} PRIVATE peanuts_rt)
   set_target_properties(${tgt} PROPERTIES LINKER_LANGUAGE CXX)
-  target_include_directories(${tgt} PRIVATE ${GEN_INC} ${GEN} ${PROFILE_DIR} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST})
-  target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
+  target_include_directories(${tgt} PRIVATE ${GEN_INC} ${GEN} ${PROFILE_DIR} ${GFX}/nvn/include ${TP}/vulkan-headers/include ${TP}/libvpx ${TP}/libvpx/config ${TP}/dav1d/include ${TP}/stb_vorbis ${HOST} ${NX_COOP_VENDOR_DIR})   # (the co-op module, as the per-title hosts)
+  target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD NX_COOP_VENDOR=${NX_COOP_VENDOR} $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
   target_compile_options(${tgt} PRIVATE -O1 -g -Wall -Wno-unused-function -Wno-format -fvisibility=hidden)
   file(GLOB VKA_C ${GFX}/vk_android/*.c)
   set_source_files_properties(${VKA_C} PROPERTIES COMPILE_OPTIONS -O2)

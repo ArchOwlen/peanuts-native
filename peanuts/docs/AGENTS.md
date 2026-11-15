@@ -114,7 +114,7 @@ this project has touched, and which edits are marked / queued for a Banana Nativ
 ## Where findings go
 
 - A fact about one title (why its profile needs a key, a measured frame rate, a known gap) → that title's own note
-  (`dm/games/<id>/README.md` if Banana Native has the convention there, or the row/notes in `RESULTS-titles.md`).
+  (`dm/games/<id>/README.md` if Banana Native has the convention there).
 - A fact about an upstream file's marking status (marked / needs a marker / queued as an upstream-candidate PR) →
   `peanuts/UPSTREAM-EDITS.md`. Don't let this drift out of sync with the actual tree — if you mark a hunk, update
   the inventory in the same commit.

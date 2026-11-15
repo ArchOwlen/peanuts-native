@@ -77,5 +77,8 @@ public:
 /// GetSubdirectory is nullptr -- only GetFile / GetFileRelative work). nullptr when `open` or
 /// `read` is missing.
 [[nodiscard]] VirtualDir OpenProviderDirectory(const PnRtRomfs& provider);
+/// Layers, the first wins: GetFile is the first layer's that has the file; GetSubdirectory is a layered directory of every layer's
+/// subdirectory of that name (nullptr when none has it); GetFiles / GetSubdirectories are the union by name. nullptr for no layers.
+[[nodiscard]] VirtualDir MakeLayeredDir(std::vector<VirtualDir> layers);
 
 } // namespace FileSys

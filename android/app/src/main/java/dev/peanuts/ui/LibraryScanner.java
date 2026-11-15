@@ -40,17 +40,17 @@ import java.util.regex.Pattern;
  * (Game.ready) or a pack.tsv lies in &lt;home&gt;/&lt;title ID&gt;-work/&lt;any&gt;/ (home: the dump folder or the .nup's folder, or that folder's parent); else BUILD.
  * Names: the probe's NACP name, else the catalog's catalog.json name, else the profile's, else the title ID.
  * <p>
- * P1 (version truth, UX-SPEC §2.1/§3.1): a BUILD title also gets a {@link Title#versionState}, read through upstream's {@code Profile} (reflection, same pattern
+ * P1 (version truth): a BUILD title also gets a {@link Title#versionState}, read through upstream's {@code Profile} (reflection, same pattern
  * as {@link Upstream}) rather than a new game.tsv parser. One gap: game.tsv's own "package" line (the version the shipped shader tables were built for) is not
  * exposed by {@code Profile} today, so {@link Title#recommendedVersion} is an approximation — the highest version in the profile's build list — not the real
- * package line. Verified true for all 131 profiles as of the phase-2 review. A round-2 runtime guard for this was removed (critique-phase2b §A-2: it never
+ * package line. Verified true for all 131 profiles as of the phase-2 review. A round-2 runtime guard for this was removed (found in review: it never
  * actually ran, and even fixed would have decompressed assets/pack/tools.zip once per title on the phone for a check that only needs to run once); the
- * check now lives in {@code peanuts/scripts/check-profiles.sh}, a build-time script, zero runtime cost. See IMPL-A.md.
+ * check now lives in {@code peanuts/scripts/check-profiles.sh}, a build-time script, zero runtime cost.
  */
 final class LibraryScanner {
     static final int BASE = 0, UPDATE = 1, DLC = 2;
     enum Status { READY, BUILD, NO_PROFILE }
-    /** The sub-states a BUILD title can be in (UX-SPEC §2.1, corrected by critique-phase1 §1 must-fix 1/8): NOT_IN_APP mirrors NO_PROFILE (kept distinct so a
+    /** The sub-states a BUILD title can be in (corrected in review): NOT_IN_APP mirrors NO_PROFILE (kept distinct so a
      *  caller that only has a Title, not the Status too, can still tell); FILE_GONE: the base or newest update file the scanner once found no longer resolves;
      *  UNSUPPORTED: the chosen version is not one of the profile's builds at all (today's silent "otherBuild"); SUPPORTED_OTHER: it is a listed build, just not
      *  the one the shipped shader tables were made for (expect a slower first build: a full shader scan); RECOMMENDED: the version Build is tuned for;
@@ -77,6 +77,9 @@ final class LibraryScanner {
         String name = "";
         Source base;
         final List<Source> updates = new ArrayList<>(), dlcs = new ArrayList<>();
+        /** The original base dumps (NSP/XCI) of a game whose base is a .nup made from them: the game no longer needs them to play or rebuild, only to take a
+         *  later update (an update's patch reads the base NCA's raw bytes, which the .nup does not keep). Settings › Library › Free up space offers them */
+        final List<Source> originals = new ArrayList<>();
         Status status = Status.BUILD;
         VersionState versionState = VersionState.UNKNOWN;
         /** The profile's builds (game.tsv build rows, via Profile.buildMap/display): version → display ("1.0.1"), null when game.tsv names none. Empty: no
@@ -166,6 +169,11 @@ final class LibraryScanner {
             Title t = titles.computeIfAbsent(s.appId, Title::new);
             if (t.base == null || (s.isNup() || s.isDump()) && t.base.needsImport()) t.base = s;
         }
+        for (Source s : sources) {   // a .nup base: the NSPs/XCIs of the same title it was made from (see Title.originals)
+            if (s.kind != BASE || !s.needsImport() || !s.file.isFile()) continue;
+            Title t = titles.get(s.appId);
+            if (t != null && t.base != null && t.base.isNup() && t.base.titleId.equals(s.titleId)) t.originals.add(s);
+        }
         for (Source s : sources) {
             if (s.kind == BASE) continue;
             Title t = titles.get(s.appId);
@@ -201,7 +209,7 @@ final class LibraryScanner {
     /** A BUILD title's version state (class doc): FILE_GONE first (nothing else matters once the file is not where it was found), then whether the newest
      *  version found on disk is in the profile's builds at all, and if so whether it is the one the shipped shader tables were made for. This is the
      *  library-grid pill's state only — it is about the newest version this title has anywhere, not about any one file a sheet's "Choose another…" picked
-     *  (critique-phase2a §A must-fix 1: the sheet computes its own, from {@code chosenUpdate}, in {@code GameSheet.chosenVersionState}; this one must not be
+     *  (found in review: the sheet computes its own, from {@code chosenUpdate}, in {@code GameSheet.chosenVersionState}; this one must not be
      *  read as "the version Build will actually use") */
     private static VersionState versionState(Title t) {
         if (fileGone(t.base) || fileGone(t.updates.isEmpty() ? null : t.updates.get(0))) return VersionState.FILE_GONE;
@@ -340,15 +348,45 @@ final class LibraryScanner {
 
     // ---- Icons ----
 
-    /** The title's icon as files/icons/<ID>.png: the one already there, else the importer's from an NSP/XCI of the title (off the main thread); null without one */
+    private static final int NUP_ICON_MAX = 4 << 20;   // a title's icon is a 256x256 picture, some hundred KiB as a PNG; anything larger is not one
+    private static final byte[] PNG_SIGNATURE = { (byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
+
+    /**
+     * The icon the PC builder wrote beside a .nup ("<the .nup's name without .nup>.png", peanuts/scripts/peanuts_build.py) copied to out; false without one.
+     * The file comes from shared storage, so it is taken only when it is a PNG by its signature and at most NUP_ICON_MAX bytes, and it reaches out by a rename:
+     * a file kept in files/icons is never read again, so half a copy or a file the decoder refuses would hide the game's cover for good.
+     */
+    private static boolean nupIcon(File nup, File out) {
+        String n = nup.getName();
+        File dir = nup.getParentFile(), to = out.getParentFile();
+        if (dir == null || to == null || n.length() <= 4) return false;
+        File png = new File(dir, n.substring(0, n.length() - 4) + ".png");
+        long len = png.isFile() ? png.length() : 0;
+        if (len < PNG_SIGNATURE.length || len > NUP_ICON_MAX) return false;
+        File tmp = new File(to, out.getName() + ".tmp");
+        try {
+            byte[] b = Files.readAllBytes(png.toPath());
+            if (b.length < PNG_SIGNATURE.length || b.length > NUP_ICON_MAX) return false;   // the file may have grown since length()
+            for (int i = 0; i < PNG_SIGNATURE.length; i++) if (b[i] != PNG_SIGNATURE[i]) return false;
+            to.mkdirs();
+            Files.write(tmp.toPath(), b);
+            if (tmp.renameTo(out)) return true;
+        } catch (Exception e) { Log.w("peanuts", "icon beside " + n + ": " + e); }
+        tmp.delete();
+        return false;
+    }
+
+    /** The title's icon as files/icons/<ID>.png: the one already there, else the PNG beside a .nup of the title (the PC builder's), else the importer's from an
+     *  NSP/XCI of the title (off the main thread); null without one */
     static File icon(Context c, Title t) {
         File out = new File(PeanutsPrefs.iconsDir(c), t.titleId + ".png");
         if (out.isFile() && out.length() > 0) return out;
-        ImporterPort imp = ImporterPort.get();
-        if (!imp.available() || !ImporterPort.ensureKeys(c)) return null;
         List<Source> all = new ArrayList<>();
         if (t.base != null) all.add(t.base);
         all.addAll(t.updates);
+        for (Source s : all) if (s.isNup() && nupIcon(s.file, out)) return out;   // a .nup holds no icon
+        ImporterPort imp = ImporterPort.get();
+        if (!imp.available() || !ImporterPort.ensureKeys(c)) return null;
         for (Source s : all) {
             if (!s.needsImport()) continue;
             out.getParentFile().mkdirs();

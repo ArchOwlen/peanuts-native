@@ -52,6 +52,13 @@
             android:name="${applicationId}.Launch"
             android:targetActivity=".FrontendLaunch"
             android:exported="true" />
+        <!-- PEANUTS: a second alias for emulator frontends (peanuts/docs/LAUNCHERS.md), same contract and no intent filters (FRONTENDS.md's Android-15 note
+             applies here too), but under a fixed name that does not embed the applicationId: a frontend's player template names it once and only ever
+             has to substitute the package before the "/", never the alias itself across the test app, -PnxApp builds and the release app -->
+        <activity-alias
+            android:name="dev.peanuts.launch.LaunchActivity"
+            android:targetActivity=".FrontendLaunch"
+            android:exported="true" />
         <!-- A .nup a file manager opens ("Open with"): its own alias, so the filter never restricts the frontends' one -->
         <activity-alias
             android:name="${applicationId}.Open"

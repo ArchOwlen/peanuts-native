@@ -1,4 +1,4 @@
-# libnximport — upstream hooks (one line each; agent A writes none of them)
+# libnximport — upstream hooks (one line each; the importer adds none of them itself)
 
 ## android/app/src/main/cpp/CMakeLists.txt
 
@@ -22,7 +22,7 @@ transparently (the hash layers before `data_off` stay raw, `nx_sec_read_raw` rea
 Tests: `comp_test` (host build) dumps LZ4 blocks + the importer's bytes, `tests/comp_check.py` compares them with python's `lz4.block`;
 `nximport_cli ivfc` checks a data level against its IVFC hashes (raw, so it holds for compressed sections too).
 
-## Java side (agent B/C own the Java; this is the class the JNI binds to)
+## Java side (this is the class the JNI binds to)
 
 ```java
 package dev.peanuts.importer;

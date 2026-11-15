@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <ranges>
@@ -119,11 +120,20 @@ inline Image RasterizeMapOverview(const MapArea& area, const MapStyle& style, u3
 
 /// Put the detailed map over the coarse downloaded overview. Transparent holes in detail reveal
 /// coarse rooms, translucent detail is composited normally, and opaque detail remains bit-exact.
-inline void CompositeMapOverview(Image& detail, const Image& overview) {
+/// `rect` (x0, y0, x1, y1; x1/y1 exclusive; null = all) limits the pass to those pixels.
+inline void CompositeMapOverview(Image& detail, const Image& overview,
+                                 const std::array<int, 4>* rect = nullptr) {
     if (detail.w != overview.w || detail.h != overview.h ||
         detail.pixels.size() != overview.pixels.size())
         return;
-    for (size_t i = 0; i < detail.pixels.size(); ++i) {
+    const int w = static_cast<int>(detail.w), h = static_cast<int>(detail.h);
+    const int ry0 = rect != nullptr ? std::clamp((*rect)[1], 0, h) : 0;
+    const int ry1 = rect != nullptr ? std::clamp((*rect)[3], 0, h) : h;
+    const int rx0 = rect != nullptr ? std::clamp((*rect)[0], 0, w) : 0;
+    const int rx1 = rect != nullptr ? std::clamp((*rect)[2], 0, w) : w;
+    for (int y = ry0; y < ry1; ++y)
+    for (int x = rx0; x < rx1; ++x) {
+        const size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
         const u32 src = detail.pixels[i];
         const u32 dst = overview.pixels[i];
         const u32 sa = src >> 24;

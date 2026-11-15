@@ -41,6 +41,39 @@ public final class PeanutsPrefs {
     public static String dlcDir(Context c) { return of(c).getString("dlc_dir", null); }
     public static void dlcDir(Context c, String p) { put(c, "dlc_dir", p); }
 
+    /** Settings › Library › Build folder: null (default) = beside the game, today's behaviour. A folder the user picked, on the phone or an SD card,
+     *  to keep every build organized by title ID instead (one folder per game, nothing loose at its top level): {@code <build folder>/<title ID>/}. */
+    public static String buildDir(Context c) { return of(c).getString("build_dir", null); }
+    public static void buildDir(Context c, String p) { put(c, "build_dir", p); }
+
+    private static final java.util.regex.Pattern TITLE_ID = java.util.regex.Pattern.compile("[0-9A-Fa-f]{16}");
+
+    /** Whether titleId is the 16 hex digits a build folder's own subfolder is named after: a build folder's top level only ever gets one of these, never a
+     *  loose file or a folder named after anything else. */
+    public static boolean validTitleId(String titleId) { return titleId != null && TITLE_ID.matcher(titleId).matches(); }
+
+    /** {@code <build folder>/<title ID>}, when a build folder is set and titleId passes {@link #validTitleId}; null otherwise, so a caller falls back to
+     *  today's places (beside the game, the app's own storage). */
+    public static File buildGameDir(Context c, String titleId) {
+        String b = buildDir(c);
+        if (b == null || b.isEmpty() || !validTitleId(titleId)) return null;
+        return new File(b, titleId.toUpperCase(Locale.ROOT));
+    }
+
+    /** {@code <build folder>/<title ID>/pack}: where a NEW build's pack goes when a build folder is set (AppStorage.pack still prefers an existing pack
+     *  already in the app's own storage, so a build made before the folder was set keeps working from there). null without a build folder, or an invalid titleId. */
+    public static File buildPackDir(Context c, String titleId) {
+        java.util.regex.Matcher m = VARIANT_ID.matcher(titleId == null ? "" : titleId);
+        if (m.matches()) {   // a build with code mods (ModStore.variantId) stays inside its game's folder: <title ID>/mod-<hash>/pack
+            File g = buildGameDir(c, m.group(1));
+            return g == null ? null : new File(g, "mod-" + m.group(2).toLowerCase(Locale.ROOT) + "/pack");
+        }
+        File g = buildGameDir(c, titleId);
+        return g == null ? null : new File(g, "pack");
+    }
+
+    private static final java.util.regex.Pattern VARIANT_ID = java.util.regex.Pattern.compile("([0-9A-Fa-f]{16})-mod-([0-9A-Fa-f]+)");
+
     public static boolean setupDone(Context c) { return of(c).getBoolean("setup_done", false); }
     public static void setupDone(Context c, boolean on) { of(c).edit().putBoolean("setup_done", on).apply(); }
 
@@ -50,10 +83,18 @@ public final class PeanutsPrefs {
     public static boolean developerReadout(Context c) { return of(c).getBoolean("developer_readout", false); }
     public static void developerReadout(Context c, boolean on) { of(c).edit().putBoolean("developer_readout", on).apply(); }
 
-    /** The roots the library scans: the game folder first, then the update and DLC folders when set and different */
+    /** Settings > Library > Haptics: false (default) = the launcher's haptics follow the system's touch feedback setting, true = none at all */
+    public static boolean hapticsOff(Context c) { return of(c).getBoolean("haptics_off", false); }
+    public static void hapticsOff(Context c, boolean off) { of(c).edit().putBoolean("haptics_off", off).apply(); }
+    /** Settings > Library > Motion: false (default) = the launcher's animations follow the system's animator scale, true = fades and the progress fill only */
+    public static boolean motionReduced(Context c) { return of(c).getBoolean("motion_reduced", false); }
+    public static void motionReduced(Context c, boolean on) { of(c).edit().putBoolean("motion_reduced", on).apply(); }
+
+    /** The roots the library scans: the game folder first, then the update and DLC folders when set and different, then the build folder (walked the same
+     *  two levels deep, so its {@code <title ID>/<name>.nup} entries are found) */
     public static List<File> roots(Context c) {
         List<File> out = new ArrayList<>();
-        for (String p : new String[] {gameDir(c), updateDir(c), dlcDir(c)}) {
+        for (String p : new String[] {gameDir(c), updateDir(c), dlcDir(c), buildDir(c)}) {
             if (p == null || p.isEmpty()) continue;
             File f = new File(p);
             if (!out.contains(f)) out.add(f);

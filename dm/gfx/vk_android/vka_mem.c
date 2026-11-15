@@ -22,6 +22,7 @@
 #include "../nvn/nvn_dirty.h"
 #include "vka_place.h"
 #include "vka_gmem.h"
+#include "vka_lowram.h"
 #include "../../host/dm.h"
 #include <errno.h>
 #include <stddef.h>
@@ -38,10 +39,12 @@
 #include "vka_mapbudget.h"
 #include "vka_fd_alias.h"
 #include "vka_fileback.h"
+#include "vka_holes.h"   // PEANUTS: ranges given back inside a placed segment
 
 static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
-typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs, fd_alias; } seg_t;
+typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs, fd_alias;
+                 VkDeviceSize boff; } seg_t;   // PEANUTS: boff, the offset of lo in buf: 0 in the table; a lookup's answer for a segment with holes is the part between two holes (lookup)
 static seg_t *g_sg; static int g_nsg, g_sgcap;   // sorted by lo, disjoint
 // Bumped (under g_rw for writing) whenever a segment comes or goes: the replay's per-thread lookup cache (vka_addr, vka_addr_run) holds while it stands
 static _Atomic uint64_t g_sg_gen = 1;
@@ -533,11 +536,79 @@ static void seg_free(const seg_t *s, int waited, uint64_t fence) {
     static _Atomic int nk; if (atomic_fetch_add(&nk, 1) < 8) VRED("giving back pool memory %#lx+%#zx: the GPU is not known to be done with it (fence %llu%s): its Vulkan memory is kept, not freed",
                                                                (unsigned long)s->lo, (size_t)(s->hi - s->lo), (unsigned long long)fence, vka_hung() ? ", GPU hang" : " not reached in the hang time");
 }
+// PEANUTS begin: Ranges given back inside placed memory (holes; the arithmetic is vka_holes.h).
+// The replay joins segments that lie end to end into one (vka_mem_join_due, "placed memory coalesced"), and a joined segment stays while any of its pools lives: it
+// still covers the range of a pool the game has finalized. The game then frees that memory and its allocator hands the pages back to the system (UnmapPhysicalMemory:
+// Pokemon Brilliant Diamond does when a MapPhysicalMemory is refused with the application pool full), and vka_mem_release gave back every segment the range touched,
+// whole: 256 KiB given back under a 208 MiB joined segment took all of it from the GPU, and nothing placed it again (its pools count as placed, mtl_pool_need skips
+// them): vertex streams read zeros, storage buffers were not bound, draws were skipped for their index buffers, and models were missing for the rest of the session.
+// Now only the range given back leaves: it is noted as a hole (g_hole) and the segment stays as it is, with its Vulkan memory, its buffer and its device address. So
+// nothing the GPU or a command buffer being recorded uses is freed or made again (a split into two segments would need new buffers, and with them the replay thread
+// and an idle queue, as a join does), and the release waits for no fence. The host then maps fresh inaccessible pages over the hole (hle_svc.c guest_release), which
+// replaces that part of the driver's placed map; the Vulkan memory under it stays allocated until the segment goes or is joined. What a hole changes:
+// - lookups (vka_addr, vka_addr_run, vka_mem_chunks) answer for the part of the segment between two holes, and "not placed" for an address in one: its CPU pages are
+//   no longer the GPU's, whatever the game writes there after it maps the range again;
+// - the hole is placed again (compact: the segment's CPU map taken down and mapped placed again in one piece, the hole filled with the bytes the CPU had there, zeros
+//   where it was not mapped, which is what the host promises for pages it gave back) when the GPU is given an address in it (cover, from mtl_pool_need: a new pool at
+//   that address), when the host maps the range again under a pool that is still live (dm_gfx_guest_open), or when the maps thread compacts the segment;
+// - a join over it (join copies the CPU's bytes into the new memory) and the segment's own give-back (unplace copies the readable pages) end it too.
+// A segment whose every byte was given back goes as before, and so does one the range covers whole. DM_VK_RELEASE_PART=0: every segment the range touches, as before.
+// Not done: the Vulkan memory under a hole is not freed (a 16 MiB hole keeps 16 MiB of driver memory until its segment goes or is joined again), and a segment of an
+// exported alias (V.fd_alias; never joined) cannot map its hole again: the hole stays unplaced there ([RED] when the GPU is given an address in it).
+// g_hole is changed under g_pl and g_rw for writing, read under either; g_nhole is its count for the checks without a lock
+static vkh_tab g_hole; static _Atomic int g_nhole;
+static int release_part(void) { static int v = -1; if (v < 0) { v = VKA_ENV("DM_VK_RELEASE_PART", 1) != 0; if (!v) VLOG("DM_VK_RELEASE_PART=0: guest memory given back under part of a placed segment takes the whole segment from the GPU"); } return v; }
+static int holes_copy(uintptr_t lo, uintptr_t hi, vkh_range **out) {   // the holes in [lo, hi), clipped (caller holds g_pl or g_rw; frees *out); the count, -1 = no memory for them
+    *out = NULL; int n = 0, i = vkh_find(&g_hole, lo), j = i; uint64_t a, e;
+    while (j < g_hole.n && g_hole.r[j].lo < hi) j++;
+    if (j == i) return 0;
+    if (!(*out = malloc((size_t)(j - i) * sizeof **out))) return -1;
+    while (vkh_next_hole(&g_hole, lo, hi, &i, &a, &e)) (*out)[n++] = (vkh_range){a, e};
+    return n;
+}
+// The protections of the nh holes h in [lo, hi), each read on its own (a hole is the host's anonymous memory, a few runs; the segment around it is split by the dirty
+// tracker into more runs than one read takes), into a list the caller frees; gaps: with the placed parts between them as one read-write run each (what an unread
+// range is taken as, prot_known). *bad: a hole's runs could not be read, it is taken as inaccessible. NULL = no memory
+enum { HOLERUN = 256 };
+static prun *hole_runs(const vkh_range *h, int nh, uintptr_t lo, uintptr_t hi, int gaps, int *n_out, int *bad) {
+    prun *out = NULL, tmp[HOLERUN]; int n = 0, cap = 0; uintptr_t at = lo; *bad = 0;
+    for (int i = 0; i <= nh; i++) {
+        uintptr_t gl = at, ge = i < nh ? (uintptr_t)h[i].lo : hi;   // the placed part before hole i (or after the last)
+        int k = 0;
+        if (i < nh && !(k = prot_runs((uintptr_t)h[i].lo, (uintptr_t)h[i].hi, tmp, HOLERUN))) { tmp[0] = (prun){(uintptr_t)h[i].lo, (uintptr_t)h[i].hi, PROT_NONE}; k = 1; *bad = 1; }
+        if (n + k + 1 > cap) { cap = 2 * cap + k + 16; prun *nr = realloc(out, (size_t)cap * sizeof *nr); if (!nr) { free(out); return NULL; } out = nr; }
+        if (gaps && ge > gl) out[n++] = (prun){gl, ge, PROT_READ | PROT_WRITE};
+        memcpy(out + n, tmp, (size_t)k * sizeof *out); n += k;
+        if (i < nh) at = (uintptr_t)h[i].hi;
+    }
+    *n_out = n;
+    return out;
+}
+static void holes_cut(uintptr_t lo, uintptr_t hi, int rw_held) {   // no address of [lo, hi) is a hole any more; caller holds g_pl (rw_held: and g_rw for writing)
+    if (!g_hole.n) return;
+    if (!rw_held) pthread_rwlock_wrlock(&g_rw);
+    if (!vkh_cut(&g_hole, lo, hi)) VRED_ONCE("placed memory %#lx+%#lx: no memory to take its ranges given back out of the table: lookups there keep answering not placed", (unsigned long)lo, (unsigned long)(hi - lo));
+    atomic_store(&g_nhole, g_hole.n); atomic_fetch_add(&g_sg_gen, 1);   // (the lookup caches hold parts between holes)
+    if (!rw_held) pthread_rwlock_unlock(&g_rw);
+}
+static int compact(uintptr_t lo, uintptr_t hi, int rw_held);
+// PEANUTS end
 static void unplace(const seg_t *sp) {
     seg_t s = *sp; size_t n = s.hi - s.lo;
     uint64_t fence = vka_fence_last();
     int waited = vka_wait_done(fence, vka_hang_ns()) && !vka_hung();
-    prun pr[MAXRUN]; int npr = prot_runs(s.lo, s.hi, pr, MAXRUN), exact = prot_known(pr, &npr, s.lo, s.hi);
+    prun pr0[MAXRUN], *pr = pr0; int npr = prot_runs(s.lo, s.hi, pr, MAXRUN), nread = npr, exact = prot_known(pr, &npr, s.lo, s.hi);   // PEANUTS: pr may be the list below
+    // PEANUTS begin: runs that were not read are taken as readable, and the copy below would fault on a hole the host holds inaccessible (a segment split by the
+    // tracker and by holes has more runs than one read takes): then each hole's own runs, the placed parts between them read-write as before
+    prun *hpr = NULL;
+    if (!nread && atomic_load(&g_nhole)) {
+        vkh_range *h; pthread_rwlock_rdlock(&g_rw); int nh = holes_copy(s.lo, s.hi, &h); pthread_rwlock_unlock(&g_rw);
+        int k = 0, bad = 0; if (nh > 0 && (hpr = hole_runs(h, nh, s.lo, s.hi, 1, &k, &bad))) { pr = hpr; npr = k; }
+        if (nh && (bad || !hpr)) VRED("giving back pool memory %#lx+%#zx: the protections of the ranges given back inside it (%d) could not be read: %s", (unsigned long)s.lo, n, nh,
+                                      hpr ? "they are taken as inaccessible (bytes the game wrote there since are lost)" : "the whole range is taken as readable");
+        free(h);
+    }
+    // PEANUTS end
     swap_begin(s.lo, s.hi);
     prot_readonly(pr, npr);
     uint8_t *t = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -585,10 +656,13 @@ static void unplace(const seg_t *sp) {
     for (int k = 0; k < npr; k++) if (pr[k].prot >= 0 && pr[k].prot != (PROT_READ | PROT_WRITE)) sw_mprotect(pr[k].lo, pr[k].hi - pr[k].lo, pr[k].prot);
     swap_end_ok(t != MAP_FAILED && exact);   // (marked as well when a call failed, e.g. the mremap and its fallback map)
     swap_end();
+    free(hpr);   // PEANUTS
     uint64_t left = vka_mem_placed_bytes(NULL);
     static int nlog; if (nlog++ < 4) VLOG("pool memory %#lx+%#zx given back as anonymous memory (%.2f GiB placed)", (unsigned long)s.lo, n, left / 1073741824.0);
 }
-static void unplace_all(segvec *v) { for (int i = 0; i < v->n; i++) { unplace(&v->s[i]); pend_done(v->s[i].lo, v->s[i].hi); } free(v->s); *v = (segvec){0}; }
+// PEANUTS: the holes of a segment given back end with it (unplace reads them, so they stay until it is done; no placement comes to the range before pend_done)
+static void holes_gone(uintptr_t lo, uintptr_t hi) { if (!atomic_load(&g_nhole)) return; pthread_mutex_lock(&g_pl); holes_cut(lo, hi, 0); pthread_mutex_unlock(&g_pl); }
+static void unplace_all(segvec *v) { for (int i = 0; i < v->n; i++) { unplace(&v->s[i]); holes_gone(v->s[i].lo, v->s[i].hi); pend_done(v->s[i].lo, v->s[i].hi); } free(v->s); *v = (segvec){0}; }   // PEANUTS: holes_gone
 
 // The segments one pool holds references on (by start)
 typedef struct { uintptr_t *lo; int n, cap; } seglist;
@@ -603,6 +677,13 @@ static int cover(uintptr_t lo, uintptr_t hi, seglist *l) {
     for (uintptr_t a = lo; a < hi;) {
         int k = sg_find(a);
         if (k >= 0 && a < g_sg[k].hi) {
+            // PEANUTS begin: a range given back inside this segment lies in the ask: its CPU pages are the host's, not the GPU's, until the segment's map is made whole
+            if (atomic_load_explicit(&g_nhole, memory_order_relaxed) && vkh_over(&g_hole, a, hi < g_sg[k].hi ? hi : g_sg[k].hi) && !compact(g_sg[k].lo, g_sg[k].hi, lock_whole())) {
+                static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("pool memory %#lx+%#lx: a range given back inside placed memory %#lx+%#lx lies in it and could not be placed again (%s): the GPU does not see that range",
+                    (unsigned long)a, (unsigned long)(hi - a), (unsigned long)g_sg[k].lo, (unsigned long)(g_sg[k].hi - g_sg[k].lo), g_sg[k].fd_alias ? "an exported alias" : "its protections were not read, or no memory");
+                ok = 0;
+            }
+            // PEANUTS end
             if (!sl_has(l, g_sg[k].lo)) { if (!lock_whole()) pthread_rwlock_wrlock(&g_rw); g_sg[k].refs++; if (!lock_whole()) pthread_rwlock_unlock(&g_rw); sl_add(l, g_sg[k].lo); }
             a = g_sg[k].hi; continue;
         }
@@ -651,18 +732,42 @@ void *vka_mem_mapped(size_t n) {
 }
 
 // The host gives [lo, hi) back (heap shrink, UnmapPhysicalMemory). Pools live there are a game error: their segments are given back first (logged), then the host's own release runs
+// PEANUTS: a segment the range covers only part of stays, with that part noted as a hole ("Ranges given back inside placed memory", above)
 static void lazy_release_note(uintptr_t lo, uintptr_t hi);
+static int pool_over(uintptr_t lo, uintptr_t hi, uintptr_t *mem, uint64_t *size);   // PEANUTS: a live pool over [lo, hi) (Pools, below)
 int vka_mem_release(uintptr_t lo, uintptr_t hi) {
     if (!vka_ok() || hi <= lo) return 0;
     segvec v = {0};
+    struct { uintptr_t lo, hi, slo, shi; } part[4]; int npart = 0, nholes = 0; uint64_t hbytes = 0;   // PEANUTS: the holes this call made (the first 4, for its lines)
     pthread_mutex_lock(&g_pl); pthread_rwlock_wrlock(&g_rw);
     int k = sg_find(lo); if (k < 0 || g_sg[k].hi <= lo) k++;
     while (k < g_nsg && g_sg[k].lo < hi) {
+        // PEANUTS begin: part of the segment: a hole, unless every byte of the segment has been given back by now (then it goes, as one the range covers whole)
+        uint64_t clo, chi;
+        if (vkh_release(g_sg[k].lo, g_sg[k].hi, lo, hi, &clo, &chi) == 2 && release_part() && vkh_add(&g_hole, clo, chi) && !vkh_covers(&g_hole, g_sg[k].lo, g_sg[k].hi)) {
+            if (npart < 4) part[npart++] = (typeof(part[0])){(uintptr_t)clo, (uintptr_t)chi, g_sg[k].lo, g_sg[k].hi};
+            atomic_fetch_add(&g_sg_gen, 1);   // (the lookup caches hold the segment, or its parts between the holes it had)
+            k++; continue;
+        }
+        // PEANUTS end
         static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("guest memory %#lx+%#lx is given back under live pool memory %#lx+%#lx: that memory leaves the GPU", (unsigned long)lo, (unsigned long)(hi - lo), (unsigned long)g_sg[k].lo, (unsigned long)(g_sg[k].hi - g_sg[k].lo));
         detach(k, &v);
     }
+    atomic_store(&g_nhole, g_hole.n); nholes = g_hole.n; hbytes = vkh_bytes(&g_hole);   // PEANUTS
     pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
     unplace_all(&v);
+    // PEANUTS begin: the lines of the holes made (outside the table's lock). Under a pool that is still live it is the game's error, as before; with no pool there
+    // it is the range of a finalized pool that a joined segment still held
+    for (int i = 0; i < npart; i++) {
+        uintptr_t pm = 0; uint64_t psz = 0;
+        static _Atomic int nred, nlog; int c;
+        if (pool_over(part[i].lo, part[i].hi, &pm, &psz)) { if (atomic_fetch_add(&nred, 1) < 8) VRED("guest memory %#lx+%#lx is given back under live pool memory %#lx+%#llx: %#lx+%#lx leaves the GPU until it is mapped again, the rest of placed memory %#lx+%#lx stays",
+                       (unsigned long)lo, (unsigned long)(hi - lo), (unsigned long)pm, (unsigned long long)psz, (unsigned long)part[i].lo, (unsigned long)(part[i].hi - part[i].lo), (unsigned long)part[i].slo, (unsigned long)(part[i].shi - part[i].slo)); }
+        else if ((c = atomic_fetch_add(&nlog, 1)) < 8 || !(c & 63))
+            VLOG("guest memory %#lx+%#lx is given back inside placed memory %#lx+%#lx (no live pool there): %#lx+%#lx is no longer placed, the rest stays (%d ranges given back inside placed memory now, %.1f MiB)",
+                 (unsigned long)lo, (unsigned long)(hi - lo), (unsigned long)part[i].slo, (unsigned long)(part[i].shi - part[i].slo), (unsigned long)part[i].lo, (unsigned long)(part[i].hi - part[i].lo), nholes, hbytes / 1048576.0);
+    }
+    // PEANUTS end
     lazy_release_note(lo, hi);   // pools not placed yet (DM_VK_PLACE_LAZY) over the range: their storage leaves the guest too
     fb_gone(lo, hi, 0);          // file-backed pieces there: dropped (the host maps fresh pages over the range next)
     return 0;
@@ -697,7 +802,14 @@ static const seg_t *lookup(uintptr_t a, seg_t *tmp) {   // the segment holding a
     int i = sg_find(a); const seg_t *r = NULL;
     if (i >= 0 && a < g_sg[i].hi) {
         *tmp = g_sg[i]; r = tmp;
-        if (c) { if (c->gen != gen) { memset(c->s, 0, sizeof c->s); c->gen = gen; } *e = g_sg[i]; }
+        // PEANUTS begin: with ranges given back inside segments, the answer is the part of the segment around a that holds none (its start boff bytes into the buffer), and none for an address in one
+        if (g_hole.n) {
+            uint64_t plo, phi;
+            if (!vkh_piece(&g_hole, tmp->lo, tmp->hi, a, &plo, &phi)) r = NULL;
+            else { tmp->boff = plo - tmp->lo; if (tmp->bda) tmp->bda += tmp->boff; tmp->lo = (uintptr_t)plo; tmp->hi = (uintptr_t)phi; }
+        }
+        // PEANUTS end
+        if (c && r) { if (c->gen != gen) { memset(c->s, 0, sizeof c->s); c->gen = gen; } *e = *tmp; }   // PEANUTS: the answer (was g_sg[i])
     }
     pthread_rwlock_unlock(&g_rw);
     return r;
@@ -705,7 +817,7 @@ static const seg_t *lookup(uintptr_t a, seg_t *tmp) {   // the segment holding a
 int vka_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off, VkDeviceAddress *bda) {
     seg_t tmp; const seg_t *g = lookup((uintptr_t)addr, &tmp);
     int ok = g && addr + len <= g->hi;
-    if (ok) { if (buf) *buf = g->buf; if (off) *off = addr - g->lo; if (bda) *bda = g->bda ? g->bda + (addr - g->lo) : 0; }
+    if (ok) { if (buf) *buf = g->buf; if (off) *off = addr - g->lo + g->boff; if (bda) *bda = g->bda ? g->bda + (addr - g->lo) : 0; }   // PEANUTS: boff
     return ok;
 }
 
@@ -720,7 +832,7 @@ void vka_mem_describe(uint64_t addr, char *out, size_t n) {
 }
 uint64_t vka_addr_run(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     seg_t tmp; const seg_t *g = lookup((uintptr_t)addr, &tmp); uint64_t n = 0;
-    if (g) { n = g->hi - addr; if (n > len) n = len; *buf = g->buf; *off = addr - g->lo; }
+    if (g) { n = g->hi - addr; if (n > len) n = len; *buf = g->buf; *off = addr - g->lo + g->boff; }   // PEANUTS: boff
     return n;
 }
 
@@ -749,7 +861,11 @@ uint64_t vka_mem_sink(void) {
 // The placed segments in address order (raw global memory's table, vka_draw.c gmem_map): at most max, the count returned
 int vka_mem_chunks(uint64_t *lo, uint64_t *hi, uint64_t *bda, int max) {
     pthread_rwlock_rdlock(&g_rw);
-    int n = 0; for (int i = 0; i < g_nsg && n < max; i++) if (g_sg[i].bda) { lo[n] = g_sg[i].lo; hi[n] = g_sg[i].hi; bda[n] = g_sg[i].bda; n++; }
+    int n = 0; for (int i = 0; i < g_nsg && n < max; i++) if (g_sg[i].bda) {
+        if (!g_hole.n || !vkh_over(&g_hole, g_sg[i].lo, g_sg[i].hi)) { lo[n] = g_sg[i].lo; hi[n] = g_sg[i].hi; bda[n] = g_sg[i].bda; n++; continue; }
+        // PEANUTS: a segment with ranges given back inside it: its parts between them (an access in one goes to the sink, as in no pool)
+        for (uint64_t at = g_sg[i].lo, a, e; n < max && vkh_next_piece(&g_hole, g_sg[i].lo, g_sg[i].hi, &at, &a, &e);) { lo[n] = a; hi[n] = e; bda[n] = g_sg[i].bda + (a - g_sg[i].lo); n++; }
+    }
     if (n == max && n < g_nsg) VRED_ONCE("more than %d placed segments: raw global memory sees the first %d", max, max);
     pthread_rwlock_unlock(&g_rw);
     return n;
@@ -775,7 +891,17 @@ static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t 
 static _Atomic int g_nlazy; static uint64_t g_lazy_bytes, g_pool_id;   // pools not (wholly) placed yet and their bytes not placed (g_lazy_bytes, g_pool_id under g_pmu)
 static _Atomic uint64_t g_lzgen = 1;   // bumped when a pool not placed yet comes (mtl_pool_add): mtl_pool_need's per-thread record of ranges with nothing left to place holds while it stands
 static int lazy_on(void) { static int v = -1; if (v < 0) { v = VKA_ENV("DM_VK_PLACE_LAZY", 1) != 0; if (!v) VLOG("DM_VK_PLACE_LAZY=0: every memory pool is placed when it is made"); } return v; }
-static uint64_t part_min(void) { static int64_t v = -1; if (v < 0) { v = (int64_t)VKA_ENV("DM_VK_PLACE_PART_MB", 1024) << 20; if (v < 0) v = 0; if (!v) VLOG("DM_VK_PLACE_PART_MB=0: every memory pool is placed whole"); } return (uint64_t)v; }
+// The default is 1024, or the profile's low_ram_place_part_mb on a low-RAM device (vka_lowram.h)
+static uint64_t part_min(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        int lr = vka_low_ram_place_part_mb();
+        v = (int64_t)VKA_ENV("DM_VK_PLACE_PART_MB", lr ? lr : 1024) << 20; if (v < 0) v = 0;
+        if (!v) VLOG("DM_VK_PLACE_PART_MB=0: every memory pool is placed whole");
+        else if (lr && v == (int64_t)lr << 20) VLOG("memory pools of %d MiB or more are placed by parts (the profile's low_ram_place_part_mb on a low-RAM device)", lr);
+    }
+    return (uint64_t)v;
+}
 static uint64_t part_gran(void) {
     static int64_t v = -1;
     if (v < 0) { int64_t m = VKA_ENV("DM_VK_PLACE_GRANULE_MB", 16); if (m < 1) m = 1; v = m << 20; uintptr_t al = pg_align(); v = (v + (int64_t)al - 1) & ~(int64_t)(al - 1); }
@@ -952,6 +1078,14 @@ void mtl_pool_need(const void *addr, uint64_t len, const char *why) {
         if (lg) placed_line(tot);
     }
 }
+// PEANUTS: 1 = a pool the game has not finalized overlaps [lo, hi) (the first found into *mem, *size); takes g_pmu
+static int pool_over(uintptr_t lo, uintptr_t hi, uintptr_t *mem, uint64_t *size) {
+    int live = 0;
+    pthread_mutex_lock(&g_pmu);
+    for (int j = 0; j < g_npool && !live; j++) if (g_pool[j].mem < hi && lo < g_pool[j].mem + g_pool[j].size) { live = 1; if (mem) *mem = g_pool[j].mem; if (size) *size = g_pool[j].size; }
+    pthread_mutex_unlock(&g_pmu);
+    return live;
+}
 static void lazy_release_note(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_pmu);   // pools not placed yet (DM_VK_PLACE_LAZY) over the range: their storage leaves the guest too
     for (int i = 0; i < g_npool; i++) if (g_pool[i].lazy && g_pool[i].mem < hi && lo < g_pool[i].mem + g_pool[i].size) {
@@ -1004,6 +1138,7 @@ static int join(int k0, int k1, seglist *l) {
     pthread_rwlock_wrlock(&g_rw);
     atomic_fetch_add(&g_sg_gen, 1);
     memmove(&g_sg[k0], &g_sg[k1 + 1], (size_t)(g_nsg - k1 - 1) * sizeof *g_sg); g_nsg -= cnt;
+    if (g_hole.n) { vkh_cut(&g_hole, lo, hi); atomic_store(&g_nhole, g_hole.n); }   // PEANUTS: ranges given back inside the parts end here: the new memory gets the CPU's bytes for the whole range, zeros from pages with no access
     pthread_rwlock_unlock(&g_rw);
     swap_begin(lo, hi);
     prot_readonly(pr, npr);   // writers wait in the fault hook from here
@@ -1210,7 +1345,11 @@ static int maps_scan(mscan *o, int nseg, uintptr_t glo, uintptr_t ghi, vkmb_hist
     return k == 0;
 }
 // One segment's CPU map made again in one piece (see above). Caller holds g_pl. 1 = done, 0 = the segment is no longer there as the scan saw it
-static int compact(uintptr_t lo, uintptr_t hi) {
+// PEANUTS: it also ends the ranges given back inside the segment ("Ranges given back inside placed memory"): the map taken down and made again puts the Vulkan memory
+// back under them, so the bytes the CPU has there (the host's pages: what the game wrote since it mapped them again, nothing where they are still given back) are
+// kept aside first and written into the memory after, zeros where the CPU had no access. rw_held: the caller holds g_rw for writing (cover under
+// DM_VK_MEM_LOCK_WHOLE). 0 as well when the holes' protections could not be read or there is no memory for their bytes (the segment and its holes as they were)
+static int compact(uintptr_t lo, uintptr_t hi, int rw_held) {
     int k = sg_find(lo); if (k < 0 || g_sg[k].lo != lo || g_sg[k].hi != hi) return 0;   // given back (or placed again) since the scan
     // An exported alias (vka_fd_alias.h) is the host's own mmap of the memory's fd, and the driver's map of it lives elsewhere: unmap_placed would take that map
     // down and a placed map is not what the alias is (on a driver without placed maps it lands elsewhere and the host stops). The maps thread never picks one
@@ -1218,7 +1357,26 @@ static int compact(uintptr_t lo, uintptr_t hi) {
     VkDeviceMemory mem = g_sg[k].mem; size_t n = hi - lo;
     nvn_dirty_hold((const void *)lo, n);   // (as place: no protection of the tracker's in the range until the swap ends)
     prun pr[MAXRUN]; int npr = prot_runs(lo, hi, pr, MAXRUN), exact = prot_known(pr, &npr, lo, hi);
+    // PEANUTS begin: the holes, their protections and room for their bytes (hsave: the holes end to end, zero pages where nothing is copied)
+    vkh_range *h = NULL; prun *hr = NULL; uint8_t *hsave = MAP_FAILED; size_t hbytes = 0; uint64_t ht0 = mono_ns();
+    int nh = atomic_load(&g_nhole) ? holes_copy(lo, hi, &h) : 0, nhr = 0, hbad = 0;
+    if (nh) {
+        for (int i = 0; i < nh; i++) hbytes += h[i].hi - h[i].lo;
+        if (nh > 0) hr = hole_runs(h, nh, lo, hi, 0, &nhr, &hbad);
+        if (hr && !hbad) hsave = mmap(NULL, hbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (hsave == MAP_FAILED) { nvn_dirty_unhold(); free(h); free(hr); return 0; }
+    }
+    // PEANUTS end
     swap_begin(lo, hi);
+    // PEANUTS begin: the holes read-only (a writer waits in the fault hook from here, as in place), then their readable bytes aside; a run lies in one hole
+    for (int i = 0, j = 0; i < nhr; i++) {
+        size_t off = 0; while (j < nh && hr[i].lo >= h[j].hi) j++;
+        for (int q = 0; q < j; q++) off += h[q].hi - h[q].lo;
+        if (hr[i].prot < 0 || j == nh) continue;
+        if (hr[i].prot & PROT_WRITE) sw_mprotect(hr[i].lo, hr[i].hi - hr[i].lo, hr[i].prot & ~PROT_WRITE);
+        if (hr[i].prot & PROT_READ) memcpy(hsave + off + (hr[i].lo - h[j].lo), (const void *)hr[i].lo, hr[i].hi - hr[i].lo);
+    }
+    // PEANUTS end
     unmap_placed(mem);   // (the bytes stay in the memory: nothing to copy, and a write before this is not lost)
     sw_hole_check(lo, n, 0, "compacting pool memory");
     int ok = 0; VkResult r = VK_SUCCESS;
@@ -1231,11 +1389,20 @@ static int compact(uintptr_t lo, uintptr_t hi) {
     }
     // The memory was mapped at this address before; without its map the GPU and the CPU would see different bytes (the segment's lookups still name it)
     if (!ok) die("compacting pool memory %#lx+%#zx: the placed map at the same address failed (%d)", (unsigned long)lo, n, r);
+    { size_t off = 0; for (int i = 0; i < nh; i++) { memcpy((void *)(uintptr_t)h[i].lo, hsave + off, h[i].hi - h[i].lo); off += h[i].hi - h[i].lo; } }   // PEANUTS: the holes' bytes into the memory (the map is whole and read-write here)
     prefault(lo, hi);   // before any protection splits it (see prefault)
     prot_apply(pr, npr);
-    swap_end_ok(exact);
+    if (nh) prot_apply(hr, nhr);   // PEANUTS: the holes' protections (the segment's runs may not have been read: more than one read takes)
+    swap_end_ok(exact && !nh);     // PEANUTS: marked with holes (their read-only pass is in no snapshot)
     swap_end();
     nvn_dirty_unhold();
+    // PEANUTS begin: no hole in the segment any more (lines after the swap, see prefault)
+    if (nh) {
+        holes_cut(lo, hi, rw_held); munmap(hsave, hbytes); free(h); free(hr);
+        static _Atomic int nlog; int c = atomic_fetch_add(&nlog, 1);
+        if (c < 8 || !(c & 63)) VLOG("placed memory %#lx+%#zx: %d ranges given back inside it (%.1f MiB) are placed again with the bytes the CPU had there (%.1f ms; %d left elsewhere)", (unsigned long)lo, n, nh, hbytes / 1048576.0, (mono_ns() - ht0) / 1e6, atomic_load(&g_nhole));
+    }
+    // PEANUTS end
     return 1;
 }
 // The largest groups of maps outside the guest block (vka_mapbudget.h vkmb_hist), from DM_VK_MAPS_HIST percent of vm.max_map_count (40, the share where the dirty
@@ -1284,7 +1451,7 @@ static void maps_tick(int *line_due) {
         uint64_t c0 = mono_ns(), bytes = 0;
         for (int j = 0; j < k; j++) {
             pthread_mutex_lock(&g_pl);
-            if (compact((uintptr_t)g_ms_lo[idx[j]], (uintptr_t)g_ms_hi[idx[j]])) { done++; shed_done += g_ms_pc[idx[j]] - 1; bytes += g_ms_hi[idx[j]] - g_ms_lo[idx[j]]; }
+            if (compact((uintptr_t)g_ms_lo[idx[j]], (uintptr_t)g_ms_hi[idx[j]], /* PEANUTS: g_rw is not held */ 0)) { done++; shed_done += g_ms_pc[idx[j]] - 1; bytes += g_ms_hi[idx[j]] - g_ms_lo[idx[j]]; }
             pthread_mutex_unlock(&g_pl);
         }
         last_compact_ns = mono_ns(); act = 1;
@@ -1325,8 +1492,32 @@ static void maps_start_once(void) {
 }
 static void maps_start(void) { static pthread_once_t o = PTHREAD_ONCE_INIT; pthread_once(&o, maps_start_once); }
 
-// The hook hle_svc.c calls when it gives guest memory back (weak no-op there for the Apple builds; its region and open hooks stay the weak no-ops)
+// The hook hle_svc.c calls when it gives guest memory back (weak no-op there for the Apple builds; its region and open hooks stay the weak no-ops)   // PEANUTS: the open hook is below
 int dm_gfx_guest_release(uintptr_t lo, uintptr_t hi) { return vka_mem_release(lo, hi); }
+// PEANUTS begin: the open hook (hle_svc.c calls it before it makes [lo, lo + n) accessible: MapPhysicalMemory, a growing heap). A range given back inside a placed
+// segment that the game maps again under a pool that is still live becomes placed again here: that pool counts as placed, so no ask of mtl_pool_need would do it,
+// and the game's buffers there would stay unseen. With no live pool over it the hole stays (plain guest memory, as any memory outside a pool) until the GPU is given
+// an address in it (cover). Without holes it is one load. The host holds its map lock here, as when it calls the release hook, which takes g_pl too
+void dm_gfx_guest_open(void *lo, size_t n) {
+    if (!n || !atomic_load_explicit(&g_nhole, memory_order_relaxed)) return;
+    uintptr_t a = (uintptr_t)lo, e = a + n;
+    pthread_rwlock_rdlock(&g_rw); int over = vkh_over(&g_hole, a, e); pthread_rwlock_unlock(&g_rw);
+    if (!over) return;   // (the usual map, somewhere else: it does not wait behind a placement for g_pl)
+    pthread_mutex_lock(&g_pl);
+    for (uintptr_t at = a; at < e;) {
+        int i = vkh_find(&g_hole, at); uint64_t hl, he;
+        if (!vkh_next_hole(&g_hole, at, e, &i, &hl, &he)) break;
+        at = (uintptr_t)he;
+        int k = sg_find((uintptr_t)hl);
+        if (k < 0 || hl >= g_sg[k].hi) continue;   // (its segment is being given back)
+        if (he > g_sg[k].hi) he = g_sg[k].hi;      // (a hole across two segments: the rest at the next turn)
+        at = (uintptr_t)he;
+        if (pool_over((uintptr_t)hl, (uintptr_t)he, NULL, NULL) && !compact(g_sg[k].lo, g_sg[k].hi, 0)) { static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("guest memory %#lx+%#lx is mapped again under a live pool, inside placed memory %#lx+%#lx, and could not be placed again: the GPU does not see it",
+                                                               (unsigned long)hl, (unsigned long)(he - hl), (unsigned long)g_sg[k].lo, (unsigned long)(g_sg[k].hi - g_sg[k].lo)); }
+    }
+    pthread_mutex_unlock(&g_pl);
+}
+// PEANUTS end
 // A guest code address as module and offset (log lines; vka_draw.c's dispatch census): 0 = in no module
 int vka_mod_off(uint64_t addr, const char **name, uint64_t *off) {
     module_t *m = addr ? module_of((const void *)(uintptr_t)addr) : NULL;

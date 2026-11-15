@@ -8,7 +8,7 @@ public interface BuildListener {
 
     /**
      * The end: ok, the message for the card's body, and a failure category (one of the constants below; "" when ok). The card uses code to pick one recovery
-     * action instead of always offering Retry (AUDIT/UX-SPEC §2.3): a thrown {@link Failure} carries its own code through BuildService/Prepare's steps, anything
+     * action instead of always offering Retry: a thrown {@link Failure} carries its own code through BuildService/Prepare's steps, anything
      * else falls back to {@link #OTHER}.
      */
     void done(boolean ok, String message, String code);
@@ -19,7 +19,7 @@ public interface BuildListener {
     /** The dump's version is not one of the profile's builds, and the player did not say "Build anyway" for it: the sheet's version row, not a silent retry */
     String WRONG_VERSION = "wrong_version";
     /** DumpLayout refused the dump for a reason that is not a version mismatch (incomplete, no RomFS, wrong title ID, …): a bad or incomplete dump, not a
-     *  missing file (critique-phase2a §A must-fix 4 — this used to share FILE_MISSING's "pick the file again", which promises a fix that will not help) */
+     *  missing file (found in review — this used to share FILE_MISSING's "pick the file again", which promises a fix that will not help) */
     String INVALID_DUMP = "invalid_dump";
     /** SpaceEstimate's warn-only pre-flight, or a real ENOSPC/"No space left" I/O error: "Free up space" */
     String OUT_OF_SPACE = "out_of_space";

@@ -74,17 +74,20 @@ import java.util.function.Predicate;
 public final class Library {
     private static final int ALL = 0, BUILDING = 1, READY = 2, BUILD = 3, NO_PROFILE = 4;
     private static final int[] FILTERS = {ALL, BUILDING, READY, BUILD, NO_PROFILE};
+    private static final int REQ_NOTIFY = 71;   // the notification permission's request (nobody reads the answer: the next notification shows or does not)
     private static final String GOES_ON = " The build goes on if you leave the app.";
 
     /** The library of the activity that is showing (one MainActivity at a time; a recreated one gets a new instance that keeps the scan) */
     private static Library current;
     private static List<LibraryScanner.Title> lastTitles = new ArrayList<>();
+    /** The newest scan's titles (Settings › Library › Free up space reads them) */
+    static List<LibraryScanner.Title> titlesNow() { return lastTitles; }
     private static List<CompanionPort.Item> catalog = new ArrayList<>();
     private static boolean catalogFetched, everScanned;
     private static final Map<String, Bitmap> icons = new HashMap<>();
     private static final Set<String> listed = new HashSet<>();   // launch paths handed to upstream's list already (Upstream.addToList), so a failing add is not retried every refresh
     /**
-     * Owner request round 3, hide-only since critique-phase2c round 4: upstream's Game list entries this build leaves out of {@link #rows()} — never
+     * Owner request round 3, hide-only since round 4: upstream's Game list entries this build leaves out of {@link #rows()} — never
      * deleted, never any permission revoked — either because their volume is not mounted right now (removable storage unplugged: hidden at once), or
      * because {@link #staleGames} got positive, repeated proof the file itself is gone (hidden only after two scans at least 60 s apart agree, and
      * never for a SAF-picked .nup or without All files access/an app-storage path — see {@link #staleGames}'s doc). Recomputed from scratch every
@@ -93,7 +96,7 @@ public final class Library {
      * them, by their own choice, instead of this code ever deleting anything on its own
      */
     private static final Set<String> hiddenUnmounted = Collections.synchronizedSet(new HashSet<>());
-    /** gameDir → the wall-clock time {@link #staleGames} first got positive proof it was gone (critique-phase2c §A-1's "two scans at least 60 s apart"
+    /** gameDir → the wall-clock time {@link #staleGames} first got positive proof it was gone (the review's "two scans at least 60 s apart"
      *  gate); removed the moment any check stops confirming "gone", or the entry leaves upstream's list some other way */
     private static final Map<String, Long> missingSince = new java.util.concurrent.ConcurrentHashMap<>();
     private static Build build;   // the running (or stopped) build, kept across activity recreation (the service runs on)
@@ -137,7 +140,7 @@ public final class Library {
     private boolean staleChecking;   // one in flight at a time; staleTick skips a tick rather than piling up background threads
     private int filter = ALL;
     private String find = "";
-    private boolean showHidden;   // the "Hidden: N missing games · Show/Hide" toggle (critique-phase2c §A-3): off by default, so a hidden card needs an explicit tap to reveal
+    private boolean showHidden;   // the "Hidden: N missing games · Show/Hide" toggle (found in review): off by default, so a hidden card needs an explicit tap to reveal
     private final Map<String, TextView> tiles = new HashMap<>();   // the tiles of the covers showing, by title ID (icons land while they show)
     private final Map<String, Boolean> companions = new HashMap<>();   // title ID → a companion is installed (read once per pass; cleared by a scan and a build's end)
     // the build card's live parts (null when it is not on screen)
@@ -148,6 +151,20 @@ public final class Library {
     private ProgressBar coverStrip;
     private View firstCover;   // the grid's first cover of this render (focused after a shoulder-button filter change)
     private boolean focusGrid;
+    // ---- What a rebuild keeps (the grid is torn down and built again by every render that changes something) ----
+    private String shown;   // the signature of what the box shows now (see render); null: build it again whatever it would be
+    private final Map<String, View> keyed = new HashMap<>();   // the library's own focusable views by a key that outlives a rebuild ("cover:<title ID>", "chip:<filter>", "find", "hidden")
+    private String lostKey, restoreKey;   // the view that lost the focus last, and the one that lost it by being removed (upstream empties the box before fill)
+    private long lostAt;
+    private boolean restoring;   // the focus is being put back by code: no focus animation, the scale is set
+    private boolean animateNext;   // the next rebuild was caused by the user (a filter, Find): its rows enter (Motion.enterRows)
+    private int lastCells = -1;   // how many cells the last rebuild showed (-1 before the first): the grid's first appearance after an empty one enters too
+    private boolean hadNote;   // the last rebuild showed the scan's or the empty library's line (it fades in only when it is new)
+    private String popReady;   // the title whose build just ended well: its Ready check pops in at the rebuild that shows it
+    private long popReadyAt;
+    private static boolean watching;   // the activity lifecycle callbacks are registered (once per process)
+    private static String played;   // the title Play was pressed on: Home's next resume puts the focus on its cover
+    private static long playedAt;
 
     private Library(Activity a) { this.a = a; }
 
@@ -157,21 +174,83 @@ public final class Library {
             if (b == null) return;
             boolean stepChanged = !step.equals(b.step);
             b.step = step; b.percent = percent; b.detail = detail == null ? "" : detail;
-            if (stepChanged || (buildStatus == null && coverChip == null) || box == null) render(); else updateBuildCard(b);
+            if (stepChanged || (buildStatus == null && coverChip == null) || box == null) render(); else updateBuildCard(b, false);
         }
         @Override public void done(boolean ok, String message, String code) {
             Build b = build;
             if (b == null) return;
+            // The end is felt and seen only while one of the app's screens is in front; away from the app the service's notification tells it (BuildPipeline.endChannel)
             if (ok) {
-                build = null; companions.clear();
                 Toast.makeText(a, b.name + " is ready to play.", Toast.LENGTH_LONG).show();
-                scan();
+                if (inFront) { Haptics.play(anchor(), Haptics.Word.DONE); popReady = b.titleId; popReadyAt = android.os.SystemClock.uptimeMillis(); }
+                TextView tile = tiles.get(b.titleId);
+                if (inFront && Motion.on() && tile != null && coverChip != null && coverChip.isAttachedToWindow()) {
+                    // the building cover is on screen: it says Ready and pops, and the rescan that moves it among the Ready games waits until that was seen
+                    coverChip.setText("Ready");
+                    coverChip.setTextColor(PUi.col(a, R.color.bn_leaf));
+                    if (coverStrip != null && !coverStrip.isIndeterminate()) Motion.progress(coverStrip, 100, false);
+                    Motion.pop(tile);
+                    UI.postDelayed(() -> { if (build == b) build = null; companions.clear(); if (current == Library.this) scan(); }, 400);
+                } else {
+                    build = null; companions.clear();
+                    scan();
+                }
             } else {
                 b.failed = true; b.error = message == null ? "" : message; b.code = code == null ? "" : code;
                 render();
+                // a build the user stopped is not a refusal: the press on Stop was its feedback
+                if (inFront && !BuildListener.CANCELLED.equals(b.code)) { Haptics.play(anchor(), Haptics.Word.REJECT); if (coverChip != null) Motion.shake(coverChip); }
             }
         }
     };
+
+    /** A view of the activity's window to play a haptic through when no pressed view is at hand (a build's end) */
+    private View anchor() { return box != null && box.isAttachedToWindow() ? box : a.getWindow().getDecorView(); }
+
+    // ---- The app in front, the settings read at a resume, the focus after a game ----
+
+    private static boolean inFront;
+    private static Activity top;   // the resumed activity of this process, if any
+
+    /**
+     * Once per process: the app's activity lifecycle (this process only; a game runs in its own). While one of the app's screens is resumed a build's end is
+     * felt here, else the service's notification alerts (BuildPipeline.front). A resume reads the haptic and motion settings again, and Home's first resume
+     * after Play puts the focus on the played game's cover, silently, with the focus scale once as the landing cue.
+     */
+    private static void watch(Activity a) {
+        if (watching) return;
+        watching = true;
+        if (a.hasWindowFocus()) { top = a; inFront = true; BuildPipeline.front(true); }   // registered by a resumed activity (else its resume follows and says so)
+        a.getApplication().registerActivityLifecycleCallbacks(new android.app.Application.ActivityLifecycleCallbacks() {
+            @Override public void onActivityResumed(Activity x) {
+                top = x;
+                front(true);
+                Haptics.refresh(x); Motion.refresh(x);
+                Library l = current;
+                String id = played;
+                if (l == null || l.a != x || id == null) return;
+                played = null;
+                View cover = l.keyed.get("cover:" + id);
+                TextView tile = l.tiles.get(id);
+                if (cover == null || tile == null || cover.isInTouchMode()) return;
+                Haptics.quiet(200);
+                l.restoring = true;
+                boolean has = cover.isFocused() || cover.requestFocus();
+                l.restoring = false;
+                if (has) Motion.land(tile);
+            }
+            @Override public void onActivityPaused(Activity x) {
+                if (top == x) { top = null; front(false); }   // from one of the app's screens to another, the next one's resume says in front again
+                if (played != null && android.os.SystemClock.uptimeMillis() - playedAt > 3000) played = null;   // Play opened a dialog and no game: nothing to come back from
+            }
+            private void front(boolean on) { inFront = on; BuildPipeline.front(on); }
+            @Override public void onActivityCreated(Activity x, android.os.Bundle b) {}
+            @Override public void onActivityStarted(Activity x) {}
+            @Override public void onActivityStopped(Activity x) {}
+            @Override public void onActivitySaveInstanceState(Activity x, android.os.Bundle b) {}
+            @Override public void onActivityDestroyed(Activity x) {}
+        });
+    }
 
     // ---- The hook ----
 
@@ -183,13 +262,16 @@ public final class Library {
     public static <G> void fill(Activity a, LinearLayout box, List<G> games, View ondeviceCard, Predicate<G> shows, Function<G, View> card, Consumer<G> manage, Runnable refresh) {
         if (current == null || current.a != a) current = new Library(a);
         Library l = current;
-        l.box = box; l.games = new ArrayList<>(games); l.ondeviceCard = ondeviceCard;
+        l.box = box; l.games = new ArrayList<>(games); l.ondeviceCard = ondeviceCard; gen++;
         l.shows = (Predicate<Object>) shows; l.card = (Function<Object, View>) card; l.manage = (Consumer<Object>) manage; l.refresh = refresh;
         if (build != null) {
             if (BuildPipeline.running() == build.id) BuildPipeline.attach(build.id, l.listener);   // an activity made anew while the service builds
             else if (!build.failed) build = null;   // the service ended while no listener heard it
         }
+        Haptics.refresh(a); Motion.refresh(a);
+        watch(a);
         l.render();
+        preloadIcons(a);
         if (!everScanned && !l.scanning && PeanutsPrefs.gameDir(a) != null) l.scan();
         if (!staleTimerStarted) { staleTimerStarted = true; UI.postDelayed(staleTick, STALE_TICK_MS); }
     }
@@ -214,15 +296,45 @@ public final class Library {
         current.sheet(current.titleFor(titleId));
     }
 
+    // ---- The covers kept from earlier runs ----
+
+    private static boolean iconsPreloaded;
+    /**
+     * Once a process: every cover already extracted (files/icons/&lt;title ID&gt;.png) is decoded on a thread of its own and put on its tile, before and beside the scan.
+     * The covers used to be read only at the end of the scan thread, behind the folder walk, the companion catalog's network fetch and each game's build id check,
+     * so a cold start showed the letter tiles for as long as all of that took.
+     */
+    private static void preloadIcons(Activity a) {
+        if (iconsPreloaded) return;
+        iconsPreloaded = true;
+        File dir = PeanutsPrefs.iconsDir(a);
+        new Thread(() -> {
+            File[] fs = dir == null ? null : dir.listFiles();
+            if (fs == null) return;
+            for (File f : fs) {
+                String n = f.getName();
+                if (!n.endsWith(".png") || f.length() == 0) continue;
+                String id = n.substring(0, n.length() - 4);
+                Bitmap b = BitmapFactory.decodeFile(f.getPath());
+                if (b == null) continue;
+                UI.post(() -> {
+                    if (icons.containsKey(id)) return;
+                    icons.put(id, b);
+                    Library l = current; TextView tile = l == null ? null : l.tiles.get(id);
+                    if (tile != null) Motion.cover(tile, b);   // a tile on screen crossfades to its art; a tile built from now on has it at once
+                });
+            }
+        }, "peanuts-icons").start();
+    }
+
     // ---- The scan ----
 
     private void scan() {
         if (scanning) return;
         scanning = true;
         render();
-        new Thread(() -> {
+        new Thread(() -> { try {
             List<LibraryScanner.Title> t = new LibraryScanner(a).scan();
-            List<CompanionPort.Item> c = catalogFetched ? catalog : CompanionPort.fetch();
             // a scanned game that is ready and not in upstream's list goes into it: its card is then Banana's own
             List<Upstream.Entry> list = Upstream.games(a);
             staleGames(list, a);
@@ -231,21 +343,35 @@ public final class Library {
                 if (!listed.add(x.launch.getPath())) continue;
                 Upstream.addToList(a, x.launch, x.packDir, x.titleId, x.name);
             }
+            // the games show as soon as the folders are read; the companion catalog (network: a slow or failing GitHub held the whole library empty for a minute)
+            // follows in its own post, and only its badges wait for it
             UI.post(() -> {
-                lastTitles = t; catalog = c; catalogFetched = true; everScanned = true;
+                lastTitles = t; everScanned = true;
                 if (current != this) return;
-                titles = t; scanning = false; companions.clear();
+                titles = t; gen++; scanning = false; companions.clear();
                 if (box != null && box.isAttachedToWindow()) refresh.run(); else render();   // upstream's list again too (Prepare and the add above put games into it)
             });
-            for (LibraryScanner.Title x : t) {   // the fonts and build id every ready game's env needs (GameEnv), and the icons
-                if (x.status == LibraryScanner.Status.READY && x.launch != null) { GameEnv.ensureFonts(a, x.titleId); GameEnv.ensureBuildId(a, x.titleId, x.launch); }
+            for (LibraryScanner.Title x : t) {   // the icons not kept yet (preloadIcons has the others), before anything slow: the catalog and the build ids below
                 if (icons.containsKey(x.titleId)) continue;
                 File f = LibraryScanner.icon(a, x);
                 Bitmap b = f == null ? null : BitmapFactory.decodeFile(f.getPath());
                 if (b == null) continue;
-                UI.post(() -> { icons.put(x.titleId, b); TextView tile = tiles.get(x.titleId); if (tile != null) PUi.tileIcon(tile, b); });
+                UI.post(() -> { icons.put(x.titleId, b); TextView tile = tiles.get(x.titleId); if (tile != null) Motion.cover(tile, b); });
             }
-        }, "peanuts-scan").start();
+            if (!catalogFetched) {
+                List<CompanionPort.Item> c = CompanionPort.fetch();
+                UI.post(() -> {
+                    catalog = c; catalogFetched = true;
+                    if (current != this) return;
+                    companions.clear();
+                    if (box != null && box.isAttachedToWindow()) refresh.run(); else render();
+                });
+            }
+            for (LibraryScanner.Title x : t)   // the fonts and build id every ready game's env needs (GameEnv)
+                if (x.status == LibraryScanner.Status.READY && x.launch != null) { GameEnv.ensureFonts(a, x.titleId); GameEnv.ensureBuildId(a, x.titleId, x.launch); }
+        } catch (RuntimeException e) {   // a failed scan must not leave the library "scanning" for good
+            UI.post(() -> { scanning = false; if (current == this) render(); });
+        } }, "peanuts-scan").start();
     }
 
     /**
@@ -258,8 +384,10 @@ public final class Library {
         if (scanning || staleChecking) return;
         staleChecking = true;
         new Thread(() -> {
-            List<Upstream.Entry> list = Upstream.games(a);
-            staleGames(list, a);
+            try {
+                List<Upstream.Entry> list = Upstream.games(a);
+                staleGames(list, a);
+            } catch (RuntimeException e) { /* the flag below is reset either way */ }
             UI.post(() -> {
                 staleChecking = false;
                 if (current == this && box != null && box.isAttachedToWindow()) render();
@@ -274,7 +402,7 @@ public final class Library {
 
     /**
      * Now (owner's choice, 2026-11-13): an entry confirmed gone is removed (removeEntry), behind the gates below; an unmounted volume's entries are only hidden.
-     * History, round 4 (critique-phase2c §A-1, a blocker on round 3's version): HIDE-ONLY, never remove. Round 3 deleted the upstream list entry itself
+     * History, round 4 (a blocker found in review of round 3's version): HIDE-ONLY, never remove. Round 3 deleted the upstream list entry itself
      * whenever {@code !File.exists()} on a mounted volume — but {@code File.exists()} is not a reliable "the file is gone" test in this app:
      * <ul>
      * <li>every SAF-picked .nup's {@code gameDir} is a stand-in path whose file is never created ({@code PickedNup}/{@code PickedPath}: only the
@@ -300,7 +428,7 @@ public final class Library {
      * games" toggle (the filter row) lets the player show it again and use upstream's own "Game file gone → Remove" dialog themselves, on their own
      * say — satisfying the original owner ask ("let the user see and remove them") without this code ever guessing on their behalf.
      * <p>
-     * The unmounted-volume branch is unchanged from round 3 (already correct per critique-phase2c), aside from fixing a path-prefix bug in
+     * The unmounted-volume branch is unchanged from round 3 (already correct per review), aside from fixing a path-prefix bug in
      * {@link #volumeMounted}: it hides immediately (no 60-second gate — a volume being absent is itself the positive proof) and never removes.
      */
     private static void staleGames(List<Upstream.Entry> list, Activity act) {
@@ -359,7 +487,7 @@ public final class Library {
 
     /** Whether path is on a volume Android currently lists (internal storage, or a mounted SD/USB); null when this cannot be told (no StorageManager, or
      *  an exception reading it) — never a guess in either direction: null leaves the record exactly as it is (neither removed nor hidden) until a later
-     *  scan can tell for sure. Matches the volume's root exactly or with a path separator after it (critique-phase2c §A-1 prefix-bug fix: without the
+     *  scan can tell for sure. Matches the volume's root exactly or with a path separator after it (a prefix-bug fix from review: without the
      *  separator, "/storage/emulated/0" would also match "/storage/emulated/01…") */
     private static Boolean volumeMounted(Context ctx, String path) {
         try {
@@ -389,7 +517,7 @@ public final class Library {
         } catch (Throwable t) { return true; }
     }
 
-    /** Mirrors upstream's own `readable` gate in {@code MainActivity.gone} (critique-phase2c §A-1): All files access, or the path is inside this
+    /** Mirrors upstream's own `readable` gate in {@code MainActivity.gone} (found in review): All files access, or the path is inside this
      *  app's own storage ({@code CopyPlan.inApp}, reflection). Without either, upstream itself treats "cannot tell" as "not gone" — never as "gone" —
      *  and so does this: an exception here also defaults to false, the same "not gone" reading */
     private static boolean readableOutsideApp(Context ctx, String gameDir) {
@@ -521,7 +649,7 @@ public final class Library {
             Upstream.Entry e = Upstream.entryOf(g);
             if (e == null) continue;
             if (!showHidden && hiddenUnmounted.contains(e.gameDir)) continue;   // hidden (never removed): either its volume is not mounted right now, or
-            // it is confirmed missing but kept for the player to see and Remove themselves (critique-phase2c §A); the "Hidden: N · Show" toggle reveals it
+            // it is confirmed missing but kept for the player to see and Remove themselves (found in review); the "Hidden: N · Show" toggle reveals it
             LibraryScanner.Title hit = null;
             for (LibraryScanner.Title t : titles) if (t.launch != null && samePath(e.gameDir, t.launch.getPath())) { hit = t; break; }
             if (hit != null) taken.add(hit);
@@ -538,17 +666,17 @@ public final class Library {
         return b != null && r.id().equalsIgnoreCase(b.titleId);
     }
 
+    /**
+     * Home's game box, built again. A render that would show what the box shows already is skipped (the 30 second stale check, a build's progress while
+     * neither its card nor its cover shows): {@link #signature} says what a rebuild depends on. A rebuild keeps the controller's focus (by title ID for a
+     * cover, by filter for a chip) and the page's scroll position; one the user caused (a filter, Find) lets its first rows enter.
+     */
     private void render() {
         if (box == null) return;
-        box.removeAllViews();
-        tiles.clear();
-        buildStatus = null; buildBody = null; buildPct = null; buildBar = null; coverChip = null; coverStrip = null; firstCover = null;
         View pc = ondeviceCard;
-        if (pc != null && pc.getParent() instanceof ViewGroup) ((ViewGroup) pc.getParent()).removeView(pc);
         boolean setup = PeanutsPrefs.gameDir(a) == null || !PeanutsPrefs.setupDone(a);
-        if (setup) PUi.add(box, setupCard(), 0);
         List<Row> rows = rows();
-        if (setup && rows.isEmpty() && pc == null) return;
+        boolean bare = setup && rows.isEmpty() && pc == null;   // the first-run card alone
 
         Build b = build;
         boolean buildCard = b != null && !(b.step.equals("prepare") && pc != null && !b.failed);   // during Prepare upstream's own card is the card
@@ -569,6 +697,44 @@ public final class Library {
         Collections.sort(rd, (x, y) -> x.used() != y.used() ? Long.compare(y.used(), x.used()) : x.name().compareToIgnoreCase(y.name()));
         Collections.sort(bd, (x, y) -> x.name().compareToIgnoreCase(y.name()));
         Collections.sort(np, (x, y) -> x.name().compareToIgnoreCase(y.name()));
+        List<Row> show = new ArrayList<>();   // the cover grid: one grid, the filters are the sections (the Building filter shows the full cards instead)
+        switch (filter) {
+            case BUILDING: break;
+            case READY: show.addAll(rd); break;
+            case BUILD: show.addAll(bd); break;
+            case NO_PROFILE: show.addAll(np); break;
+            default: show.addAll(bl); show.addAll(rd); show.addAll(bd); show.addAll(np);
+        }
+        int hidden = hiddenGameCount();
+        int cols = coverColumns();
+
+        // nothing visible changed: the views stay, with their focus, their scroll position and whatever is animating
+        String sig = setup ? null : signature(show, pc, b, buildCard, building, all, ready, toBuild, noProfile, hidden, cols);   // the first-run card reads too much to list: always built
+        boolean user = animateNext;
+        animateNext = false;
+        if (sig != null && sig.equals(shown) && box.getChildCount() > 0) {
+            if (b != null) updateBuildCard(b, false);
+            focusGrid = false;
+            return;
+        }
+
+        // what the rebuild keeps: the focused view's key (upstream's refresh has emptied the box already: then the one that lost the focus by that), the scroll position
+        String keep = restoreKey;
+        View focused = box.findFocus();
+        if (focused != null) for (Map.Entry<String, View> e : keyed.entrySet()) if (e.getValue() == focused) keep = e.getKey();
+        android.widget.ScrollView page = null;
+        for (android.view.ViewParent p = box.getParent(); p != null && page == null; p = p.getParent()) if (p instanceof android.widget.ScrollView) page = (android.widget.ScrollView) p;
+        int scrollY = page == null ? 0 : page.getScrollY();
+
+        Motion.clear();
+        box.removeAllViews();
+        tiles.clear(); keyed.clear();
+        lostKey = null; restoreKey = null;   // the removal above is not a focus lost to restore at the next rebuild
+        buildStatus = null; buildBody = null; buildPct = null; buildBar = null; coverChip = null; coverStrip = null; firstCover = null;
+        if (pc != null && pc.getParent() instanceof ViewGroup) ((ViewGroup) pc.getParent()).removeView(pc);
+        shown = sig;
+        if (setup) PUi.add(box, setupCard(), 0);
+        if (bare) { lastCells = 0; hadNote = false; return; }
 
         // the filter row
         LinearLayout top = PUi.row(a);
@@ -584,31 +750,37 @@ public final class Library {
         chip(chipRow, "Ready " + ready, READY);
         chip(chipRow, "Build needed " + toBuild, BUILD);
         chip(chipRow, "Not in this app version " + noProfile, NO_PROFILE);
-        int hidden = hiddenGameCount();
         if (hidden > 0) {
-            // critique-phase2c §A-3: lets the player see and remove a confirmed-missing (or currently unreachable) game themselves, through upstream's
+            // Found in review: lets the player see and remove a confirmed-missing (or currently unreachable) game themselves, through upstream's
             // own "Game file gone → Remove" dialog, instead of this code ever deleting the record on its own
             Button hideB = PUi.button(a, hidden + " hidden · " + (showHidden ? "Hide" : "Show"),
-                    PUi.Kind.QUIET, v -> { showHidden = !showHidden; render(); });
+                    PUi.Kind.QUIET, v -> { Haptics.play(v, Haptics.Word.CLICK); showHidden = !showHidden; render(); });
+            hideB.setOnKeyListener(shoulders);
+            track(hideB, "hidden", null);
             LinearLayout.LayoutParams hlp = PUi.wrap();
             hlp.leftMargin = PUi.dp(a, 8);
             chipRow.addView(hideB, hlp);
         }
         chips.addView(chipRow, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         top.addView(chips, PUi.weight());
-        Button findB = PUi.button(a, find.isEmpty() ? "Find" : "Find · " + find, PUi.Kind.QUIET, v -> findDialog());
+        Button findB = PUi.button(a, find.isEmpty() ? "Find" : "Find · " + find, PUi.Kind.QUIET, Haptics.on(Haptics.Word.CLICK, v -> findDialog()));
         findB.setCompoundDrawablesRelativeWithIntrinsicBounds(PUi.icon(a, R.drawable.ic_search, R.color.bn_accent), null, null, null);
         findB.setCompoundDrawablePadding(PUi.dp(a, 6));
         findB.setOnKeyListener(shoulders);
+        track(findB, "find", null);
         LinearLayout.LayoutParams flp = PUi.wrap(); flp.leftMargin = PUi.dp(a, 8);
         top.addView(findB, flp);
         PUi.add(box, top, setup ? 16 : 2);
+        TextView note = null;   // the scan's line, or the empty library's: it fades in when the last rebuild did not have it
         if (scanning) {
             int n = PeanutsPrefs.roots(a).size();
-            PUi.add(box, PUi.small(a, "Looking in " + n + (n == 1 ? " folder…" : " folders…")), 8);
+            note = PUi.add(box, PUi.small(a, "Looking in " + n + (n == 1 ? " folder…" : " folders…")), 8);
         } else if (rows.isEmpty() && pc == null && !setup) {
-            PUi.add(box, PUi.small(a, "No games found in " + PeanutsPrefs.gameDir(a) + ". Put NSP, XCI, .nup files or dump folders there, then Rescan (Settings › Library)."), 8);
+            note = PUi.add(box, PUi.small(a, "No games found in " + PeanutsPrefs.gameDir(a) + ". Put NSP, XCI, .nup files or dump folders there, then Rescan (Settings › Library)."), 8);
         }
+        if (note != null && !hadNote) Motion.fadeIn(note);
+        hadNote = note != null;
+        int firstRow = box.getChildCount();   // the grid's first row in the box (Motion.enterRows)
 
         // the Building filter: the full cards, two per row
         if (filter == BUILDING) {
@@ -617,24 +789,67 @@ public final class Library {
             if (buildCard) full.add(buildCard(b));
             grid(full, fullColumns(), PUi.GAP);
             PUi.add(box, PUi.small(a, "When a build finishes, its game moves to Ready and this filter goes away."), 10);
-            focusAfterRender(chipRow);
+            afterRender(chipRow, keep, page, scrollY, user, firstRow);
             return;
         }
 
-        // the cover grid: one grid, the filters are the sections
-        List<Row> show = new ArrayList<>();
-        switch (filter) {
-            case READY: show.addAll(rd); break;
-            case BUILD: show.addAll(bd); break;
-            case NO_PROFILE: show.addAll(np); break;
-            default: show.addAll(bl); show.addAll(rd); show.addAll(bd); show.addAll(np);
-        }
-        int cols = coverColumns();
         int cell = (Math.min(widthDp(), 900) - 40 - PUi.GAP * (cols - 1)) / cols;   // Banana's 20 dp gutters and 12 dp gaps
         List<View> cells = new ArrayList<>();
         for (Row r : show) cells.add(coverCell(r, cell));
         grid(cells, cols, 16);
+        boolean first = lastCells == 0 && !cells.isEmpty();   // the grid shows after an empty one (the first scan ended): it enters as after a filter change
+        lastCells = cells.size();
+        afterRender(chipRow, keep, page, scrollY, user || first, firstRow);
+    }
+
+    /**
+     * What a rebuild depends on, as one string: the filter, Find, the counts on the chips, the scan's and the empty library's lines, the build (its percent
+     * apart: {@link #updateBuildCard} writes that into the views that are there), upstream's progress card, and every cover showing in its order with its
+     * name, state and companion badge. {@link #gen} stands for the lists themselves: the covers' taps hold the list entries they were built from, so a new
+     * list of games (every fill) or of scanned titles is always built again.
+     */
+    private String signature(List<Row> show, View pc, Build b, boolean buildCard, int building, int all, int ready, int toBuild, int noProfile, int hidden, int cols) {
+        StringBuilder s = new StringBuilder(64 + show.size() * 48);
+        s.append(gen).append('|').append(filter).append('|').append(find).append('|').append(showHidden).append('|').append(hidden).append('|').append(cols).append('|').append(widthDp())
+                .append('|').append(all).append(',').append(ready).append(',').append(toBuild).append(',').append(noProfile).append(',').append(building)
+                .append('|').append(scanning ? PeanutsPrefs.roots(a).size() : -1).append('|').append(PeanutsPrefs.gameDir(a))
+                .append('|').append(pc == null ? 0 : System.identityHashCode(pc)).append('|').append(buildCard);
+        if (b != null) s.append('|').append(b.id).append(',').append(b.step).append(',').append(b.failed).append(',').append(b.code).append(',').append(b.error.hashCode());
+        for (Row r : show) {
+            s.append('\n').append(r.id()).append('\t').append(r.name()).append('\t').append(r.status()).append('\t').append(isBuilding(r) ? 1 : 0)
+                    .append(r.game != null && shows.test(r.game) ? 1 : 0).append(companionInstalled(r) ? 1 : 0)
+                    .append(r.title == null ? "-" : String.valueOf(r.title.versionState));
+        }
+        return s.toString();
+    }
+
+    private static int gen;   // counts the lists a signature stands for: bumped by every fill (upstream's games) and every scan's result (the titles)
+
+    /**
+     * After a rebuild: the focus goes back where it was (a shoulder-button filter change puts it on the first cover instead), silently and with no focus
+     * animation; without a focus to put back the page keeps its scroll position (the removal moved the focus, and the page with it, to the page's first
+     * view); and the first rows enter when the user caused the rebuild.
+     */
+    private void afterRender(LinearLayout chipRow, String keep, android.widget.ScrollView page, int scrollY, boolean enter, int firstRow) {
+        boolean placed = focusGrid;
         focusAfterRender(chipRow);
+        View v = placed || keep == null ? null : keyed.get(keep);
+        if (v != null && !box.isInTouchMode()) {
+            Haptics.quiet(200);
+            restoring = true;
+            placed = v.requestFocus();   // before the layout: the page then scrolls only as far as showing it needs, which is not at all when it did not move
+            restoring = false;
+        }
+        if (!placed && !enter && page != null && scrollY > 0) {
+            android.widget.ScrollView sv = page;
+            sv.getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                @Override public void onGlobalLayout() {
+                    sv.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                    if (sv.getScrollY() != scrollY) sv.scrollTo(0, scrollY);
+                }
+            });
+        }
+        if (enter) Motion.enterRows(box, firstRow);
     }
 
     /** After a shoulder-button filter change the first cover (else the chosen chip) takes the focus, so the controller stays in the grid */
@@ -644,24 +859,49 @@ public final class Library {
         View f = firstCover;
         if (f == null) for (int i = 0; i < chipRow.getChildCount(); i++) if (chipRow.getChildAt(i).isSelected()) f = chipRow.getChildAt(i);
         if (f == null && chipRow.getChildCount() > 0) f = chipRow.getChildAt(0);
-        if (f != null) { View v = f; v.post(v::requestFocus); }
+        if (f != null) { View v = f; v.post(() -> { Haptics.quiet(200); restoring = true; v.requestFocus(); restoring = false; }); }
+    }
+
+    /**
+     * One of the library's own focusable views under a key that outlives a rebuild. A view that loses the focus and is removed in the same moment lost it
+     * to the removal (upstream's refresh empties the box before {@link #fill}): the next rebuild puts the focus on the view with that key. tile: a cover's
+     * tile, whose focus and press animations end with the view.
+     */
+    private void track(View v, String key, View tile) {
+        keyed.put(key, v);
+        if (tile == null) v.setOnFocusChangeListener((x, f) -> noteFocus(key, f));   // a cover's own listener calls noteFocus
+        v.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View x) {}
+            @Override public void onViewDetachedFromWindow(View x) {
+                if (key.equals(lostKey) && android.os.SystemClock.uptimeMillis() - lostAt < 50) restoreKey = key;
+                if (tile != null) tile.animate().cancel();
+            }
+        });
+    }
+
+    private void noteFocus(String key, boolean gained) {
+        if (gained) { lostKey = null; restoreKey = null; }
+        else { lostKey = key; lostAt = android.os.SystemClock.uptimeMillis(); }
     }
 
     private void chip(LinearLayout row, CharSequence label, int which) {
         boolean on = filter == which;
-        Button c = PUi.button(a, label, on ? PUi.Kind.PRIMARY : PUi.Kind.TONAL, v -> { filter = which; render(); });
+        Button c = PUi.button(a, label, on ? PUi.Kind.PRIMARY : PUi.Kind.TONAL, v -> { Haptics.play(v, Haptics.Word.CLICK); filter = which; animateNext = true; render(); });
         c.setSelected(on);
         c.setOnKeyListener(shoulders);
+        track(c, "chip:" + which, null);
         LinearLayout.LayoutParams lp = PUi.wrap();
         if (row.getChildCount() > 0) lp.leftMargin = PUi.dp(a, 8);
         row.addView(c, lp);
     }
 
-    /** L/R shoulder on any of the library's own focusable views (covers, chips, Find): the previous/next filter chip */
+    /** A key on any of the library's own focusable views (covers, chips, Find): the D-pad's focus haptic first (it never takes the key), then L/R
+     *  shoulder: the previous/next filter chip */
     private final View.OnKeyListener shoulders = (v, code, ev) -> {
+        Haptics.focusKey(v, ev);
         if (ev.getAction() != KeyEvent.ACTION_DOWN || ev.getRepeatCount() != 0) return false;
-        if (code == KeyEvent.KEYCODE_BUTTON_L1) { stepFilter(-1); return true; }
-        if (code == KeyEvent.KEYCODE_BUTTON_R1) { stepFilter(1); return true; }
+        if (code == KeyEvent.KEYCODE_BUTTON_L1) { Haptics.play(v, Haptics.Word.CLICK); stepFilter(-1); return true; }
+        if (code == KeyEvent.KEYCODE_BUTTON_R1) { Haptics.play(v, Haptics.Word.CLICK); stepFilter(1); return true; }
         return false;
     };
 
@@ -674,6 +914,7 @@ public final class Library {
         int i = Math.max(0, avail.indexOf(filter));
         filter = avail.get(((i + d) % avail.size() + avail.size()) % avail.size());
         focusGrid = true;
+        animateNext = true;
         render();
     }
 
@@ -686,9 +927,9 @@ public final class Library {
         LinearLayout wrap = new LinearLayout(a);
         wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.addView(e, PUi.fill());
-        AlertDialog d = PUi.sheet(a, "Find", wrap).setPositiveButton("Find", (x, w) -> { find = e.getText().toString().trim(); render(); })
-                .setNegativeButton("Cancel", null).setNeutralButton(find.isEmpty() ? null : "Clear", (x, w) -> { find = ""; render(); }).create();
-        e.setOnEditorActionListener((v, id, ev) -> { find = e.getText().toString().trim(); d.dismiss(); render(); return true; });
+        AlertDialog d = PUi.sheet(a, "Find", wrap).setPositiveButton("Find", (x, w) -> { find = e.getText().toString().trim(); animateNext = true; render(); })
+                .setNegativeButton("Cancel", null).setNeutralButton(find.isEmpty() ? null : "Clear", (x, w) -> { find = ""; animateNext = true; render(); }).create();
+        e.setOnEditorActionListener((v, id, ev) -> { find = e.getText().toString().trim(); d.dismiss(); animateNext = true; render(); return true; });
         d.show();
         e.requestFocus();
     }
@@ -740,6 +981,8 @@ public final class Library {
         FrameLayout cover = new FrameLayout(a);
         int p4 = PUi.dp(a, 4), p8 = PUi.dp(a, 8);
         cover.setPadding(p4, p4, p4, p4);
+        cover.setClipToPadding(false);   // the focused tile grows into the 4 dp around it (Motion.focus)
+        cover.setHapticFeedbackEnabled(Haptics.enabled());   // the system's own long-press haptic follows the app's setting too
         cover.setClickable(true);
         cover.setFocusable(true);
         cover.setContentDescription(name + ", " + state + (companion ? ", companion installed" : ""));
@@ -768,6 +1011,10 @@ public final class Library {
             cover.addView(coverStrip);
         } else if (st == READY) {
             TextView ok = PUi.text(a, "✓", 12, R.color.bn_on_leaf, 700);
+            if (popReady != null && popReady.equalsIgnoreCase(r.id())) {   // its build ended a moment ago, in front of the user: the check is new
+                if (android.os.SystemClock.uptimeMillis() - popReadyAt < 60_000L) Motion.popIn(ok);
+                popReady = null;
+            }
             ok.setGravity(Gravity.CENTER);
             ok.setIncludeFontPadding(false);
             ok.setBackground(PUi.round(PUi.col(a, R.color.bn_leaf), PUi.dp(a, 999), 0, 0));
@@ -795,19 +1042,31 @@ public final class Library {
         n.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         LinearLayout.LayoutParams nlp = PUi.fill();
         nlp.setMargins(p4, p4, p4, 0);
-        cover.setOnFocusChangeListener((v, f) -> n.setTextColor(PUi.col(a, f ? R.color.bn_banana : nameColor)));
+        String key = "cover:" + r.id();
+        cover.setOnFocusChangeListener((v, f) -> {
+            n.setTextColor(PUi.col(a, f ? R.color.bn_banana : nameColor));   // at once: a colour animation would redraw the text every frame
+            noteFocus(key, f);
+            Motion.focus(tile, f, restoring);
+        });
+        track(cover, key, tile);
 
         // tap, long press, Y, shoulders
         Runnable tap, hold;
         Runnable manageOrSheet = r.game != null ? () -> manage.accept(r.game) : () -> sheet(r.title);
-        if (building) { tap = () -> { filter = BUILDING; render(); }; hold = manageOrSheet; }
-        else if (st == READY) { tap = r.game != null ? () -> play(r) : () -> sheet(r.title); hold = manageOrSheet; }
+        boolean plays = !building && st == READY && r.game != null;
+        if (building) { tap = () -> { filter = BUILDING; focusGrid = true; animateNext = true; render(); }; hold = manageOrSheet; }
+        else if (st == READY) { tap = plays ? () -> play(r) : () -> sheet(r.title); hold = manageOrSheet; }
         else if (st == BUILD) { tap = () -> sheet(r.title); hold = tap; }
         else { tap = manageOrSheet; hold = manageOrSheet; }   // listed: Banana's Manage (the sentence, Remove from list); scanned: the sheet (Profile.missing's sentence)
-        cover.setOnClickListener(v -> tap.run());
-        cover.setOnLongClickListener(v -> { hold.run(); return true; });
+        // a tap or A: Play is the weighty word, at the press, whatever dialog may come first; the tile dips while the launch or the sheet goes on
+        cover.setOnClickListener(v -> {
+            Haptics.play(v, plays ? Haptics.Word.HEAVY : Haptics.Word.CLICK);
+            if (!building) Motion.press(tile);
+            tap.run();
+        });
+        cover.setOnLongClickListener(v -> { hold.run(); return true; });   // the system plays its own long-press haptic for a true: nothing added, or it plays twice
         cover.setOnKeyListener((v, code, ev) -> {
-            if (ev.getAction() == KeyEvent.ACTION_DOWN && ev.getRepeatCount() == 0 && code == KeyEvent.KEYCODE_BUTTON_Y) { hold.run(); return true; }
+            if (ev.getAction() == KeyEvent.ACTION_DOWN && ev.getRepeatCount() == 0 && code == KeyEvent.KEYCODE_BUTTON_Y) { Haptics.play(v, Haptics.Word.HEAVY); hold.run(); return true; }
             return shoulders.onKey(v, code, ev);
         });
 
@@ -818,7 +1077,13 @@ public final class Library {
     }
 
     /** Play for a listed, ready game: Banana's own launch (the pack search, the checks, its dialogs); its Manage sheet if that cannot be reached */
-    private void play(Row r) { if (!Upstream.launch(a, r.game)) manage.accept(r.game); }
+    private void play(Row r) {
+        FontGate.check(a, r.id(), r.name(), () -> {
+            played = r.id(); playedAt = android.os.SystemClock.uptimeMillis();   // Home's next resume puts the focus on this cover (watch)
+            if (Upstream.launch(a, r.game)) Motion.launched(a);
+            else { Haptics.play(anchor(), Haptics.Word.REJECT); manage.accept(r.game); }
+        });
+    }
 
     /** A pill on the cover, 8 dp in from its corner: 12 sp 700, a 1 dp shadow so it reads on any art */
     private TextView mark(String s, int fill, int textRes, boolean stroke, int gravity) {
@@ -927,7 +1192,7 @@ public final class Library {
         buildStatus.setPadding(0, PUi.dp(a, 2), 0, 0);
         info.addView(buildStatus);
         top.addView(info, PUi.weight());
-        top.addView(PUi.more(a, "Manage " + name, v -> { if (t != null) sheet(t); }));
+        top.addView(PUi.more(a, "Manage " + name, Haptics.on(Haptics.Word.CLICK, v -> { if (t != null) sheet(t); })));
         c.addView(top);
         buildBody = PUi.body(a, "");
         PUi.add(c, buildBody, 12);
@@ -941,7 +1206,7 @@ public final class Library {
         View right;
         View left;
         if (b.failed) {
-            // Every button here must do what its label says (critique-phase2a §A must-fix 2 — before this, "Build anyway"/"Pick the recommended
+            // Every button here must do what its label says (found in review — before this, "Build anyway"/"Pick the recommended
             // update"/"Pick the file again"/"Resume" all just reopened the sheet, same as plain "Retry"). Only two actions are actually honest to offer from
             // the card without a file picker of its own: open the sheet (unchanged — it already has the Version row, the re-pick chevrons and the relabeled
             // Build/"Build anyway" button, so "open the sheet" is never a dead end), or really resume the job (now implemented, below)
@@ -950,41 +1215,43 @@ public final class Library {
                 case BuildListener.FILE_MISSING:
                 case BuildListener.WRONG_VERSION:
                 case BuildListener.INVALID_DUMP:
-                    left = PUi.button(a, "Open the game's sheet", PUi.Kind.TONAL, v -> openSheet.run());
+                    left = PUi.button(a, "Open the game's sheet", PUi.Kind.TONAL, Haptics.on(Haptics.Word.CLICK, v -> openSheet.run()));
                     right = null;
                     break;
                 case BuildListener.OUT_OF_SPACE:
                     left = PUi.button(a, "Free up space", PUi.Kind.TONAL, v -> {
+                        Haptics.play(v, Haptics.Word.CLICK);
                         try { a.startActivity(new android.content.Intent(android.provider.Settings.ACTION_INTERNAL_STORAGE_SETTINGS)); }
                         catch (RuntimeException e) { Toast.makeText(a, "Open Settings › Storage to free some space.", Toast.LENGTH_LONG).show(); }
                     });
-                    right = PUi.button(a, "Retry", PUi.Kind.SOFT, v -> openSheet.run());
+                    right = PUi.button(a, "Retry", PUi.Kind.SOFT, Haptics.on(Haptics.Word.CLICK, v -> openSheet.run()));
                     break;
                 case BuildListener.STALLED:
                 case BuildListener.CANCELLED:
-                    left = PUi.button(a, "Resume", PUi.Kind.TONAL, v -> resumeBuild(t));
+                    left = PUi.button(a, "Resume", PUi.Kind.TONAL, v -> resumeBuild(t));   // its haptic is resumeBuild's: the weighty word when it starts, the refusal when not
                     right = null;
                     break;
                 default:
-                    left = PUi.button(a, "Retry", PUi.Kind.TONAL, v -> openSheet.run());
+                    left = PUi.button(a, "Retry", PUi.Kind.TONAL, Haptics.on(Haptics.Word.CLICK, v -> openSheet.run()));
                     right = null;
             }
         } else {
-            left = PUi.button(a, "Stop", PUi.Kind.TONAL, v -> PUi.confirmDanger(a, "Stop the build?", "The build of " + name + " stops. What is written so far stays, and the next Build picks up what it can.", "Stop", () -> BuildPipeline.cancel(a)));
+            left = PUi.button(a, "Stop", PUi.Kind.TONAL, v -> PUi.confirmDanger(a, "Stop the build?", "The build of " + name + " stops. What is written so far stays, and the next Build picks up what it can.", "Stop", () -> { Haptics.play(anchor(), Haptics.Word.CLICK); BuildPipeline.cancel(a); }));
             PUi.Action play = PUi.action(a, R.drawable.ic_play, "Play", PUi.Kind.PRIMARY, null);
             play.setEnabled(false);
             right = play;
         }
         PUi.add(c, PUi.pair(a, left, right), 14);
-        updateBuildCard(b);
+        updateBuildCard(b, true);
         return c;
     }
 
-    private void updateBuildCard(Build b) {
+    /** The build's state into the card and the cover that show it; fresh: the views were just built (a bar shows its value as it is, later values animate their fill) */
+    private void updateBuildCard(Build b, boolean fresh) {
         if (coverChip != null) {   // the building cover's chip and strip (the Building filter not chosen)
             coverChip.setText(b.failed ? "Build stopped" : "Building · " + b.percent + " %");
             coverChip.setTextColor(PUi.col(a, b.failed ? R.color.bn_danger : R.color.bn_accent));
-            if (coverStrip != null) { coverStrip.setVisibility(b.failed ? View.GONE : View.VISIBLE); if (!coverStrip.isIndeterminate()) coverStrip.setProgress(Math.max(0, Math.min(100, b.percent))); }
+            if (coverStrip != null) { coverStrip.setVisibility(b.failed ? View.GONE : View.VISIBLE); if (!coverStrip.isIndeterminate()) Motion.progress(coverStrip, b.percent, fresh); }
         }
         if (buildStatus == null) return;
         PUi.status(buildStatus, stepWords(b), b.failed ? R.color.bn_danger : b.step.equals("done") ? R.color.bn_leaf : R.color.bn_accent);
@@ -1003,7 +1270,7 @@ public final class Library {
             String d = b.detail.trim();
             buildBody.setText((d.isEmpty() ? "Working" : d.endsWith(".") ? d.substring(0, d.length() - 1) : d) + "." + GOES_ON);
             buildBar.setVisibility(View.VISIBLE);
-            buildBar.setProgress(Math.max(0, Math.min(100, b.percent)));
+            Motion.progress(buildBar, b.percent, fresh);
             buildPct.setVisibility(View.VISIBLE);
             buildPct.setText(b.percent + " %");
         }
@@ -1022,6 +1289,11 @@ public final class Library {
     /** The sheet's Build: the state to the pipeline; the card shows the rest. Returns why it could not start, or null */
     String startBuild(GameSheet.State s) {
         if (BuildPipeline.running() != 0) return "A build is running now. Wait for it to finish.";
+        // Keys and firmware fonts are a one-time setup requirement (owner, 2026-11-13), checked here as a cheap file-presence gate for every entry point
+        // that can start a build (the sheet's Build/Build anyway/Rebuild, and Resume below): GameSheet already disables its Build button for the same
+        // reason, so this is only a last line of defense, never a per-build re-validation against the importer.
+        if (!PeanutsPrefs.hasKeys(a)) return "Add your keys first (Settings › Library), then build.";
+        if (!PeanutsPrefs.hasFonts(a)) return "Add your firmware first (Settings › Library), then build.";
         BuildRequest r = new BuildRequest();
         r.titleId = s.titleId; r.name = s.name; r.base = s.base; r.update = s.update;
         r.dlcs = new ArrayList<>(s.dlcs);
@@ -1032,6 +1304,7 @@ public final class Library {
             @Override public void progress(String step, int percent, String detail) { listener.progress(step, percent, detail); }
             @Override public void done(boolean ok, String message, String code) {
                 if (build != null) { listener.done(ok, message, code); return; }
+                Haptics.play(anchor(), Haptics.Word.REJECT);
                 new AlertDialog.Builder(a).setTitle("Build").setMessage(message).setPositiveButton("OK", null).show();
             }
         });
@@ -1039,24 +1312,28 @@ public final class Library {
         build = new Build(id, s.titleId, s.name);
         BuildPipeline.attach(id, listener);
         render();
+        // the build's notifications (its progress, and its end while the app is not in front) need the permission; asked as upstream's Prepare asks (Ondevice)
+        if (a.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            a.requestPermissions(new String[] {android.Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFY);
         return null;
     }
 
     /**
-     * The failed card's "Resume" (STALLED/CANCELLED only): actually resumes the job instead of just reopening the sheet (critique-phase2a §A must-fix 2).
+     * The failed card's "Resume" (STALLED/CANCELLED only): actually resumes the job instead of just reopening the sheet (found in review).
      * Rebuilds the same {@link GameSheet.State} the last build used, from the title and its persisted sheet choices (no open sheet needed — the job itself
      * was already saved by Prepare and picks up where it stopped, Prepare.java's job.json resume path), and hands it straight to {@link #startBuild}
      */
     private void resumeBuild(LibraryScanner.Title t) {
-        if (t == null) { Toast.makeText(a, "Open the game from Home to resume it.", Toast.LENGTH_LONG).show(); return; }
+        if (t == null) { Haptics.play(anchor(), Haptics.Word.REJECT); Toast.makeText(a, "Open the game from Home to resume it.", Toast.LENGTH_LONG).show(); return; }
         GameSheet.State s = GameSheet.resumeState(a, t, CompanionPort.forTitle(catalog, t.titleId));
         String why = startBuild(s);
-        if (why != null) new AlertDialog.Builder(a).setTitle("Build").setMessage(why).setPositiveButton("OK", null).show();
+        if (why != null) { Haptics.play(anchor(), Haptics.Word.REJECT); new AlertDialog.Builder(a).setTitle("Build").setMessage(why).setPositiveButton("OK", null).show(); }
+        else if (building(t.titleId)) Haptics.play(anchor(), Haptics.Word.HEAVY);   // it started (a refusal by the pipeline says so in its own dialog)
     }
 
     // ---- First run ----
 
-    /** emptyCard's shape: the badge, a heading, the four steps (P5, UX-SPEC §2.4: Updates & DLC folded in as its own numbered row, no longer a quiet
+    /** emptyCard's shape: the badge, a heading, the four steps (P5: Updates & DLC folded in as its own numbered row, no longer a quiet
      *  footnote button), the four Setting rows, then the single "Show my games" action */
     private View setupCard() {
         LinearLayout c = PUi.card(a);
@@ -1074,7 +1351,7 @@ public final class Library {
         PUi.add(c, t, 6, PUi.wrap());
         LinearLayout steps = PUi.row(a);
         steps.setGravity(Gravity.CENTER);
-        String[] s = {"1  Keys", "2  Game folder", "3  Updates & DLC", "4  Firmware fonts"};
+        String[] s = {"1  Keys", "2  Game folder", "3  Updates & DLC", "4  Firmware"};
         for (int k = 0; k < s.length; k++) {
             LinearLayout.LayoutParams lp = PUi.wrap();
             if (k > 0) lp.leftMargin = PUi.dp(a, 6);
@@ -1085,19 +1362,22 @@ public final class Library {
         PUi.add(c, steps, 16, PUi.wrap());
         boolean keys = PeanutsPrefs.hasKeys(a);
         String game = PeanutsPrefs.gameDir(a);
-        PUi.add(c, new PUi.Setting(a, "🔑", "Keys", v -> LibrarySettings.pickKeys(a))
-                .value(keys ? "Added: prod.keys is in the app." : "Optional. Needed for NSP and XCI files; a .nup or a dump folder plays without them.").chevron(a).view, 16);
-        PUi.add(c, new PUi.Setting(a, "📁", "Game folder", v -> LibrarySettings.pickFolder(a, LibrarySettings.REQ_GAME, "Pick your game folder"))
+        // Keys and firmware fonts are a one-time setup requirement before Build, not per-build (owner, 2026-11-13): no longer worded "Optional" here, since
+        // Build itself is gated on both (GameSheet, Library.startBuild). Browsing this screen (Show my games, below) still needs only the game folder.
+        PUi.add(c, new PUi.Setting(a, "🔑", "Keys", Haptics.on(Haptics.Word.TICK, v -> LibrarySettings.pickKeys(a)))
+                .value(keys ? "Added: prod.keys is in the app." : "Needed before building. Importing an NSP or XCI needs it; browsing your folders here does not.").chevron(a).view, 16);
+        PUi.add(c, new PUi.Setting(a, "📁", "Game folder", Haptics.on(Haptics.Word.TICK, v -> LibrarySettings.pickFolder(a, LibrarySettings.REQ_GAME, "Pick your game folder")))
                 .value(game != null ? game : "Required. Every NSP, XCI, .nup and dump folder inside is shown on this screen.").chevron(a).view, 0);
-        // P5 (UX-SPEC §2.4): folded in as its own numbered step, same Setting-row shape as the other three, instead of a quiet text button below the action row
+        // P5: folded in as its own numbered step, same Setting-row shape as the other three, instead of a quiet text button below the action row
         String updateDir = PeanutsPrefs.updateDir(a), dlcDir = PeanutsPrefs.dlcDir(a);
         String updDlcValue = updateDir == null && dlcDir == null ? "Point at your update and DLC files if they're not inside the game folder already. Skip if everything's together."
                 : (updateDir != null ? "Update: " + updateDir : "Update: not set") + (dlcDir != null ? " · DLC: " + dlcDir : "");
-        PUi.add(c, new PUi.Setting(a, "⬆️", "Updates & DLC", v -> LibrarySettings.extraFolders(a)).value(updDlcValue).chevron(a).view, 0);
-        PUi.add(c, new PUi.Setting(a, "🔤", "Firmware fonts", v -> LibrarySettings.pickFolder(a, LibrarySettings.REQ_FIRMWARE, "Pick your firmware folder"))
-                .value(LibrarySettings.fontsValue(a, "Optional. Lets companions draw the system font.")).chevron(a).view, 0);
+        PUi.add(c, new PUi.Setting(a, "⬆️", "Updates & DLC", Haptics.on(Haptics.Word.TICK, v -> LibrarySettings.extraFolders(a))).value(updDlcValue).chevron(a).view, 0);
+        PUi.add(c, new PUi.Setting(a, "🔤", "Firmware", Haptics.on(Haptics.Word.TICK, v -> LibrarySettings.pickFirmwareSource(a)))
+                .value(LibrarySettings.fontsValue(a, "Needed before building. A missing font can crash some games at boot.")).chevron(a).view, 0);
         PUi.Action show = PUi.action(a, R.drawable.ic_add, "Show my games", PUi.Kind.PRIMARY, v -> {
-            if (PeanutsPrefs.gameDir(a) == null) { Toast.makeText(a, "Pick the game folder first", Toast.LENGTH_LONG).show(); return; }
+            if (PeanutsPrefs.gameDir(a) == null) { Haptics.play(v, Haptics.Word.REJECT); Toast.makeText(a, "Pick the game folder first", Toast.LENGTH_LONG).show(); return; }
+            Haptics.play(v, Haptics.Word.CLICK);
             PeanutsPrefs.setupDone(a, true);
             changed(a);
         });

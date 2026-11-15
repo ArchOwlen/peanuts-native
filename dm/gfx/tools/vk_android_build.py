@@ -397,10 +397,12 @@ MESH_PRIM = collections.defaultdict(set, {p: s for p, s in MESH_PRIM.items() if 
 for _p in [p for p in MESH_PRIM if VS_OF.get(p)]:
     print(f'[RED] pixel shader {_p} is drawn with mesh programs (per-primitive inputs {sorted(MESH_PRIM[_p])}) and with vertex shaders {sorted(VS_OF[_p])[:3]}: its inputs are left per vertex', flush=True)
     del MESH_PRIM[_p]
+KIND_TEX_DYN, KIND_SAMP_DYN = 'tex_dyn', 'samp_dyn'   # the Vulkan ABI's own kinds (dmsh_abi_vk.h): Ryujinx's fallback arrays of 32 buffer textures and samplers (profile key tex_dyn_slots)
 KIND = {abi.KIND_CBUF: 'CBUF', abi.KIND_C1: 'C1', abi.KIND_DRVCB: 'DRVCB', abi.KIND_SUPPORT: 'SUPPORT', abi.KIND_SBUF: 'SBUF', abi.KIND_SBUF_UBO: 'SBUF_UBO', abi.KIND_UBO_PTR: 'UBO_PTR',
         abi.KIND_TEX: 'TEX', abi.KIND_TBUF: 'TBUF', abi.KIND_IMG: 'IMG', abi.KIND_SAMP: 'SAMP', abi.KIND_SAMP_TEX: 'SAMP_TEX', abi.KIND_SAMP_ID: 'SAMP_ID', abi.KIND_TEX_UBO: 'TEX_UBO',
         abi.KIND_SAMP_UBO: 'SAMP_UBO', abi.KIND_TEX_C2A: 'TEX_C2A', abi.KIND_SAMP_C2A: 'SAMP_C2A', abi.KIND_TEX_POOL: 'TEX_POOL', abi.KIND_SAMP_POOL: 'SAMP_POOL',
-        abi.KIND_GMEM_MAP: 'GMEM_MAP', abi.KIND_GMEM_LOG: 'GMEM_LOG', abi.KIND_SHARED_SPILL: 'SHARED_SPILL', abi.KIND_UNKNOWN: 'UNKNOWN'}
+        abi.KIND_GMEM_MAP: 'GMEM_MAP', abi.KIND_GMEM_LOG: 'GMEM_LOG', abi.KIND_SHARED_SPILL: 'SHARED_SPILL', abi.KIND_UNKNOWN: 'UNKNOWN',
+        KIND_TEX_DYN: 'TEX_DYN', KIND_SAMP_DYN: 'SAMP_DYN'}
 KIND_NUM = {k: VK['KIND_' + v] for k, v in KIND.items()}
 SLOT_KINDS = {abi.KIND_CBUF, abi.KIND_SAMP, abi.KIND_SAMP_TEX, abi.KIND_TEX, abi.KIND_IMG, abi.KIND_TBUF, abi.KIND_SBUF, abi.KIND_UBO_PTR, abi.KIND_SBUF_UBO, abi.KIND_TEX_UBO, abi.KIND_SAMP_UBO, abi.KIND_SAMP_ID}
 POOL_SUFFIX = '_cb0_40000000'   # a handle traced to no slot indexes the pools by its IDs (Program.cs QueryTextureArrayLengthFromPool; dmsh_build.py pool_arrays)
@@ -429,6 +431,8 @@ def classify(stage, r, res, m):
         else: e.update(kind=abi.KIND_C1 if n == 1 else abi.KIND_DRVCB, reg=n)
     elif desc == spv.VK_STORAGE_BUFFER and re.fullmatch(r'[a-z]+_s(\d+)', nm):
         e.update(kind=abi.KIND_SBUF, index=int(re.fullmatch(r'[a-z]+_s(\d+)', nm).group(1)))
+    elif texlike and nm.endswith(POOL_SUFFIX) and r['count'] == 32 and re.fullmatch(r'[a-z]+_(tb|s)_cb0_40000000', nm) and desc in (spv.VK_UNIFORM_TEXEL, spv.VK_SAMPLER):
+        e['kind'] = KIND_SAMP_DYN if desc == spv.VK_SAMPLER else KIND_TEX_DYN   # a texture word traced to no slot, here from c2's tables (tex_dyn_slots): the replay binds slot k at element k
     elif texlike and nm.endswith(POOL_SUFFIX) and r['count'] >= 33:
         e.update(kind=abi.KIND_SAMP_POOL if desc == spv.VK_SAMPLER else abi.KIND_TEX_POOL)
         if desc not in (spv.VK_SAMPLER, spv.VK_SAMPLED_IMAGE): e['kind'] = abi.KIND_UNKNOWN   # a pool of combined or storage images: not in the ABI
@@ -594,6 +598,7 @@ def finish(key, w, job, c1):
     hmma = stage == 'cs' and spv.hmma_lds(m)   # the HMMA helper's calls lowered at their sites, gathers shared (vk_android_spv.py hmma_lds)
     if not hmma: spv.promote_locals(m)   # simplify GlobalToStorage helpers (binary search, CAS, branchless inPool) and promote single-store locals
     if not hmma: spv.loop_pool_search(m)   # the raw helpers' pool table search one loop of one step (vk_android_spv.py loop_pool_search)
+    spv.buffer_textures_split(m)   # a buffer texture's combined image and sampler of Dim Buffer → a texel buffer (vk_android_spv.py)
     binds = [classify(stage, r, res, m) for r in m.resources()]
     storage_slots(stage, binds, res)
     try: place(stage, binds, m)

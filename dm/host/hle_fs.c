@@ -106,6 +106,21 @@ static int save_txn_from_path(const char *hp) {
 __attribute__((weak)) void front_save_failed(int err) { LOG("front_save_failed(errno=%d): no front end attached (default weak implementation)", err); }
 // DM_FSLOG=<file>: each ReadFile logs one TSV line "seconds since boot\tguest path\toffset\tlength\tguest buffer address" (which bytes boot read, for offline reverse lookup against the manifest)
 static FILE *g_fslog; static char *g_fdpath[4096]; static pthread_mutex_t g_fslog_lock = PTHREAD_MUTEX_INITIALIZER;
+// PEANUTS begin: DM_FSLOG names files of an image mount (a .nup package, a RomFS image) too: their handles carry (mount, entry), not an fd, so the path
+// each entry was opened by is kept per mount while the log is on (it printed "?" for every read of a .nup game: a replay could not tell the files apart)
+static char **g_imgpath[MAX_MOUNT];
+static void fslog_img_open(int mi, int64_t k, const char *path) {
+    if (!g_fslog || mi < 0 || mi >= MAX_MOUNT || k < 0 || !g_mnt[mi].img || (uint64_t)k >= g_mnt[mi].img->n) return;
+    pthread_mutex_lock(&g_fslog_lock);
+    if (!g_imgpath[mi]) g_imgpath[mi] = calloc(g_mnt[mi].img->n, sizeof(char *));
+    if (g_imgpath[mi] && !g_imgpath[mi][k]) g_imgpath[mi][k] = strdup(path);
+    pthread_mutex_unlock(&g_fslog_lock);
+}
+static const char *fslog_img_path(uint64_t h) {   // under g_fslog_lock
+    int mi = (int)((h >> 32) & 0x3ffffff); uint64_t k = h & 0xffffffffull;
+    return mi < MAX_MOUNT && g_imgpath[mi] && g_mnt[mi].img && k < g_mnt[mi].img->n && g_imgpath[mi][k] ? g_imgpath[mi][k] : "?";
+}
+// PEANUTS end
 static void fslog_init(void) { static int done; if (done) return; done = 1; const char *e = getenv("DM_FSLOG"); if (e && !(g_fslog = fopen(e, "w"))) die("cannot open DM_FSLOG %s", e); if (g_fslog) setvbuf(g_fslog, NULL, _IOLBF, 0); }   // line-buffered: runs end at the time-limit alarm or a crash, which never flush stdio
 
 static const char *envdir(const char *var, const char *rel, char *buf, size_t n) {
@@ -875,6 +890,7 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
             if (!nup_z_get(g_mnt[mi].img, ent->a, why, sizeof why)) { LOG("[RED] fs %s: cannot decompress it from %s: %s", path, ((nup_aux *)g_mnt[mi].img->aux)->what, why); return RES_FAIL; }
         }
         *out = FH_OUT(IMG_HANDLE(mi, k));
+        fslog_img_open(mi, k, path);   // PEANUTS: DM_FSLOG names image files (fslog_img_open above)
         if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → image entry %lld", (now_ns() - g_t0_ns) / 1e9, path, mode, (long long)k);
         return RES_OK;
     }
@@ -938,8 +954,8 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;
-        if (hash_on) fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\t%016llx\n", (now_ns() - g_t0_ns) / 1e9, !IMG_H(h) && (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf, (unsigned long long)fh);
-        else fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\n", (now_ns() - g_t0_ns) / 1e9, !IMG_H(h) && (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf);
+        if (hash_on) fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\t%016llx\n", (now_ns() - g_t0_ns) / 1e9, IMG_H(h) ? fslog_img_path(h) : (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf, (unsigned long long)fh);   // PEANUTS: image paths (fslog_img_path)
+        else fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\n", (now_ns() - g_t0_ns) / 1e9, IMG_H(h) ? fslog_img_path(h) : (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf);   // PEANUTS: image paths (fslog_img_path)
         pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) {   // Read metering: print a line every 64 MiB accumulated or every 1000 reads
         static uint64_t n, bytes, next_b = 64 << 20; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;

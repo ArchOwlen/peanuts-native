@@ -118,7 +118,7 @@ double MsSince(std::chrono::steady_clock::time_point started) {
 
 #if PNRT // PNRT: no loader / content provider; "base:" is the host's romfs directory, "aoc:" none
 FileSys::VirtualDir BuildBase(Core::System& system, u64 program_id) {
-    auto root = system.RomfsRoot();
+    auto root = system.RomfsBaseRoot(); // PNRT: without the mods' folders
     LOG_INFO(Core, "DSMod: base romfs of {:016X} {} (host directory)", program_id,
              root ? "opened" : "unavailable");
     return root;

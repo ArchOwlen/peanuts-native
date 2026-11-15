@@ -16,5 +16,6 @@
             android:process=":pack"
             android:foregroundServiceType="dataSync" />
         <service android:name="dev.peanuts.build.BuildService" android:exported="false" android:foregroundServiceType="dataSync" />   <!-- PEANUTS: the library's build service (import → Prepare → companion) -->
+        <service android:name="dev.peanuts.build.ModBuildService" android:exported="false" android:foregroundServiceType="dataSync" />   <!-- PEANUTS: the modded-variant build (DESIGN-MODS.md "Code injection"), the Mods section's "Build with mods" -->
     </application>
 </manifest>

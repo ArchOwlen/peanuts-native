@@ -55,6 +55,12 @@ if '--target' in ARGS:
     ti = ARGS.index('--target')
     if ti + 1 >= len(ARGS) or ARGS[ti + 1] not in ('apple', 'android'): sys.exit('[RED] --target takes apple or android')
     TARGET = ARGS[ti + 1]; del ARGS[ti:ti + 2]
+# PEANUTS: --xmod <file> (scripts/pack_android.py, for a module of a build with code mods; "Cross-module branches" near the end of this file). Without it nothing below differs
+XMOD = None
+if '--xmod' in ARGS:
+    xi = ARGS.index('--xmod')
+    if xi + 1 >= len(ARGS): sys.exit('[RED] --xmod takes the layout file')
+    XMOD = ARGS[xi + 1]; del ARGS[xi:xi + 2]
 if len(ARGS) != 3: sys.exit('usage: patch_nso.py <NSO file> <output dir> <module name> [--target apple|android]')
 src, outdir, NAME = ARGS
 # An NSO, or an NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code), rewritten as an NSO of the same layout would be. nso.py checks the file
@@ -613,15 +619,19 @@ def rd(o, enc):
     if app == 0x10: v += o
     if app == 0x30: v += ehs
     return v, sz
-_, penc, cenc, tenc = IMG[ehs:ehs + 4]
-o = ehs + 4
-_, s = rd(o, penc); o += s
-nfde, s = rd(o, cenc); o += s
 starts = set()
-for _ in range(nfde):
-    a, s = rd(o, tenc); o += s
-    _, s = rd(o, tenc); o += s
-    starts.add(a)
+# PEANUTS: a module without the table (MOD0's eh_frame_hdr start and end are the same offset: a mod's own subsdk built without one, as Luminescent's subsdk1
+# for Pokemon Brilliant Diamond) has no function starts to read; the bytes at ehs are then MOD0 itself and reading them as a table stopped the rewrite
+# (KeyError: 15). func_range() works without starts
+if struct.unpack_from('<i', IMG, m0 + 16)[0] != struct.unpack_from('<i', IMG, m0 + 20)[0]:
+    _, penc, cenc, tenc = IMG[ehs:ehs + 4]
+    o = ehs + 4
+    _, s = rd(o, penc); o += s
+    nfde, s = rd(o, cenc); o += s
+    for _ in range(nfde):
+        a, s = rd(o, tenc); o += s
+        _, s = rd(o, tenc); o += s
+        starts.add(a)
 starts = sorted(x for x in starts if x < TEXT_END)
 
 # ---- Linear scan to find all rewrite points (not relying on register read/write reports) ----
@@ -1868,8 +1878,88 @@ def changed_runs():
 with open(P('changed.tsv'), 'w', encoding='utf-8', newline='\n') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, n in changed_runs(): f.write(f'{off:#x}\t{n:#x}\n')   # Columns: offset, length in bytes
+# PEANUTS: <name>.orig.bin: the file's own bytes of those runs, one after the other in the table's order. A companion package's module reads the game's code to check
+# that it is the build it knows (a hash of a function's bytes) and to take addresses from its instructions; the Peanuts companion host gives it these bytes in place of the
+# rewritten ones (dm/peanuts/peanuts.c rt_orig). Fire Emblem: Three Houses' companion found 2 of its 42 map functions changed (x18 sites) and showed no monastery map
+with open(P('orig.bin'), 'wb') as f:
+    for off, n in changed_runs(): f.write(ORIG_TEXT[off:off + n])
 with open(P('obs.tsv'), 'w', encoding='utf-8', newline='\n') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')
+# PEANUTS begin: cross-module branches (--xmod). A code mod made for the console may branch straight from one module into another: Luminescent Platinum for Pokemon
+# Brilliant Diamond 1.3.0 patches 106 b / bl into main that go to its own subsdk1, and that module calls main 1,228 times the same way, each at the distance the two have on
+# the console, where rtld puts every module right after the one before it. The host's modules stand farther apart (each carries its key page and patch area), so the loader
+# aims each such branch again once it knows the bases (dm/host/loader.c xmod_apply), from <name>.xmod.tsv: the instruction's offset in this image, b or bl, the module it
+# goes to and the offset there. The layout file (dm/tools/xmod.py write_layout) has tab-separated rows:
+#   module <name> <offset from main on the console> <text length> <size on the console>   every module of the build, in the console's order
+#   scan all | scan sites, then site <offset> rows   where to look: all the code (a module the mod supplies), or only the words a patch changed (the game's own module:
+#                                                    a word of its data that reads as a far branch is never one)
+#   in <offset> <from>                               an offset of this module that another module branches to
+#   inptr <offset> <from>                            an offset of this module that another module keeps the address of
+# A branch that leaves this module and lands in no other module's code stops the rewrite, and so does one this rewriter moved (a site, a window, a spin wait's copy:
+# the loader patches the word where the file has it) and one that comes in at the middle of a window or a retry block, whose instructions run from their copy.
+# Addresses kept as data are listed too, as ptr rows (scan all only: a module the mod supplies): a relocation that makes an address outside the module (xmod.py
+# far_pointers; that mod's subsdk1 has 116 in its GOT, for the globals and functions of main it uses) is a pointer into another module at the console's distance. The slot is
+# where the file has it (this rewriter moves no data and no relocation table), the loader stores the real address there after it has relocated the module. One
+# that lands in no module stops the rewrite; one into another module's code follows the rule of a branch coming in; one into its data or bss needs nothing: the
+# image keeps the file's offsets up to the end of bss, and the key page and the patch area come after
+def xmod_table():
+    mods, sites, scan, incoming, n_inptr = {}, [], None, [], 0
+    with open(XMOD, encoding='utf-8') as f:
+        for line in f.read().splitlines():
+            c = line.split('\t')
+            if c[0] == 'module': mods[c[1]] = (int(c[2], 16), int(c[3], 16), int(c[4], 16))
+            elif c[0] == 'scan': scan = c[1]
+            elif c[0] == 'site': sites.append(int(c[1], 16))
+            elif c[0] in ('in', 'inptr'): incoming.append((int(c[1], 16), c[2])); n_inptr += c[0] == 'inptr'
+    if NAME not in mods or scan not in ('all', 'sites'): sys.exit(f'[RED] {NAME}: {XMOD} is not a cross-module layout of this module')
+    own, _, size = mods[NAME]
+    moved = {w for off, n in changed_runs() for w in range(off, off + n, 4)} | done
+    rows, far, other = [], [], 0
+    for o in sorted(sites) if scan == 'sites' else (o for s, e in CODE_RANGES for o in range(s, e & ~3, 4)):
+        if o < 0 or o + 4 > TEXT_END or o & 3: continue
+        w = struct.unpack_from('<I', ORIG_TEXT, o)[0]
+        if w & 0x7C000000 != 0x14000000:   # not b / bl: count what else points out of the module by its own position
+            if w & 0x1F000000 == 0x10000000:   # adr, adrp
+                d = ((w >> 5) & 0x7FFFF) << 2 | (w >> 29) & 3; d -= (d & 0x100000) << 1
+                t = (o & ~0xFFF) + (d << 12) if w >> 31 else o + d
+            elif w & 0x3B000000 == 0x18000000: d = (w >> 5) & 0x7FFFF; t = o + 4 * (d - ((d & 0x40000) << 1))   # ldr literal
+            else: continue
+            other += not 0 <= t < size
+            continue
+        d = w & 0x3FFFFFF; t = o + 4 * (d - ((d & 0x2000000) << 1))
+        if 0 <= t < size: continue
+        kind = 'bl' if w >> 31 else 'b'
+        to = next((m for m, (at, text, _) in mods.items() if m != NAME and at <= own + t < at + text), None)
+        if to is None: far.append(f'{NAME}+{o:#x} {kind} to {NAME}{t:+#x} (main{own + t:+#x} on the console): in no module\'s code'); continue
+        if o in moved: far.append(f'{NAME}+{o:#x} {kind} to {to}+{own + t - mods[to][0]:#x}: the rewriter moved this instruction (a rewrite site, a window or a spin wait)'); continue
+        assert bytes(IMG[o:o + 4]) == ORIG_TEXT[o:o + 4], f'{o:#x}'
+        rows.append((o, kind, to, own + t - mods[to][0]))
+    ptrs = []
+    if scan == 'all':
+        import xmod
+        img_end = MOD.segments[2][0] + MOD.segments[2][1]   # text + ro + data, as the file has them: where a relocation's slot can be
+        for o, t in xmod.far_pointers(IMG[:img_end], size):
+            to = next((m for m, (at, _, msize) in mods.items() if m != NAME and at <= own + t < at + msize), None)
+            if to is None: far.append(f'{NAME}+{o:#x} holds the address {NAME}{t:+#x} (main{own + t:+#x} on the console): in no module'); continue
+            if o & 7 or not TEXT_END <= o <= img_end - 8: far.append(f'{NAME}+{o:#x} holds the address of {to}+{own + t - mods[to][0]:#x}: the slot is not a word of the module\'s data'); continue
+            ptrs.append((o, 'ptr', to, own + t - mods[to][0]))
+    win_mid = {x.address for wseg in windows for x in wseg[1:]}
+    for t, frm in incoming:
+        if t in win_mid or t in rmid_all: far.append(f'{frm} branches or points to {NAME}+{t:#x}: the middle of a window or retry block, which runs from its copy')
+    if far:
+        for line in far[:20]: print(f'[RED] cross-module branch: {line}')
+        sys.exit(f'[RED] {NAME}: {len(far)} cross-module branches or pointers cannot be kept ({len(rows) + len(ptrs)} can): the build with this mod is refused')
+    with open(P('xmod.tsv'), 'w', encoding='utf-8', newline='\n') as f:
+        f.write(f'# BUILD_ID\t{BUILD_ID}\n')
+        for o, kind, to, t in rows + ptrs: f.write(f'{o:#x}\t{kind}\t{to}\t{t:#x}\n')   # Columns: offset in this image, b or bl or ptr (a data word holding an address), the module it goes to, offset there
+    into = {m: sum(1 for r in rows if r[2] == m) for m in mods}
+    n_site = sum(1 for t, _ in incoming if t < TEXT_END and bytes(IMG[t:t + 4]) != ORIG_TEXT[t:t + 4])
+    pinto = {m: (sum(1 for r in ptrs if r[2] == m), sum(1 for r in ptrs if r[2] == m and r[3] < mods[m][1])) for m in mods}
+    print(f'{NAME}: xmod: {len(rows)} branches out' + ''.join(f', {n} into {m}' for m, n in into.items() if n) + f'; {len(incoming) - n_inptr} come in, {n_site} of them at a rewritten instruction (its stub runs)'
+          + (f'; {len(ptrs)} pointers out' + ''.join(f', {n} into {m} ({c} of them into its code)' for m, (n, c) in pinto.items() if n) if ptrs else '') + (f'; {n_inptr} pointers come in' if n_inptr else ''))
+    if other: print(f'[RED] {NAME}: {other} adr / adrp / ldr literal words point outside the module by their own position: not re-aimed (data in the code, or the mod reads another module that way)')
+if XMOD: xmod_table()
+# PEANUTS end
 print(NAME, stats, 'cuts', len(cuts), 'obs', len(obs), 'patch', len(patch_front) + len(patch_back), 'PATCH_OFF', hex(PATCH_OFF), *(('BACK_OFF', hex(BACK_OFF), 'back', len(patch_back)) if TWO else ()), 'slot_refs', len(fix), 'gates', len(gates))
 if DATA_BLOCKS: print(NAME, 'data blocks left alone:', ', '.join(f'{s:#x}..{e:#x}' for s, e in DATA_BLOCKS))

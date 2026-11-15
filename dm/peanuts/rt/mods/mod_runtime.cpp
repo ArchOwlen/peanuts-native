@@ -377,11 +377,17 @@ void ModRuntime::Initialize() {
         const bool env_off = gc != nullptr && gc[0] == '0'; // explicit "0" overrides the manifest
         const auto gcf = manifest.flag_defaults.find("gpu_composite");
         const bool manifest_gc = gcf != manifest.flag_defaults.end() && gcf->second;
+        // PNRT: this host has no GPU quad compositor (PublishComposite/PublishAuxTexture are
+        // accepted and dropped by the AuxRouting shim), so a composite page would publish only
+        // the HUD overlay over a transparent map area and the screen would never show the map.
+        // The flag is ignored here and the CPU raster path (what every other companion uses) runs.
         if (!env_off && (env_gc || manifest_gc)) {
-            gpu_composite_mode = true;
-            system.GPU().DSModAux().gpu_composite.store(true);
-            LOG_INFO(Core, "DSMod: GPU composite path enabled (via {})",
+            LOG_INFO(Core,
+                     "DSMod: GPU composite requested (via {}) but this host has no compositor; "
+                     "using the CPU raster path",
                      env_gc ? "env" : "manifest flag");
+        } else {
+            LOG_INFO(Core, "DSMod: CPU raster path");
         }
     }
     LOG_INFO(Core, "DSMod: runtime started for '{}'", manifest.name);
@@ -799,6 +805,21 @@ void ModRuntime::Tick() {
                 summary += std::format("{}=? ", name);
             }
         }
+        // PNRT: the module's gates, so a page stuck on its standby screen says why in the log.
+        const auto gate = [&](const char* name) {
+            const auto it = snapshot.ints.find(name);
+            return it != snapshot.ints.end() ? it->second : s64{-1};
+        };
+        summary += std::format("[gates map_ready={} cutscene={} module_ready={} build_match={} "
+                               "map_lock_forced={} ui_frames={} map_base_rasters={} base_ms={} "
+                               "map_composites={} incremental={} composite_ms={} "
+                               "publish_skipped={} fade_steps={}] ",
+                               gate("map_ready"), gate("cutscene"), gate("module_ready"),
+                               gate("build_match"), map_lock_forced_waits,
+                               system.GPU().DSModAux().UiSerial(), map_base_rasters.load(),
+                               map_base_last_ms.load(), map_composites.load(),
+                               map_composites_incremental.load(), map_last_composite_ms.load(),
+                               map_publish_skipped.load(), map_fade_steps.load());
         LOG_INFO(Core, "DSMod snapshot: {}", summary);
     }
 

@@ -180,6 +180,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         setContentView(root);
         immersive();
         dev.peanuts.Companion.start(this, getIntent().getStringExtra("name"));   // PEANUTS: the companion on the second display
+        dev.peanuts.launch.RecentGames.touch(this, id, getIntent().getStringExtra("name"));   // PEANUTS: last-3-played dynamic shortcuts (LAUNCHERS.md)
         TextInput.screen(this);   // the keyboard applet's input box shows on this screen (again, when the game was waiting on it as the screen was recreated)
         // The host starts once per process. A screen created again while it runs (Android recreated the activity: "Don't keep activities", a font or language
         // change while in the background) takes its window over; a screen restored into a new process (Android ended the old one while it was in the background)
@@ -403,6 +404,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     /** The DM_ switches this build reads (BuildConfig.NX_ENV_SWITCHES, from docs/env_switches.tsv) */
     static final java.util.Set<String> KNOWN_SWITCHES = new java.util.HashSet<>(java.util.Arrays.asList(BuildConfig.NX_ENV_SWITCHES.split(" ")));
     private final List<String> unknownNotes = new ArrayList<>();
+    private String shapeNote;   // Aspect ratio › Screen shape: the window it read and the shape passed, for the log
     private int readinessEnv;   // the lines the readiness check ran with (readinessHold), for the log
 
     /** Where a user line with this key came from, for the [RED] line: the last of env.txt, the game's settings, env-<id>.txt that has it */
@@ -426,11 +428,19 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         return hz >= 30 && hz <= 240 ? hz : 60;
     }
 
+    private Profile.Render startRender;   // the render setting this run started with (settingsEnv), null for a game without a render_cfg row
+    Profile.Render startRender() { return startRender; }
+
     private String settingsEnv(String id, List<String> env) {
         // Game resolution: the game's own setting, else the main screen's: the window size the host gives the game (window_fn), or the graphics scale and operation
         // mode that give that size (graphics_scale rows), as its profile says (Profile.resolutionEnv); nothing for a game with neither
         Profile prof = Profile.of(id);
+        ScreenMode.env(this, id, env);   // PEANUTS: Console mode (DM_OPMODE) for a game whose Resolution does not set it
+        ResScale.env(this, id, env);   // PEANUTS: Resolution scale (DM_RES_SCALE) when it is not 1x
         if (prof != null) env.addAll(prof.resolutionEnv(Prefs.startWindow(this, id)));   // a Resolution preset's window, else Game resolution's (Prefs.startWindow, ResPresets)
+        // Resolution, Upscaling quality and Graphics quality (a render_cfg row: Profile.renderCfg), kept as the setting this run starts with: the loader sizes the render target
+        // pool for it, and the in-game panel compares a pick with it (Profile.renderRestartNote)
+        if (prof != null && prof.renderCfg()) { startRender = Prefs.render(this, prof, id); env.addAll(Profile.renderEnv(startRender)); }
         if (prof != null && prof.vegetationDetail && !Prefs.fullVegetation(this, id)) env.add("DM_VK_VEGETATION=0");
         if (prof != null) env.addAll(prof.optionsEnv(optEnv -> Prefs.gameOption(this, id, optEnv)));
         Lsfg.env(this, env);   // frame generation: the user's Lossless.dll and the settings
@@ -463,6 +473,13 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (variant != null) {   // Game settings › Aspect ratio: the pack's native-aspect modules (<pack>/<variant>/, loader.c) and the picture shown at that aspect
             env.add("DM_PATCH_VARIANT=" + variant);
             env.add("DM_VK_PICTURE_ASPECT=" + aspect);
+        } else if (aspect != null && Profile.of(id) != null && Arrays.asList(Profile.of(id).cameraAspects.split(",")).contains(aspect)) {   // a shape the host's camera patch follows (game.tsv aspect rows): the picture at that shape, no variant
+            env.add("DM_VK_PICTURE_ASPECT=" + aspect);
+        } else if (ScreenShape.CHOICE.equals(aspect) && Profile.of(id) != null && !Profile.of(id).cameraAspects.isEmpty()) {   // Screen shape: the window's own shape (ScreenShape), read now, once; a 16:9-ish window passes nothing
+            android.graphics.Rect b = getWindowManager().getCurrentWindowMetrics().getBounds();
+            String shape = ScreenShape.ratio(b.width(), b.height(), orientationFixed());
+            if (shape != null) env.add("DM_VK_PICTURE_ASPECT=" + shape);
+            shapeNote = ("[nxlaunch] aspect ratio: screen shape, window " + b.width() + "x" + b.height() + (orientationFixed() ? " (landscape)" : "") + (shape == null ? ": about 16:9, nothing passed" : " -> " + shape));
         }
         int picSize = Prefs.pictureSize(this, id);   // the in-game panel's Picture size; 100 (the default) is not passed
         if (picSize < PictureFit.SIZE_MAX) env.add("DM_VK_PICTURE_SIZE=" + picSize);
@@ -635,6 +652,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             if (nupFd >= 0) romfs = PickedPath.forHost(romfs, game, nupFd);
             // The user's lines, read first: the paths the launcher sets cannot be changed by them (guard), but the test app's env-<id>.txt may name a test save folder (one game's file only: a global DM_SAVE would point every game at one save)
             List<String> user = new ArrayList<>(guard(userEnv(new File(files, "env.txt")), "env.txt", false));   // diagnostic switches (every game: never DM_SAVE) (DM_SVC=1, DM_FS=1, ...), as the iPhone's Documents/env.txt
+            user.addAll(guard(LinkPlay.env(this, id), "Link Play", false));   // Game settings › Link Play (before the typed lines, which win)
             user.addAll(guard(envLines(Prefs.gameEnv(this, id)), "the game's settings", false));   // the game's own lines (its Game settings): after env.txt, so they win for this game
             user.addAll(guard(userEnv(new File(files, "env-" + id + ".txt")), "env-" + id + ".txt", testApp()));   // and env-<title ID>.txt (adb), the same for one game
             File save = saveDir(files, game, id), temp = mkdirs(new File(files, "temp/" + id)), root = mkdirs(new File(files, "root"));
@@ -649,26 +667,49 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                     "DM_ROMFS=" + romfs, "DM_SAVE=" + save, "DM_TEMP=" + temp, "DM_ROOT=" + root, "DM_AOC_DIR=" + aoc,
                     "HOME=" + files, "TMPDIR=" + getCacheDir(), "DM_BUILD_COMMIT=" + BuildConfig.NX_COMMIT,
                     "DM_CTL=" + new File(files, "ctl.txt"), "NX_EXIT_RECORD=" + ExitWatch.record(this)));   // live control lines (android/TESTING.md "Live control", android/tools/nxctl.sh); DM_CTL= in env.txt turns it off
-            env.addAll(dev.peanuts.build.GenericProfile.envLines(this, id));   // PEANUTS: -PnxGenericHost=true DM_PROFILE_PATH/DM_PROFILE_SEED; empty list otherwise
+            env.addAll(dev.peanuts.build.GenericProfile.envLines(this, id, packDir));   // PEANUTS: packDir: a modded variant's own profile.bin (GenericProfile)   // PEANUTS: -PnxGenericHost=true DM_PROFILE_PATH/DM_PROFILE_SEED; empty list otherwise
             env.add(0, "NX_BUILD_TAG=" + Prefs.buildTag(this) + " \u00b7 signer " + Prefs.signerId(this));   // nxlaunch.c writes it as the log's first line; the signer says which key signed the APK (Signer)
+            try (java.io.InputStream fin = getAssets().open(GameFonts.ASSET)) {   // the shared-font stand-in (dm/third_party/fonts): the host serves it instead of the phone's own fonts; a DM_FONT_DIR line of the user's comes later and wins
+                File fontDir = new File(getFilesDir(), "fonts");
+                GameFonts.place(fontDir, GameFonts.STANDARD, fin.readAllBytes());
+                env.add(GameFonts.envLine(fontDir));
+            } catch (IOException e) { unknownNotes.add("[nxlaunch] the shared font stand-in is not placed (" + e.getMessage() + "): the host uses the phone's own fonts"); }
+            try (java.io.InputStream fin = getAssets().open(GameFonts.EXT_ASSET)) {   // the button icons in game text (shared-font type 5: hle_sdk16.c), in the same folder; without it they draw as '?'
+                GameFonts.place(new File(getFilesDir(), "fonts"), GameFonts.EXT, fin.readAllBytes());
+            } catch (java.io.FileNotFoundException e) {   // an APK built without fontTools: the host's [YELLOW] line says so
+            } catch (IOException e) { unknownNotes.add("[nxlaunch] the button-icon font is not placed (" + e.getMessage() + "): button icons in game text draw as '?'"); }
             String gpuNote = settingsEnv(id, env);
-            // The 3D scene (Game settings › Resolution, ResPresets; Advanced › 3D scene, SceneRes): the chosen RomFS overlay in the pack, made by the pack step from the player's files;
-            // a DM_ROMFS_OVERLAY line of the user's comes later and wins
+            // The 3D scene (Game settings › Resolution, ResPresets; Advanced › 3D scene, SceneRes): the chosen RomFS overlay in the pack, made by the pack step from the player's files,
+            // or the chosen game arguments (scene_arg); a DM_ROMFS_OVERLAY or DM_GAME_ARGS_ADD line of the user's comes later and wins
             Profile sceneProf = Profile.of(id);
             List<SceneRes.Preset> scenes = SceneRes.presets(sceneProf);
             List<ResPresets.Preset> resPresets = ResPresets.presets(sceneProf);
             String sceneNote = null;
             String sceneName = Prefs.startScene(this, id);
             ResPresets.Preset rp = ResPresets.of(resPresets, sceneName);
+            File sceneOverlay = null;   // PEANUTS: mods (the scene overlay, kept for the mods' line below)
             if (rp != null) {   // a preset with a scene of its own: its overlay is named by its id
                 File ov = SceneRes.overlay(pack.scenes, packDir, rp.id);
                 if (ov != null) env.add(SceneRes.envLine(ov));
                 sceneNote = SceneRes.note(rp.id, rp.label + " \u00b7 " + rp.detail(), ov);
-            } else if (!scenes.isEmpty()) {
+                sceneOverlay = ov;   // PEANUTS: mods (see below)
+            } else if (!scenes.isEmpty()) {   // an overlay (scene_scale), or game arguments the engine takes (scene_arg: DM_GAME_ARGS_ADD, nothing in the pack)
                 File ov = SceneRes.overlay(scenes, pack.scenes, packDir, sceneName);
                 if (ov != null) env.add(SceneRes.envLine(ov));
+                String argLine = SceneRes.argLine(scenes, sceneName);
+                if (argLine != null) env.add(argLine);
                 sceneNote = SceneRes.note(scenes, sceneName, ov);
+                sceneOverlay = ov;   // PEANUTS: mods (see below)
             }
+            // PEANUTS: Mods (DESIGN-MODS.md) \u2014 the enabled mods' romfs, highest-priority first, ahead of the scene overlay above (hle_fs.c:222-223
+            // DM_ROMFS_OVERLAY is ':'-separated, first root to have the file wins, hle_fs.c:375-388/1289-1326); replaces the scene's own line above
+            // only when a mod actually has a romfs (env is applied setenv-overwrite style, so the last DM_ROMFS_OVERLAY line here wins \u2014 same rule
+            // the scene comment above already relies on for the user's own env.txt). DM_CHEATS stages the enabled mods' cheats into one folder
+            // (hle_cheats.c reads a single flat folder by build ID); a "code" mod's exefs/exefs_patches never reach this process at all.
+            String modOverlay = dev.peanuts.mods.ModRuntime.romfsOverlayEnv(this, game.isDirectory() ? game : game.getParentFile(), id, sceneOverlay, packDir);   // PEANUTS: mods beside the game; packDir: a code mod's files only with its build
+            if (modOverlay != null) env.add(modOverlay);
+            String modCheats = dev.peanuts.mods.ModRuntime.cheatsEnv(this, game.isDirectory() ? game : game.getParentFile(), id, packDir);   // PEANUTS: mods beside the game; a code mod's cheats only with its build
+            if (modCheats != null) env.add(modCheats);
             String resNote = resPresets.isEmpty() ? null   // the choice in force, for the log: which preset (or Advanced), and the window and scene it gave
                     : "[nxlaunch] resolution " + Prefs.resolutionChoice(this, id) + (Prefs.resPreset(this, id).isEmpty() ? " (nothing chosen: the earlier settings' match or the default)" : "")
                     + ": window " + Prefs.startWindow(this, id) + ", scene " + (sceneName.isEmpty() ? "the game's own palette" : sceneName);
@@ -712,7 +753,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             Native.note("[nxlaunch] game: " + game + (nupFd >= 0 ? " (.nup used where it is, descriptor " + nupFd + ")" : Nup.isNup(game) ? " (.nup)" : " (folder)") + ", DM_ROMFS " + romfs
                     + ", pack " + packDir);
             Native.note("[nxlaunch] save: " + save + " (" + saveHow + ")" + (saveNote != null ? "; " + saveNote : ""));
-            // PEANUTS: -PnxGenericHost=true loads libnxhost.so (one for every title), not libnxhost_<id>.so (design/platform/IMPL-GENERIC.md)
+            // PEANUTS: -PnxGenericHost=true loads libnxhost.so (one for every title), not libnxhost_<id>.so
             Native.note("nxnative " + BuildConfig.VERSION_NAME + " (" + BuildConfig.NX_COMMIT + "), host " + (BuildConfig.NX_GENERIC_HOST ? "libnxhost.so" : "libnxhost_" + id + ".so") + "; " + name + " " + id + " version " + pack.version);
             Native.note("device " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE + " (SDK " + Build.VERSION.SDK_INT + "), " + Build.SUPPORTED_ABIS[0]
                     + "; game " + game + "; pack " + packDir);
@@ -733,6 +774,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             Native.note(gpuNote + " (picked in the launcher; a DM_VK_DRIVER line in env.txt wins, the host's [vk] driver line says which ran)");
             Native.note(Recommend.logLine(Prefs.recStates(this, id)));   // each recommended setting with its value and source (yours / recommended / default); env.txt lines come later and win
             if (resNote != null) Native.note(resNote);
+            if (shapeNote != null) Native.note(shapeNote);
             if (sceneNote != null) Native.note(sceneNote);
             input = Native.hasInput();
             started = true;
@@ -1104,10 +1146,13 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
      * is already resizable (targetSdk 35), and these only change which part of the display the system gives a window that asks for an orientation, not the request
      */
     private void fitOrientation() {
-        android.graphics.Rect b = getWindowManager().getMaximumWindowMetrics().getBounds();
-        int want = GameOrientation.fixedLandscape(b.width(), b.height(), getResources().getDisplayMetrics().density)
-                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+        int want = orientationFixed() ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
         if (getRequestedOrientation() != want) setRequestedOrientation(want);
+    }
+    /** Whether the window asks for landscape (GameOrientation): Settings › Screen rotation Landscape, on a phone; Automatic asks for nothing */
+    private boolean orientationFixed() {
+        android.graphics.Rect b = getWindowManager().getMaximumWindowMetrics().getBounds();
+        return GameOrientation.fixedLandscape(b.width(), b.height(), getResources().getDisplayMetrics().density, Prefs.rotationAuto(this));
     }
 
     /** Full screen: the status and navigation bars (and the swipe handle) are hidden, a swipe from the edge shows them for a moment; the picture also runs under a display cutout */

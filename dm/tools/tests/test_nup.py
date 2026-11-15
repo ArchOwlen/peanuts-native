@@ -269,7 +269,7 @@ class Tools(Fixture):
         try: import capstone, lz4.block   # noqa: F401  (pack_android.py checks them before any work)
         except ImportError: self.skipTest('no capstone / lz4 (android/environment.yml)')
         import pack_android
-        def fake_rewrite(py, srcs, out, jobs, g, in_process=False):   # the rewriter's input as it reads it (nso.py), as its output
+        def fake_rewrite(py, srcs, out, jobs, g, in_process=False, xmod=None):   # PEANUTS: xmod, as rewrite() takes it   # the rewriter's input as it reads it (nso.py), as its output
             for m, src in srcs.items():
                 (out / f'{m}.patched.bin').write_bytes(bytes(nso.read(str(pack_android.rewriter_src(src, out, m))).image)); (out / f'{m}.android.key').write_text(pack_android.rewrite_key(src, g) + '\n')
         packs = {}
@@ -335,7 +335,7 @@ class Descriptor(Fixture):
         try: import capstone, lz4.block   # noqa: F401
         except ImportError: self.skipTest('no capstone / lz4 (android/environment.yml)')
         import pack_android
-        def fake_rewrite(py, srcs, out, jobs, g, in_process=False):
+        def fake_rewrite(py, srcs, out, jobs, g, in_process=False, xmod=None):   # PEANUTS: xmod, as rewrite() takes it
             for m, src in srcs.items():
                 (out / f'{m}.patched.bin').write_bytes(bytes(nso.read(str(pack_android.rewriter_src(src, out, m))).image)); (out / f'{m}.android.key').write_text(pack_android.rewrite_key(src, g) + '\n')
         packs = {}

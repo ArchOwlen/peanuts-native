@@ -31,7 +31,7 @@ import java.util.zip.ZipInputStream;
 
 /**
  * Installs a companion package: downloads the .dsmod.zip, verifies its sha256, checks that it holds package.json and dualscreen/manifest.json for the expected
- * title, checks it against this app's runtime before ever activating it, and activates it. Layout (dev.peanuts.ui.CompanionVersions, AUDIT.md's rt_find_package
+ * title, checks it against this app's runtime before ever activating it, and activates it. Layout (dev.peanuts.ui.CompanionVersions, rt_find_package
  * note, dm/peanuts/peanuts.c's PEANUTS companion-versions comment):
  * <ul>
  * <li>&lt;root&gt;/&lt;package&gt;/ - the one *active* version the host (dm/peanuts/peanuts.c rt_find_package) loads at the next game start. Exactly one folder of
@@ -55,7 +55,7 @@ public final class Installer {
     private static final String VERSIONS_DIR = ".peanuts-versions";
     private static final Pattern SHA256_LINE = Pattern.compile("([0-9A-Fa-f]{64})");
 
-    /** One lock per package name (CRITIQUE-phase2b.md §B): install/activateLocalVersion/remove/forgetLocalVersion hold it for their whole operation, so a
+    /** One lock per package name (found in review): install/activateLocalVersion/remove/forgetLocalVersion hold it for their whole operation, so a
      * repair() triggered by the UI opening a screen can never run concurrently with one of them - without this, repair()'s delete(newSlot) could wipe a
      * half-extracted ".new" an install() is still writing into, or restore ".old" while a swap mid-flight is between its own two renames, making its own
      * error message lie about what just happened. A plain static map keyed by package name is a reasonable simplification for a device with one Peanuts
@@ -150,7 +150,7 @@ public final class Installer {
             if (!src.isDirectory()) throw new IOException(packageName + " " + version + " is not on this device");
             refuseIfIncompatible(src);
             String warning = buildIdWarning(src, knownBuildId);
-            refuseIfGameRunning(ctx);   // re-check right before the swap (CRITIQUE-phase2d.md B-1): this window is tiny, but still a window
+            refuseIfGameRunning(ctx);   // re-check right before the swap (found in review): this window is tiny, but still a window
             swap(root, packageName, src, version);
             return warning;
         } finally {
@@ -336,7 +336,7 @@ public final class Installer {
             try (OutputStream o = new FileOutputStream(new File(fresh, "installed.json"))) {
                 o.write(new JSONObject().put("version", version).put("tag", tag).put("url", url).put("verified", true).toString(2).getBytes(StandardCharsets.UTF_8));
             }
-            // CRITIQUE-phase2d.md B-1: the game-running check at install()'s entry only covers the moment the download started; download+verify+extract
+            // Found in review: the game-running check at install()'s entry only covers the moment the download started; download+verify+extract
             // above can take minutes, long enough for the user to start the game in the meantime. Re-check right before the swap, which is the actual
             // hazard, rather than trust a check that is now stale.
             refuseIfGameRunning(ctx);
@@ -358,7 +358,7 @@ public final class Installer {
         File active = installedDir(root, packageName);
         File oldSlot = new File(root, packageName + ".old");
         if (oldSlot.exists()) {
-            // CRITIQUE-phase2b.md §B: oldSlot can already be occupied by a version an earlier repair()/archiveOldSlot() could not file away (a rename
+            // Found in review: oldSlot can already be occupied by a version an earlier repair()/archiveOldSlot() could not file away (a rename
             // failure, not expected but not impossible) - try to archive it before clearing the slot, rather than silently discarding that rollback copy.
             archiveOldSlot(root, packageName, oldSlot);
             if (oldSlot.exists()) {
@@ -428,7 +428,7 @@ public final class Installer {
         File newSlot = new File(root, packageName + ".new");
         if (!active.isDirectory()) {
             if (isUsablePackage(oldSlot) && oldSlot.renameTo(active)) { delete(newSlot); return; }   // roll back to the pre-swap state: the safest default
-            // CRITIQUE-phase2c.md B-1: isUsablePackage alone is not enough here. extractAndActivate() writes installed.json only after extraction and
+            // Found in review: isUsablePackage alone is not enough here. extractAndActivate() writes installed.json only after extraction and
             // every check pass, so a FIRST install (nothing active yet, no ".old" to roll back to) killed mid-extract can leave a ".new" that already has
             // package.json + dualscreen/manifest.json (zip entry order often puts those early) but is missing assets/modules that come later in the zip.
             // Promoting that partial folder would make the host load a broken package. Require installed.json too - it is written last, after the whole

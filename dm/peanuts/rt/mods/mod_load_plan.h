@@ -88,6 +88,16 @@ public:
         return epoch_offset;
     }
 
+    /// PNRT: the patches of main (not the guest code), for a host that applies the plan to a running
+    /// process and must know which bytes of main it reads and writes (peanuts_helper.cpp).
+    [[nodiscard]] const std::vector<Write>& Writes() const {
+        return writes;
+    }
+    /// PNRT: the guest helper's code and relocations, nullptr without one (format 1).
+    [[nodiscard]] const GuestCode* GuestCodeData() const {
+        return guest_code ? &*guest_code : nullptr;
+    }
+
     /// Separate RX allocation. Format 1 continues to use no extra code pages.
     [[nodiscard]] u64 GuestCodeSize() const;
 

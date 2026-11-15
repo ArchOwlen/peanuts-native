@@ -7,7 +7,7 @@ import java.lang.reflect.Proxy;
 import java.util.List;
 
 /**
- * The .nup importer's Java face (dev.peanuts.importer.Native, agent A's JNI over dm/peanuts/import) reached through reflection, so this package compiles and
+ * The .nup importer's Java face (dev.peanuts.importer.Native, the JNI over dm/peanuts/import) reached through reflection, so this package compiles and
  * runs without it: without the class, {@link #available()} is false and an NSP/XCI build says so.
  * <pre>
  *   static int keys(String prodKeys);  static String probe(String file);  static String lastError();

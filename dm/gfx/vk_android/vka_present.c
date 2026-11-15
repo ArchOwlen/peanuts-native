@@ -748,8 +748,12 @@ static int present_one(const pq_item *it) {
     VkCommandBuffer cb = g_fr[k].cb; vk.vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vk.vkBeginCommandBuffer(cb, &bi);
+    // PEANUTS: DM_RES_SCALE (vka_tex.c vka_resscale.inc): from here to the command buffer's end the window texture's size, scale and handle are read under vka_rs_mu,
+    // which a change of its scale on the recording thread only tries to take (the present holds the texture across frames, so its holds cannot stand for "in use now")
+    int rs_lock = vka_rs_on(); if (rs_lock) pthread_mutex_lock(&vka_rs_mu);
     int cx = 0, cy = 0, cw = im ? (int)im->w : 1, ch = im ? (int)im->h : 1;
-    if (it->has_crop && it->crop[2] > 0 && it->crop[3] > 0) { cx = it->crop[0]; cy = it->crop[1]; cw = it->crop[2]; ch = it->crop[3]; }
+    if (it->has_crop && it->crop[2] > 0 && it->crop[3] > 0) { cx = it->crop[0]; cy = it->crop[1]; cw = it->crop[2]; ch = it->crop[3];
+        if (im && im->rsc && !vka_rs_rect(im, &cx, &cy, &cw, &ch)) { cx = cy = 0; cw = (int)im->w; ch = (int)im->h; } }   // PEANUTS: the game's crop in a scaled window texture's pixels (all of it when nothing is left of the crop)
     int ew = (int)(rot_quarter(g_pre) ? g_ext.height : g_ext.width), eh = (int)(rot_quarter(g_pre) ? g_ext.width : g_ext.height);   // the display, as the user sees it
     // Fit (keep aspect) or stretch to the whole display (DM_VK_STRETCH), at DM_VK_PICTURE_SIZE % of that, placed by nxhost_picture_place; all live (the in-game panel
     // sends the switches through DM_CTL and gives the launcher's touch mapping the same rectangle, PictureFit.rect)
@@ -802,6 +806,7 @@ static int present_one(const pq_item *it) {
     ovl_draw(cb, k, idx);   // the launcher's overlay over the picture (generated frames too)
     if (!it->src) vka_ctl_shot_record(cb, im, g_pfmt, cx, cy, cw, ch);   // the game's own frames only
     vk.vkEndCommandBuffer(cb);
+    if (rs_lock) pthread_mutex_unlock(&vka_rs_mu);   // PEANUTS: (above)
     VkSemaphore ws[2] = {g_fr[k].acq, V.tl}; uint64_t wv[2] = {0, it->fence}; VkPipelineStageFlags st[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};   // the image's first barrier is ALL_COMMANDS
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 2, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = it->fence ? 2 : 1, .pWaitSemaphores = ws, .pWaitDstStageMask = st,
@@ -879,7 +884,9 @@ static void *present_main(void *arg) {
         pq_item it = g_pq[g_pq_read % PQ]; g_pq_read++;
         pthread_mutex_unlock(&g_pmu);
         vka_img *gen[VKA_FG_MAX]; double hold = 0, out_period = 0;   // frame generation: the images shown before this frame, each for hold seconds
-        int ng = g_surf ? vka_fg_frame(it.t.serial, it.has_crop ? it.crop : NULL, it.period, it.fence, gen, &hold, &out_period) : 0;
+        if (vka_rs_on()) pthread_mutex_lock(&vka_rs_mu);   // PEANUTS: DM_RES_SCALE: frame generation reads the window texture's size and handle too (present_one)
+        int ng = g_surf ? vka_fg_frame(it.t.serial, it.has_crop ? it.crop : NULL, it.period, it.fence, (int)it.t.d.format, gen, &hold, &out_period) : 0;
+        if (vka_rs_on()) pthread_mutex_unlock(&vka_rs_mu);   // PEANUTS
         double game_period = it.period;
         g_fg_on = out_period > 0;
         if (out_period > 0) it.period = out_period;

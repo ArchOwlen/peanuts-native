@@ -39,6 +39,10 @@ FIXTURE = textwrap.dedent('''
     PS_INPUTS = {}
     XLATE_GATE = threading.Semaphore(XLATE_J)
     packs = {}
+    # PEANUTS begin: what pool_for and close_pool read since the worker processes (DMSH_VK_WORKER / DMSH_VK_WORKERS): none here, so the pool is the interpreters'
+    VK_WORKER, VK_WORKERS = '', 1
+    sys.path.insert(0, os.path.dirname(TOOL)); import split_pool
+    # PEANUTS end
 
     def _rec(name, k):
         fd, offs = packs[name]
@@ -73,10 +77,10 @@ FIXTURE = textwrap.dedent('''
     def _take(names, worker_block=False):
         body = [n for n in _tree.body if (isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in names)
                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in n.targets))
-                or (worker_block and isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == 'WORKER')]
+                or (worker_block and isinstance(n, ast.If) and ast.unparse(n.test) == "WORKER and (not WORKER.get('proc'))")]   # PEANUTS: the interpreters' block since the worker processes have one too (`if WORKER and WORKER.get('proc')`, not taken)
         exec(compile(ast.Module(body=body, type_ignores=[]), TOOL, 'exec'), globals())
     _take({'Stop', 'worker_message'}, worker_block=True)   # a worker serves here and ends
-    _take({'WORKER_SETUP', 'WORKER_RUN', 'WorkerSetupFailed', 'Pool', 'POOL', 'pool_for', 'close_pool'})
+    _take({'WORKER_SETUP', 'WORKER_RUN', 'WorkerSetupFailed', 'Pool', 'POOL', '_PROC_TRIED', 'pool_for', 'close_pool'})   # PEANUTS: _PROC_TRIED (pool_for's once-only try of the worker processes)
 
     signal.signal(signal.SIGINT, signal.default_int_handler)
     for name in sorted({v[0] for v in MAP.values()}):

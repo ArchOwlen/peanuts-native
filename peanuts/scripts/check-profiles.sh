@@ -2,9 +2,9 @@
 # Build-time check for the assumption dev.peanuts.ui.LibraryScanner.versionInfo() makes at runtime: that a profile's "recommended" build (shown on the
 # Version row and used to relabel Build -> "Build anyway") is the highest version in its game.tsv `build` rows. game.tsv's own `package` line is the real
 # answer (the version the shipped shader tables were built for) but is not exposed through BuildConfig.NX_PROFILES, so LibraryScanner approximates it with
-# max(build) instead -- see LibraryScanner.java's class doc and GameSheet.java's "Known gaps" note in IMPL-A.md.
+# max(build) instead -- see LibraryScanner.java's class doc and GameSheet.java's "Known gaps" note.
 #
-# CRITIQUE-phase2b.md A-2: the round-2 runtime guard for this (LibraryScanner.checkRecommendedGuard) never actually ran (a stray `break` made it check only
+# Found in review: the round-2 runtime guard for this (LibraryScanner.checkRecommendedGuard) never actually ran (a stray `break` made it check only
 # game.tsv's first line, never the `package` row) and, even fixed, would decompress assets/pack/tools.zip once per title during the first scan on the
 # phone for a check that only ever needs to run once, at build time. This script replaces it: no runtime cost, and it catches a mismatch before an APK
 # ships instead of after.
@@ -13,7 +13,7 @@
 # highest version among its `build` rows. Prints one OK/MISMATCH line per title; exits non-zero if any title mismatches, has no `package` line, or has
 # no `build` rows.
 #
-# critique-phase2c A (round 4): the default used to be android/app/gradle.properties' `nxGames`, but that property holds Banana Native's own 5 Switch 2
+# Found in review (round 4): the default used to be android/app/gradle.properties' `nxGames`, but that property holds Banana Native's own 5 Switch 2
 # defaults, not the titles the Peanuts APK is actually built with (those come from -PnxGames=... at build time, which this script has no way to read
 # without invoking Gradle). Checking every dm/games/<id> profile is both simpler and strictly more thorough -- it is what the round-3 run already did
 # by hand (131 OK) -- and never misses a title just because it is not (yet, or ever) one of the ones a particular APK build happens to include.

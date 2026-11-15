@@ -21,7 +21,7 @@ A patch's binding is what its correctness is anchored to, from the loosest. A pa
 
 ## Gaps
 
-Every patch bound tighter than it could be: the open gaps, then the blocked, kept and unreviewed ones; in each, those reaching the most games first (the games whose profiles register the builds it touches), then those farthest from their goal. 1 patch has no reviewed goal yet.
+Every patch bound tighter than it could be: the open gaps, then the blocked, kept and unreviewed ones; in each, those reaching the most games first (the games whose profiles register the builds it touches), then those farthest from their goal. 2 patches have no reviewed goal yet.
 
 | Now → goal | Patch | Purpose | Status | Evidence | Games | Where | Why |
 |---|---|---|---|---|---|---|---|
@@ -38,14 +38,18 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `game` → `host` | CPU vertex conversion over the vertices a draw reads | power | gap | judgement | 1 | `vconv_range`: [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) | the same vertices as the whole range, for less work; DM_NVN_VCONV_CHECK checks it: a default for every game after `regress.py check` on the games |
 | `game` → `host` | draw passes ordered by the game's own barriers | frame rate | gap | judgement | 1 | `draw_barriers`: [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | what NVN specifies: a default for every game after `regress.py check` on the games |
 | `game` → `host` | frame-parallel dav1d for AV1 movies | frame rate | gap | judgement | 1 | `av1_decoder`: [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | the default decoder drops frames of this game's movies on the phone; frame-parallel dav1d for every game once it is checked on the other games' movies |
+| `game` → `host` | GPU event and sync waits across queues passed on the Vulkan replay | frame rate | gap | judgement | 1 | `event_wait`: [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | parked waits cost this game a third of its frame rate and lose the device on Turnip V39; waits that cost no extra submissions would let every game keep them |
+| `game` → `host` | MapPhysicalMemory limited to the application pool | memory | gap | judgement | 1 | `mem_map_limit`: [Castlevania: Belmont's Curse](../../dm/games/0100BA4026E94000/README.md) | Horizon's limit, on for every game; `off` only for a profile whose pool is too small (Switch 1 games, not supported) |
+| `game` → `host` | memory pools placed by parts from a smaller size on a device of 12 GB or less | memory | gap | judgement | 1 | `low_ram_place_part_mb`: [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | less placed memory where RAM is short; a size for every game once the part size's cost is measured on the other games |
 | `game` → `host` | Metal encoding on its own thread on the Mac | frame rate | gap | judgement | 1 | `enc_thread`: [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | what iOS does for every game: a default for every game after `regress.py check` on the games |
 | `game` → `host` | MTL4Compiler pipelines on iOS | rendering | gap | judgement | 1 | `pso_mtl4`: [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | a setting the game was tested with on an iPhone: a default for every game after `regress.py check` on the games |
 | `game` → `host` | one vertex shader's visibility counter (VertexCounterLowering) | shaders | gap | judgement | — | [Program.cs:303](../../dm/gfx/tools/dmsh_xlate/Program.cs#L303) | a general lowering of subgroup ballots in vertex shaders would cover any shader that counts that way |
 | `game` → `host` | present snapshots | rendering | gap | judgement | 1 | `present_snap`: [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | a setting the game was tested with: a default for every game after `regress.py check` on the games |
-| `build` → `engine` | sead's dynamic interval controller floor behind a fixed global (the app object's framework) | frame rate | gap | judgement | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | sead's game framework code that other Nintendo EPD games ship: the rewriter now finds the controller by its code (nso_code.py sead_find) and its gate hands the host the controller's address, which the floor could take instead of the fixed chain |
 | `build` → `engine` | the dynamic resolution's level lists, lowered at load to fit DM_WINDOW_SIZE (the Android launcher's Game resolution) | rendering | gap | judgement | 1 | `res_levels`: [Pokemon Pokopia](../../dm/games/0400A3A01EE4C000/README.md) | KTGL's size table and level lists, at fixed offsets per main build; a fingerprint of the controller that picks the list (oe::GetOperationMode, oe::GetCurrentGraphicsScale, the 34-level table) could find them in other KTGL games |
 | `build` → `engine` | the dynamic resolution's range steered while the game runs (DM_DRS, the Android launcher's Dynamic resolution) | rendering | gap | judgement | 1 | `drs_ctl`: [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | four places in sead / agl's MaintainGpuPercentage controller, at fixed offsets per main build (each checked for its instruction); a fingerprint of the controller could find them in other games on that engine |
 | `build` → `engine` | the framework's fixed steps per frame (its mode and step count), written for the frame rate cap: 30 and 20 fps at full game speed | frame rate | gap | judgement | 1 | `fps_steps`: [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | the framework at a fixed global per main build; a fingerprint of its frame function (the step pick from the mode, then the update loop over the count and the present interval set to it) could find it in the game's updates |
+| `build` → `engine` | the output and render size written into every render configuration (DM_WINDOW_SIZE, DM_RENDER_PCT; hle_render.c) | rendering | gap | judgement | 1 | `render_cfg`: [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | the game's table of render configurations, at a fixed offset per main build (the build, the heap and the game's own sizes checked before each write); a fingerprint of the selector that reads it could find it in other builds |
+| `build` → `engine` | the render target pool sized at load for the starting render setting (at least the first larger size on a device of more than 12 GB), and render_cfg's max_render raised with it (DM_RT_POOL_MB; loader.c) | memory | gap | judgement | 1 | `rt_pool`: [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | the pool's size is one movz in the game's text, at a fixed offset per build (the build and the word checked before the write); a fingerprint of the pool's constructor call could find it in other builds |
 | `build` → `engine` | Unity QualitySettings.vSyncCount held at 1 | frame rate | gap | judgement | 1 | [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md) | an IL2CPP player registers the setter by its icall name, so the place can be found in any Unity game; holding it at 1 stays this profile's choice (its logic steps by the count) |
 | `build` → `engine` | Unity's Application.targetFrameRate at a fixed address | frame rate | gap | judgement | 1 | [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) | an IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile's |
 | `build` → `game` | frame buffer scale: the scene at the window's full size instead of 80 % | rendering | gap | judgement | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | the game's own per-mode table entry, multiplied in at two fixed offsets; a function fingerprint of the scene setup (the two fmul after the table load) could carry it over the game's updates |
@@ -62,6 +66,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | unused 272-byte slot pool: 4,194,304 → 65,536 slots | address space | gap | judgement | 1 | [Mario + Rabbids® Sparks of Hope](../../dm/games/0100317013770000/README.md) | Sparks of Hope's own init (Kingdom Battle has none) |
 | `build` → `sdk` | rows the rules would add the alignment cuts to (2d369d99, 12f16103, 311deab1) | address space | blocked: the games that reach them (Pokémon Brilliant Diamond, Monster Hunter Rise, 13 Sentinels: Aegis Rim; Brain Memory Training Academy; Ace Attorney Investigations Collection) have no Mac build: run one per build with the alignment cuts | checked: the rules resolved on each build's sdk, 2026-10-29 and 2026-10-30 | 12 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | the rules give these builds the same node area cut and the three alignment cuts more; each row keeps the alignment out |
 | `build` → `sdk` | rows of builds not on the game drive (56ec2474, 9c73fb73, e01950c5) | address space | blocked: no copy on the drive to compare | judgement | 3 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | likely what the rules give (each names one of their implementations) |
+| `build` → `game` | Game Freak's frame time of present interval 2 at a fixed address (Pokémon Sword and Shield) | frame rate | blocked: one version of each game on hand | checked: Sword main a3b75bcd3311385a and Shield main a16802625e7826bf (1.3.2): the same offset in both | 2 | [Pokémon Shield](../../dm/games/01008DB008C2C000/README.md); [Pokémon Sword](../../dm/games/0100ABF008968000/README.md) | the game's own table of frame times by present interval (16666667, 33333334, 50000000 ... ns as 64-bit words), which a search for those values could find in any build |
 | `build` → `game` | Unity BucketAllocator ALLOC_BUCKET: 255 blocks of 4 MB → 63 | address space | blocked: no extracted main of either Subnautica on the game drive to fingerprint | checked: the bucket allocator of five Unity 2021 and later mains (not Subnautica's), 2026-10-29 | 2 | [Subnautica](../../dm/games/0100429011144000/README.md); [Subnautica: Below Zero](../../dm/games/010014C011146000/README.md) | Unity 2019's constructor call takes the block count as a constant; Unity 2021 and later read the bucket sizes from boot.config with a default of one block (Cult of the Lamb, Monster Train 2, Blasphemous 2, BALL x PIT, Donkey Kong Country Returns HD; checked 2026-10-29) and need no cut, so no Unity rule. A function-matched rule could carry it over the game's updates |
 | `build` → `sdk` | VammManager node area and alignment, SDK 4.4.0 (9de92bad) | address space | blocked: one game ships it | judgement | 1 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | an older implementation no rule covers (its large regions aligned to 32 MB, not the rules' 2 MB); a rule once a second game ships it |
 | `build` → `engine` | Criterion's 60 fps mode, frame ticks and game step at fixed addresses | frame rate | blocked: one game on that engine here | judgement | 1 | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | the studio's engine, which its other games ship |
@@ -73,12 +78,23 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | 60 fps frame step and render scale | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) | the game's own timing object |
 | `build` → `game` | 60 fps frame step and render scale (ksys::VFR) | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | the game's own frame code; the frame-step state page is general |
 | `build` → `game` | 60 fps frame step: the KIDS frame task and frame-rate block | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) | the game's own frame code; only the host's frame-step state page is shared. Fire Emblem: Three Houses and Taiko Risshiden V DX run on KTGL too, with other frame code |
+| `build` → `game` | camera aspect and 2D layer: the 3D camera follows the picture shape and the layout perspective stays in the middle 16:9 (Game settings > Aspect ratio / Screen shape) | rendering | blocked: one build on hand; the projection update and the matrix copy are plain code a function fingerprint could find | checked: v458752 by disassembly, 2026-11-13: every original word read from the main image; the prior art's sites (dkbwide set) match the same words; the layout uniform block seen on the phone (DM_VK_UB_PEEK) | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | sead::PerspectiveProjection and the draw info's projection copy are engine code, but the three gate sites (the scene camera updater's projection update and the two layout projection setups after their copies) are fixed addresses of this build |
+| `build` → `game` | camera aspect and 2D layer: the 3D cameras and the UI follow the picture shape (Game settings > Aspect ratio) | rendering | blocked: one build on hand; the aspect store and the getter calls could be found by function fingerprint | judgement | 1 | [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | sead::PerspectiveProjection and nn::ui2d::DrawInfo are the same in every title of this engine, but the five sites are fixed addresses of this build |
+| `build` → `game` | camera aspect: the 3D cameras follow the picture shape (Game settings > Aspect ratio) | rendering | blocked: one build on hand; the projection reads are plain sead code and could be found by function fingerprint | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | sead::PerspectiveProjection is the same in every title of this engine, but the five read sites are fixed addresses of this build |
+| `build` → `game` | Donkey Kong Bananza camera and layout aspect callback in main v458752 | rendering | blocked: one build on hand | judgement | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | the callback reads the scene camera updater's aspect and fovy and the layout draw info's projection at fixed offsets, and the gates sit at fixed addresses of this build; the projection update and the layout setup are plain code a function fingerprint could find |
 | `build` → `game` | FPS Unlock: optional elapsed-time update step | frame rate | blocked: one full build ID and update hook verified | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the game update derives a fractional step from its integer frame rate |
 | `build` → `game` | frame step floor 2 → 1 vsync, and its frame step | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) | the game's own clock floor and step |
 | `build` → `game` | frame step: the frame-rate controller's interval and fps from the host | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the game's own 30 fps mode (interval 2), chosen by the host's step so presentation and game time agree |
+| `build` → `game` | Grezzo's frame controller least and most extra vsyncs behind a fixed global (Link's Awakening) | frame rate | blocked: one build on hand | checked: main 909e904af78ac1b8 (1.1.0), where the row was found; another project describes the same bytes for 1.0.1 | 1 | [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) | the game's own frame controller: its clamp to the two bytes and the game manager's pointer are plain code a function fingerprint could find |
+| `build` → `game` | Grezzo's frame governor enable and last-frame-slow bytes at a fixed address (Echoes of Wisdom) | frame rate | blocked: one build on hand | checked: main 9f221e1afa65ba54 (1.1.0), where the row was found | 1 | [The Legend of Zelda: Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md) | the game's own frame governor, rewritten since Link's Awakening (no least and most bytes): the game manager is a static object the frame task's code names, which a function fingerprint could find |
+| `build` → `game` | Mario Kart World camera and 2D layer aspect callback in main 1.8.0 | rendering | blocked: one build on hand; the aspect stores and the getter calls could be found by function fingerprint | judgement | 1 | [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | the callback reads sead's PerspectiveProjection fields and nn::ui2d's DrawInfo matrix, the same in every title of this engine, but its five gates (two camera aspect stores, two projection getter calls and one rows read) are fixed addresses of this build |
 | `build` → `game` | Max Resolution: optional full-scale dynamic resolution path | rendering | blocked: one full build ID and branch verified | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the title has its own dynamic resolution controller and full-scale branch |
 | `build` → `game` | movie player: the plain player instead of the NDVE-enhanced one | frame rate | blocked: one build on hand; the faster tensor path is translator work (docs/reference/shaders.md, Ampere HMMA through simdgroup_matrix, Open) | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | a workaround: the tensor network costs 47.5 ms of GPU a movie frame; a function fingerprint could carry it over updates, and once the translator keeps LDSM / MOVM / HMMA chains in matrices the cut can go |
+| `build` → `game` | Ocarina of Time camera and 2D layer aspect callback in main v131072 | rendering | blocked: one build on hand; the projection reads are plain sead code a function fingerprint could find | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the callback reads sead's PerspectiveProjection fields, the same in every title of this engine, but its eight gates (five cameras, the HUD canvas, the movie viewport and the save picture) are fixed addresses of this build |
+| `build` → `game` | Persona 5 Royal's present interval at the end of a fixed pointer chain | frame rate | blocked: one build on hand, and the function that builds the chain is not located yet | checked: main d4b150b29a931cd3 (1.0.2): the chain is that of a community cheat for this build, its first pointer lies in bss; the code that makes the chain was not found | 1 | [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md) | the game's own display object behind a global of main, at offsets of this build |
+| `build` → `game` | Pokopia camera aspect hooks in main v2.0.1 | rendering | blocked: future game builds require exact offset and original-word validation | checked: main 76a489f3bd3642fa5e18bd83d32c98ba (Fold 7 observation, 2026-11-11) | 1 | [Pokemon Pokopia](../../dm/games/0400A3A01EE4C000/README.md) | camera layout/offsets are specific to this exact game build |
 | `build` → `game` | Texture Pool x2: optional larger initial graphics allocation | memory | blocked: one full build ID and allocator call verified | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the allocator is in the game and full-scale rendering can exhaust the original pool |
+| `build` → unreviewed | cutscene frame time from the game clock at a 60 fps target | frame rate | unreviewed | judgement | 1 | [Metroid Dread](../../dm/games/010093801237C000/README.md) | the engine's per-frame function picks the cutscene's audio clock over the game clock by a predicate at a fixed offset |
 | `build` → unreviewed | Fire Emblem Fortune's Weave native 4:3 variant (VARIANT_CUTS['43']: camera aspect and ui2d pane rules) | rendering | unreviewed | judgement | 1 | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | an opt-in variant (Game settings › Aspect ratio) of about 230 words in code caves of this main; each ui2d rule names panes of this build's layouts |
 
 ## Summary
@@ -88,7 +104,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [ASTRAL CHAIN](#astral-chain) | 0 | 0 | 112 | 0 | 0 | `build` → `game` |
 | [Batman: Arkham Knight](#batman-arkham-knight) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [DARK SOULS: REMASTERED](#dark-souls-remastered) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [Donkey Kong Bananza](#donkey-kong-bananza) | 2 | 1 | 0 | 0 | 1 | `build` → `game`, `build`, `build` → `engine` |
+| [Donkey Kong Bananza](#donkey-kong-bananza) | 2 | 4 | 0 | 0 | 2 | `build` → `game` ×3, `build` |
 | [EA SPORTS FC 27](#ea-sports-fc-27) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition](#final-fantasy-crystal-chronicles-remastered-edition) | 8 | 0 | 0 | 0 | 0 | `build` → `engine` |
 | [FINAL FANTASY TACTICS - The Ivalice Chronicles](#final-fantasy-tactics---the-ivalice-chronicles) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
@@ -99,19 +115,26 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Luigi's Mansion 3](#luigis-mansion-3) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Mario + Rabbids Kingdom Battle](#mario--rabbids-kingdom-battle) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Mario + Rabbids® Sparks of Hope](#mario--rabbids-sparks-of-hope) | 7 | 0 | 0 | 0 | 0 | `build` → `game` ×2 |
+| [Mario Kart World](#mario-kart-world) | 0 | 5 | 0 | 0 | 1 | `build` → `game` ×2 |
+| [Metroid Dread](#metroid-dread) | 0 | 0 | 1 | 0 | 0 | `build` → unreviewed |
 | [Monster Hunter Rise](#monster-hunter-rise) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Need For Speed™ Hot Pursuit Remastered](#need-for-speed-hot-pursuit-remastered) | 1 | 0 | 0 | 0 | 5 | `build` → `game`, `build` → `engine` |
 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](#nierautomata-the-end-of-yorha-edition-010056b015fe8000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](#nierautomata-the-end-of-yorha-edition-0100b8e016f76000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [Paper Mario: The Thousand-Year Door](#paper-mario-the-thousand-year-door) | 1 | 0 | 1 | 0 | 0 | `build` → `game` |
+| [Persona 5 Royal](#persona-5-royal) | 0 | 0 | 0 | 0 | 1 | `build` → `game` |
+| [Pokemon Pokopia](#pokemon-pokopia) | 0 | 3 | 0 | 0 | 1 | `build` → `game` |
 | [Pokémon Brilliant Diamond](#pokémon-brilliant-diamond) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
+| [Pokémon Shield](#pokémon-shield) | 0 | 0 | 0 | 0 | 1 | `build` → `game` |
+| [Pokémon Sword](#pokémon-sword) | 0 | 0 | 0 | 0 | 1 | `build` → `game` |
 | [Subnautica](#subnautica) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Subnautica: Below Zero](#subnautica-below-zero) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Super Smash Bros. Ultimate](#super-smash-bros-ultimate) | 11 | 0 | 0 | 1 | 0 | `game` |
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 5 | 0 | 0 | `build` → `game` ×2 |
-| [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 1 | 0 | 4 | 0 | 0 | `build` → `game` ×5 |
+| [The Legend of Zelda: Echoes of Wisdom](#the-legend-of-zelda-echoes-of-wisdom) | 0 | 0 | 0 | 0 | 1 | `build` → `game` |
+| [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 1 | 8 | 4 | 0 | 2 | `build` → `game` ×7 |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 9 | 0 | 0 | `build` → `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -276,13 +299,18 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`build` → `game`**, rendering, gap, judgement: frame buffer scale: the scene at the window's full size instead of 80 %. The game's own per-mode table entry, multiplied in at two fixed offsets; a function fingerprint of the scene setup (the two fmul after the table load) could carry it over the game's updates
 - **`build`**, frame rate, at goal, checked: v0 and v458752 by disassembly, 2026-11-10: the search finds main+0x1eadf0 and main+0x204b20, nso_fnmap.py maps one to the other exactly: sead's frame-rate controller's place for v458752, named whatever the search finds. An override and fallback of the rewriter's search (nso_code.py sead_find), which finds the same place in every build of this game by the controller's code
-- **`build` → `engine`**, frame rate, gap, judgement: sead's dynamic interval controller floor behind a fixed global (the app object's framework). Sead's game framework code that other Nintendo EPD games ship: the rewriter now finds the controller by its code (nso_code.py sead_find) and its gate hands the host the controller's address, which the floor could take instead of the fixed chain
+- **`build` → `game`**, rendering, blocked: one build on hand; the projection update and the matrix copy are plain code a function fingerprint could find, checked: v458752 by disassembly, 2026-11-13: every original word read from the main image; the prior art's sites (dkbwide set) match the same words; the layout uniform block seen on the phone (DM_VK_UB_PEEK): camera aspect and 2D layer: the 3D camera follows the picture shape and the layout perspective stays in the middle 16:9 (Game settings > Aspect ratio / Screen shape). Sead::PerspectiveProjection and the draw info's projection copy are engine code, but the three gate sites (the scene camera updater's projection update and the two layout projection setups after their copies) are fixed addresses of this build
+- **`build` → `game`**, rendering, blocked: one build on hand, judgement: Donkey Kong Bananza camera and layout aspect callback in main v458752. The callback reads the scene camera updater's aspect and fovy and the layout draw info's projection at fixed offsets, and the gates sit at fixed addresses of this build; the projection update and the layout setup are plain code a function fingerprint could find
 
 - **v458752 `main`** `e25c90c1…` ([patches.py:7](../../dm/games/040074A01BF12000/patches.py#L7))
   - cut `+0x30f8f4`: frame buffer scale: fmul s0, s1, s0 → fmov s0, s1 (the base, 1.0, instead of base × 0.8)
   - cut `+0x30f904`: frame buffer scale: the second fmul → nop (the height keeps the base too)
   - gate 5416987 at `+0x204b20`: sead's frame-rate controller: 60 / interval (w8 / w21, the controller in x20); the host makes it the measured rate (hle_fpslock.c sead_rate)
-  - host [hle_fpslock.c:45](../../dm/host/hle_fpslock.c#L45): engine frame limit set to fps_target: sead frame-rate controller minimum interval
+  - gate 4896 at `+0x45e238`: scene camera updater projection update, before it reads the fovy (ldr s0,[x19,#0x104]); x19 the updater (aspect +0x100, fovy degrees +0x104)
+  - gate 8224 at `+0x45f9e0`: layout system projection setup main+0x45f840, after its copy main+0xb1314 (ldr s0,[x20,#0xc]); x0 the draw info, the perspective matrix at +0x10
+  - gate 8224 at `+0x803c9c`: the second layout projection setup main+0x803b60 (the scene's layouts: HUD), after its copy main+0xb1314 (mov x8,sp; the adrp before it is not relocatable); x0 the draw info
+  - host [dkb_wide.c:32](../../dm/host/android/dkb_wide.c#L32): build check
+  - host [hle_fpslock.c:49](../../dm/host/hle_fpslock.c#L49): engine frame limit set to fps_target: sead frame-rate controller minimum interval
 
 ### EA SPORTS FC 27
 
@@ -291,7 +319,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, blocked: one Frostbite game here, judgement: Frostbite's frame regulator at a fixed pointer. Engine code other Frostbite games ship (the simulation's own rate is already set by name)
 
 - **1.8d.310c `main`** `a48c0de3…`
-  - host [hle_fpslock.c:72](../../dm/host/hle_fpslock.c#L72): engine frame limit set to fps_target: FIFA frame regulator
+  - host [hle_fpslock.c:130](../../dm/host/hle_fpslock.c#L130): engine frame limit set to fps_target: FIFA frame regulator
 
 ### FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition
 
@@ -374,7 +402,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, blocked: one game on that engine here, judgement: Next Level Games' frame limiter target at a fixed address. The studio's engine, which its other games ship
 
 - **1.4.0 `main`** `79e5950f…`
-  - host [hle_fpslock.c:57](../../dm/host/hle_fpslock.c#L57): engine frame limit set to fps_target: NLG frame limiter target
+  - host [hle_fpslock.c:115](../../dm/host/hle_fpslock.c#L115): engine frame limit set to fps_target: NLG frame limiter target
 
 ### Mario + Rabbids Kingdom Battle
 
@@ -406,6 +434,30 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x164338`: Snowdrop large allocator: maximum 64 KB page count 65536 -> 32768, matching its 2 GB range (mov w5,#0x8000)
   - cut `+0x94354`: Unused 272-byte slot pool: 4,194,304 -> 65,536 slots, 1.06 GB -> 17 MB of address space (mov w1,#0x10000)
 
+### Mario Kart World
+
+[Mario Kart World](../../dm/games/0400C3F00006E000/README.md), `0400C3F00006E000`, [patches.py](../../dm/games/0400C3F00006E000/patches.py).
+
+- **`build` → `game`**, rendering, blocked: one build on hand; the aspect store and the getter calls could be found by function fingerprint, judgement: camera aspect and 2D layer: the 3D cameras and the UI follow the picture shape (Game settings > Aspect ratio). Sead::PerspectiveProjection and nn::ui2d::DrawInfo are the same in every title of this engine, but the five sites are fixed addresses of this build
+- **`build` → `game`**, rendering, blocked: one build on hand; the aspect stores and the getter calls could be found by function fingerprint, judgement: Mario Kart World camera and 2D layer aspect callback in main 1.8.0. The callback reads sead's PerspectiveProjection fields and nn::ui2d's DrawInfo matrix, the same in every title of this engine, but its five gates (two camera aspect stores, two projection getter calls and one rows read) are fixed addresses of this build
+
+- **1.8.0 `main`** `d00e4f39…` ([patches.py:10](../../dm/games/0400C3F00006E000/patches.py#L10))
+  - gate 2081 at `+0x8a6d8`: layer camera aspect store (str s0,[x8,#0xb0], the viewport width over height); x8 the sead::PerspectiveProjection, s0 widened before the store
+  - gate 2849 at `+0x8a788`: the same store in the second copy of the loop (str s0,[x11,#0xb0]); x11 the projection
+  - gate 8225 at `+0x17f3c1c`: nn::ui2d draw constant-buffer setup, before its bl to DrawInfo's projection getter (main+0x17ed900); x0 pointed at a scaled copy of the 16:9 projection
+  - gate 16417 at `+0x1805f18`: nn::ui2d text setup, before its bl to the same getter; x0 pointed at a scaled copy, pane in x21
+  - gate 24609 at `+0x17f5088`: view-projection product made on the CPU, after ldp q0,q4,[x21,#0x10]; q0 (x row) or q4 (y row) scaled
+  - host [mkw_wide.c:33](../../dm/host/android/mkw_wide.c#L33): build check
+
+### Metroid Dread
+
+[Metroid Dread](../../dm/games/010093801237C000/README.md), `010093801237C000`, [patches.py](../../dm/games/010093801237C000/patches.py).
+
+- **`build` → unreviewed**, frame rate, unreviewed, judgement: cutscene frame time from the game clock at a 60 fps target. The engine's per-frame function picks the cutscene's audio clock over the game clock by a predicate at a fixed offset
+
+- **2.1.0 `main`** `646761f6…` ([patches.py:31](../../dm/games/010093801237C000/patches.py#L31))
+  - frame step `+0x119a320`: cutscene frame time: the audio clock only below a 60 fps target (state page target fps; 0 and 30 = the original predicate)
+
 ### Monster Hunter Rise
 
 [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), `0100B04011742000`.
@@ -413,7 +465,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, blocked: one RE Engine game here, judgement: RE Engine's frame limit at a fixed pointer. Engine code other RE Engine games ship
 
 - **16.0.2 `main`** `c9a3dd77…`
-  - host [hle_fpslock.c:53](../../dm/host/hle_fpslock.c#L53): engine frame limit set to fps_target: RE Engine frame limit
+  - host [hle_fpslock.c:111](../../dm/host/hle_fpslock.c#L111): engine frame limit set to fps_target: RE Engine frame limit
 
 ### Need For Speed™ Hot Pursuit Remastered
 
@@ -424,11 +476,11 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **1.0.3 `main`** `799d1061…` ([patches.py:7](../../dm/games/010029B0118E8000/patches.py#L7))
   - cut `+0x4835a4`: frame limiter spin: b.gt main+0x483588 → nop (the host paces the frames)
-  - host [hle_fpslock.c:62](../../dm/host/hle_fpslock.c#L62): engine frame limit set to fps_target: Criterion 60 fps mode
-  - host [hle_fpslock.c:63](../../dm/host/hle_fpslock.c#L63): engine frame limit set to fps_target: Criterion frame ticks
-  - host [hle_fpslock.c:64](../../dm/host/hle_fpslock.c#L64): engine frame limit set to fps_target: Criterion frame ticks / 10
-  - host [hle_fpslock.c:65](../../dm/host/hle_fpslock.c#L65): engine frame limit set to fps_target: Criterion 2D game step
-  - host [hle_fpslock.c:66](../../dm/host/hle_fpslock.c#L66): engine frame limit set to fps_target: Criterion 3D game step
+  - host [hle_fpslock.c:120](../../dm/host/hle_fpslock.c#L120): engine frame limit set to fps_target: Criterion 60 fps mode
+  - host [hle_fpslock.c:121](../../dm/host/hle_fpslock.c#L121): engine frame limit set to fps_target: Criterion frame ticks
+  - host [hle_fpslock.c:122](../../dm/host/hle_fpslock.c#L122): engine frame limit set to fps_target: Criterion frame ticks / 10
+  - host [hle_fpslock.c:123](../../dm/host/hle_fpslock.c#L123): engine frame limit set to fps_target: Criterion 2D game step
+  - host [hle_fpslock.c:124](../../dm/host/hle_fpslock.c#L124): engine frame limit set to fps_target: Criterion 3D game step
 
 ### NieR:Automata The End of YoRHa Edition (010056B015FE8000)
 
@@ -447,7 +499,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x9bf4d4`: dynamic resolution: optimal frame cost 32.01 -> 16.005 ms at 60 fps (second load)
   - cut `+0x9bf4f8`: dynamic resolution: good frame cost 30 -> 15 ms at 60 fps
   - launcher capabilities: DYNAMIC_RESOLUTION
-  - host [hle_fpslock.c:102](../../dm/host/hle_fpslock.c#L102): frame interval and dynamic-resolution floor
+  - host [hle_fpslock.c:174](../../dm/host/hle_fpslock.c#L174): frame interval and dynamic-resolution floor
 
 ### NieR:Automata The End of YoRHa Edition (0100B8E016F76000)
 
@@ -466,7 +518,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x9c08e8`: dynamic resolution lower bound follows the selected preset
   - cut `+0x9c08f4`: dynamic resolution lower bound follows the selected preset
   - launcher capabilities: DYNAMIC_RESOLUTION
-  - host [hle_fpslock.c:103](../../dm/host/hle_fpslock.c#L103): frame interval and dynamic-resolution floor
+  - host [hle_fpslock.c:175](../../dm/host/hle_fpslock.c#L175): frame interval and dynamic-resolution floor
 
 ### Paper Mario: The Thousand-Year Door
 
@@ -478,6 +530,27 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x2e77a4`: frame step floor in 60 Hz vsyncs: mov w9,#2 → mov w9,#1 (the game steps by the vsyncs that passed, down to one)
   - frame step `+0x2e77f8`: frame step: the base clock steps by the host's vsyncs (state page target fps; 0 = the game's measured step)
 
+### Persona 5 Royal
+
+[Persona 5 Royal](../../dm/games/01005CA01580E000/README.md), `01005CA01580E000`.
+
+- **`build` → `game`**, frame rate, blocked: one build on hand, and the function that builds the chain is not located yet, checked: main d4b150b29a931cd3 (1.0.2): the chain is that of a community cheat for this build, its first pointer lies in bss; the code that makes the chain was not found: Persona 5 Royal's present interval at the end of a fixed pointer chain. The game's own display object behind a global of main, at offsets of this build
+
+- **1.0.2 `main`** `d4b150b2…`
+  - host [hle_fpslock.c:94](../../dm/host/hle_fpslock.c#L94): engine frame limit set to fps_target: Persona 5 Royal present interval
+
+### Pokemon Pokopia
+
+[Pokemon Pokopia](../../dm/games/0400A3A01EE4C000/README.md), `0400A3A01EE4C000`, [patches.py](../../dm/games/0400A3A01EE4C000/patches.py).
+
+- **`build` → `game`**, rendering, blocked: future game builds require exact offset and original-word validation, checked: main 76a489f3bd3642fa5e18bd83d32c98ba (Fold 7 observation, 2026-11-11): Pokopia camera aspect hooks in main v2.0.1. Camera layout/offsets are specific to this exact game build
+
+- **v655360 `main`** `76a489f3…` ([patches.py:8](../../dm/games/0400A3A01EE4C000/patches.py#L8))
+  - gate 28 at `+0x8cc128`: scene camera enters render view; x20 camera
+  - gate 29 at `+0x1f12130`: projection builder entry; x0 camera
+  - gate 30 at `+0x1f12354`: perspective projection exit; x19 camera
+  - host [pkp_aspect.c:58](../../dm/host/android/pkp_aspect.c#L58): build check
+
 ### Pokémon Brilliant Diamond
 
 [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md), `0100000011D90000`.
@@ -485,7 +558,25 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, gap, judgement: Unity's Application.targetFrameRate at a fixed address. An IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile's
 
 - **1.3.0 `main`** `94ceae32…`
-  - host [hle_fpslock.c:48](../../dm/host/hle_fpslock.c#L48): engine frame limit set to fps_target: Unity targetFrameRate
+  - host [hle_fpslock.c:106](../../dm/host/hle_fpslock.c#L106): engine frame limit set to fps_target: Unity targetFrameRate
+
+### Pokémon Shield
+
+[Pokémon Shield](../../dm/games/01008DB008C2C000/README.md), `01008DB008C2C000`.
+
+- **`build` → `game`**, frame rate, blocked: one version of each game on hand, checked: Sword main a3b75bcd3311385a and Shield main a16802625e7826bf (1.3.2): the same offset in both: Game Freak's frame time of present interval 2 at a fixed address (Pokémon Sword and Shield). The game's own table of frame times by present interval (16666667, 33333334, 50000000 ... ns as 64-bit words), which a search for those values could find in any build
+
+- **1.3.2 `main`** `a1680262…`
+  - host [hle_fpslock.c:102](../../dm/host/hle_fpslock.c#L102): engine frame limit set to fps_target: Game Freak frame time of interval 2
+
+### Pokémon Sword
+
+[Pokémon Sword](../../dm/games/0100ABF008968000/README.md), `0100ABF008968000`.
+
+- **`build` → `game`**, frame rate, blocked: one version of each game on hand, checked: Sword main a3b75bcd3311385a and Shield main a16802625e7826bf (1.3.2): the same offset in both: Game Freak's frame time of present interval 2 at a fixed address (Pokémon Sword and Shield). The game's own table of frame times by present interval (16666667, 33333334, 50000000 ... ns as 64-bit words), which a search for those values could find in any build
+
+- **1.3.2 `main`** `a3b75bcd…`
+  - host [hle_fpslock.c:101](../../dm/host/hle_fpslock.c#L101): engine frame limit set to fps_target: Game Freak frame time of interval 2
 
 ### Subnautica
 
@@ -558,31 +649,54 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - frame step `+0x151d3d0`: VFR::updateInterval: its own override published for the host (state page target fps; 0 = original)
   - render scale stub (the launcher offers DM_RENDER_SCALE)
 
+### The Legend of Zelda: Echoes of Wisdom
+
+[The Legend of Zelda: Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md), `01008CF01BAAC000`.
+
+- **`build` → `game`**, frame rate, blocked: one build on hand, checked: main 9f221e1afa65ba54 (1.1.0), where the row was found: Grezzo's frame governor enable and last-frame-slow bytes at a fixed address (Echoes of Wisdom). The game's own frame governor, rewritten since Link's Awakening (no least and most bytes): the game manager is a static object the frame task's code names, which a function fingerprint could find
+
+- **1.1.0 `main`** `9f221e1a…`
+  - host [hle_fpslock.c:72](../../dm/host/hle_fpslock.c#L72): engine frame limit set to fps_target: Grezzo frame governor enable
+
 ### The Legend of Zelda: Link's Awakening
 
 [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md), `01006BB00C6F0000`, [patches.py](../../dm/games/01006BB00C6F0000/patches.py).
 
 - **`build` → `game`**, race, gap, judgement: PhysX completion task release. A lifetime race in the game's own completion task (its release slot serves this one vtable)
+- **`build` → `game`**, frame rate, blocked: one build on hand, checked: main 909e904af78ac1b8 (1.1.0), where the row was found; another project describes the same bytes for 1.0.1: Grezzo's frame controller least and most extra vsyncs behind a fixed global (Link's Awakening). The game's own frame controller: its clamp to the two bytes and the game manager's pointer are plain code a function fingerprint could find
 
 - **1.1.0 `main`** `909e904a…` ([patches.py:12](../../dm/games/01006BB00C6F0000/patches.py#L12))
   - cut `+0x10cd070`: physics completion task release (calls its own destructor): ldr x8,[x0] → ret (no longer destroyed; the step function rebuilds it in place every step)
+  - host [hle_fpslock.c:58](../../dm/host/hle_fpslock.c#L58): engine frame limit set to fps_target: Grezzo frame controller extra vsyncs
 
 ### The Legend of Zelda: Ocarina of Time
 
 [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), `0400486024DEC000`, [patches.py](../../dm/games/0400486024DEC000/patches.py).
 
+- **`build` → `game`**, rendering, blocked: one build on hand; the projection reads are plain sead code and could be found by function fingerprint, judgement: camera aspect: the 3D cameras follow the picture shape (Game settings > Aspect ratio). Sead::PerspectiveProjection is the same in every title of this engine, but the five read sites are fixed addresses of this build
 - **`build` → `game`**, rendering, blocked: one full build ID and branch verified, judgement: Max Resolution: optional full-scale dynamic resolution path. The title has its own dynamic resolution controller and full-scale branch
 - **`build` → `game`**, memory, blocked: one full build ID and allocator call verified, judgement: Texture Pool x2: optional larger initial graphics allocation. The allocator is in the game and full-scale rendering can exhaust the original pool
 - **`build` → `game`**, frame rate, blocked: one full build ID and update hook verified, judgement: FPS Unlock: optional elapsed-time update step. The game update derives a fractional step from its integer frame rate
 - **`build` → `game`**, frame rate, blocked: frame-step stubs have no function-matched form yet, judgement: frame step: the frame-rate controller's interval and fps from the host. The game's own 30 fps mode (interval 2), chosen by the host's step so presentation and game time agree
 - **`build` → `game`**, frame rate, blocked: one build on hand; the faster tensor path is translator work (docs/reference/shaders.md, Ampere HMMA through simdgroup_matrix, Open), judgement: movie player: the plain player instead of the NDVE-enhanced one. A workaround: the tensor network costs 47.5 ms of GPU a movie frame; a function fingerprint could carry it over updates, and once the translator keeps LDSM / MOVM / HMMA chains in matrices the cut can go
+- **`build` → `game`**, rendering, blocked: one build on hand; the projection reads are plain sead code a function fingerprint could find, judgement: Ocarina of Time camera and 2D layer aspect callback in main v131072. The callback reads sead's PerspectiveProjection fields, the same in every title of this engine, but its eight gates (five cameras, the HUD canvas, the movie viewport and the save picture) are fixed addresses of this build
 
 - **v131072 `main`** `e0f3ccfa…` ([patches.py:9](../../dm/games/0400486024DEC000/patches.py#L9))
   - cut `+0x3b5f524`: movie player: cbz w8 → b main+0x3b5f548 (the plain player, without the NDVE tensor network)
+  - gate 5151 at `+0x4c5340`: camera update, after it stored the camera aspect at +0xb0 (ldr x8,[x8]); x20 the projection
+  - gate 31 at `+0x3485cc0`: sead PerspectiveProjection matrix update (ldp s0,s1,[x0,#0xac]); x0 the projection
+  - gate 5407 at `+0x4f1e8`: inlined projection update (ldp s0,s3,[x21,#0xac]); x21 the projection
+  - gate 31 at `+0x23b9a8`: inlined projection update (ldp s0,s3,[x0,#0xac]); x0 the projection
+  - gate 543 at `+0x33b82c`: inlined projection update (ldp s0,s1,[x2,#0xac]); x2 the projection
+  - gate 8223 at `+0x774368`: UI canvas matrix product (ldp q1,q4,[x2], the projection rows; x0 the canvas, x2 pointed at a scaled copy for the full-screen UI projection)
+  - gate 23839 at `+0x3b5c758`: movie layer draw, after its viewport struct at x29-0x28 is built (ldp x9,x8,[x19,#0x18]); the viewport pulled into the middle 16:9
+  - gate 24607 at `+0x284824`: save picture: the viewport helper's SetViewport call (ldr x8,[x8]; x1..x4 = x, y, w, h); the middle 16:9 fills the texture
   - frame step `+0x6e6cc4`: FPS Unlock: optional fractional update step from the host guest clock
   - frame step `+0x805bd0`: Max Resolution: optional full-scale branch of the dynamic resolution controller
   - frame step `+0xc2a36c`: Texture Pool x2: optional doubling of the initial graphics allocation
   - frame step `+0x3b4f074`: frame step: the frame-rate controller's interval and fps follow the host's vsyncs (state page target fps; 0 = the game's own choice)
+  - host [oot_wide.c:37](../../dm/host/android/oot_wide.c#L37): build check
+  - host [oot_wide.c:38](../../dm/host/android/oot_wide.c#L38): build check
 
 ### The Legend of Zelda: Tears of the Kingdom
 
@@ -679,15 +793,22 @@ Profile keys (`game.tsv`) whose value changes what the host does, set away from 
 | `draw_barriers game` | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | `game` → `host`, gap | what NVN specifies: a default for every game after `regress.py check` on the games |
 | `drs_ctl e25c90c1c136638885659fd55bf8a03b 0x38e100 0x38de2c 0x38dcbc 0x38dbc8` | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | `build` → `engine`, gap | four places in sead / agl's MaintainGpuPercentage controller, at fixed offsets per main build (each checked for its instruction); a fingerprint of the controller could find them in other games on that engine |
 | `enc_thread on` | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | `game` → `host`, gap | what iOS does for every game: a default for every game after `regress.py check` on the games |
+| `event_wait off` | [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | `game` → `host`, gap | parked waits cost this game a third of its frame rate and lose the device on Turnip V39; waits that cost no extra submissions would let every game keep them |
 | `fps_decouple sead` | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | `game`, at goal | whether the game steps its world by the rate sead's controller hands it is the game's own (Ocarina of Time's framework turns it back into a present interval): the rewriter finds the controller in any main (nso_code.py sead_find) but gates it only for a profile with this key |
 | `fps_steps d00e4f399e411d0613aa8d26b1c02fef 0x37c8410 0x8 0x210 0x214` | [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | `build` → `engine`, gap | the framework at a fixed global per main build; a fingerprint of its frame function (the step pick from the mode, then the update loop over the count and the present interval set to it) could find it in the game's updates |
 | `fps_target 30` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `game`, at goal | a choice per game |
 | `game_env DOTNET_GCRegionRange=60000000` | [Absolum](../../dm/games/0100A83022A22000/README.md) | `game`, at goal | measured for the game's regions |
-| `graphics_scale 2048x1152 1 console` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `game`, at goal | the game sizes its 3D scenes by the graphics scale, not by its window; which crop each scale gives was measured on the game |
 | `graphics_scale original 1 console` | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | `game`, at goal | the game sizes its 3D scenes by the graphics scale, not by its window; which crop each scale gives was measured on the game |
+| `low_ram_app_pool_mb 5632` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `game`, at goal | the total the game's SDK sizes its cache of freed pages from, measured on the game; the pool and the map limit stay the profile's |
+| `low_ram_img_cache_max_mb 1024` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `game`, at goal | the most image memory the game's scenes need, measured on the game; the measured limit still acts below it |
+| `low_ram_place_part_mb 256` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `game` → `host`, gap | less placed memory where RAM is short; a size for every game once the part size's cost is measured on the other games |
+| `mem_map_limit off` | [Castlevania: Belmont's Curse](../../dm/games/0100BA4026E94000/README.md) | `game` → `host`, gap | Horizon's limit, on for every game; `off` only for a profile whose pool is too small (Switch 1 games, not supported) |
 | `present_snap on` | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | `game` → `host`, gap | a setting the game was tested with: a default for every game after `regress.py check` on the games |
 | `pso_mtl4 on` | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | `game` → `host`, gap | a setting the game was tested with on an iPhone: a default for every game after `regress.py check` on the games |
+| `render_cfg db93b0125f4850601d61c3edde012f8e 0x223e0b0 6 16 0x0 0x8 2560x1440/1280x720,2048x1152/1024x576,1706x960/853x480,1920x1080/960x540,1536x864/768x432,1280x720/640x360 original=2048x1152 max_render=1280x720 min=720` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `build` → `engine`, gap | the game's table of render configurations, at a fixed offset per main build (the build, the heap and the game's own sizes checked before each write); a fingerprint of the selector that reads it could find it in other builds |
+| `render_quality quality=boost:2 performance=normal:1` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `game`, at goal | which render configuration family the game picks for each answer was read in the game's selector |
 | `res_levels 76a489f3bd3642fa5e18bd83d32c98ba 0x2849658 34 0x2804ff0:8 0x2805160:8 0x2805198:8 0x2805458:8 0x28055c0:8 0x2808b60:9 0x2808b69:10 0x2808b73:9 0x2808b7c:9` | [Pokemon Pokopia](../../dm/games/0400A3A01EE4C000/README.md) | `build` → `engine`, gap | KTGL's size table and level lists, at fixed offsets per main build; a fingerprint of the controller that picks the list (oe::GetOperationMode, oe::GetCurrentGraphicsScale, the 34-level table) could find them in other KTGL games |
+| `rt_pool db93b0125f4850601d61c3edde012f8e main 0x646f88 52a7e009 1008 1536=1920x1080 2048=2560x1440 out_h=1440` | [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md) | `build` → `engine`, gap | the pool's size is one movz in the game's text, at a fixed offset per build (the build and the word checked before the write); a fingerprint of the pool's constructor call could find it in other builds |
 | `shader_key_skip 0x770+0x78` | [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md) | `game`, at goal | the engine shares one control section among shaders; leaving GLSLC's compile information out of every game's keys would change every shader key |
 | `shader_key_skip 0x7d0+0x18` | [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md) | `game`, at goal | the engine shares one control section among shaders; leaving GLSLC's compile information out of every game's keys would change every shader key |
 | `stdalloc_cap 0xa0000000` | [Absolum](../../dm/games/0100A83022A22000/README.md) | `game`, at goal | what the regions after it need, measured by the NSP script's region check; the host's cap is the default |
@@ -703,9 +824,9 @@ Profile keys (`game.tsv`) whose value changes what the host does, set away from 
 | `tex_dyn_slots on` | [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md), [FINAL FANTASY RESONANCE (Asian release)](../../dm/games/0100B8A026F14000/README.md), [OCTOPATH TRAVELER 0](../../dm/games/01005270232F2000/README.md) | `game` → `host`, gap | right only where the handle comes from c2's tables: the translator could prove that per shader |
 | `alloc_big_align on` | [13 Sentinels: Aegis Rim](../../dm/games/01003FC01670C000/README.md), [13 Sentinels: Aegis Rim (Asia)](../../dm/games/01008D7016438000/README.md), [13 Sentinels: Aegis Rim (Japan)](../../dm/games/010045C014650000/README.md), [Unicorn Overlord](../../dm/games/010069401ADB8000/README.md), [Unicorn Overlord (Asia)](../../dm/games/010054B01AD92000/README.md) | `game` → `host`, gap | the cause is a memory pool's GPU address, big-page aligned on hardware and the CPU address here: pool GPU addresses aligned as hardware does, or this alignment for every game |
 | `gpu_timestamps segment` | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [Splatoon Raiders](../../dm/games/0400380020056000/README.md), [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | `game` → `host`, gap | what hardware records: a default for every game after `regress.py check` on the games |
-| `op_mode handheld` | [Balatro](../../dm/games/0100CD801CE5E000/README.md), [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md), [Captain Toad: Treasure Tracker](../../dm/games/01009BF0072D4000/README.md), [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md), [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md), [Taiko Risshiden V DX](../../dm/games/0100346017304000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | `game`, at goal | the game's controls (handheld: the touch screen instead of a gyro pointer) |
 | `present_interval display` | [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md), [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md), [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), [Monster Train 2](../../dm/games/010051701FB46000/README.md), [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) | `game`, at goal | right only for games whose logic does not count frames |
 | `render_cond on` | [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md), [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md), [Mario Kart 8 Deluxe](../../dm/games/0100152000022000/README.md), [Mario Kart World](../../dm/games/0400C3F00006E000/README.md), [Mario vs. Donkey Kong](../../dm/games/0100B99019412000/README.md), [Splatoon Raiders](../../dm/games/0400380020056000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) | `game` → `host`, gap | what the GPU does; off by default only because other games drew everything before: a default for every game after `regress.py check` on the games |
+| `op_mode handheld` | [Balatro](../../dm/games/0100CD801CE5E000/README.md), [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md), [Captain Toad: Treasure Tracker](../../dm/games/01009BF0072D4000/README.md), [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md), [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md), [Rhythm Heaven Groove](../../dm/games/0100D9F01D474000/README.md), [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md), [Taiko Risshiden V DX](../../dm/games/0100346017304000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | `game`, at goal | the game's controls (handheld: the touch screen instead of a gyro pointer) |
 | `tex_dirty_upload on` | [FINAL FANTASY TACTICS - The Ivalice Chronicles](../../dm/games/010038B015560000/README.md), [Ghost Trick: Phantom Detective](../../dm/games/010029B018432000/README.md), [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md), [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md) | `game` → `host`, gap | as tex_flush_upload, for pools the CPU writes without a flush |
 | `tex_flush_upload on` | [FINAL FANTASY TACTICS - The Ivalice Chronicles](../../dm/games/010038B015560000/README.md), [Ghost Trick: Phantom Detective](../../dm/games/010029B018432000/README.md), [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md), [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [OCTOPATH TRAVELER](../../dm/games/010057D006492000/README.md), [The Great Ace Attorney Chronicles](../../dm/games/010036E00FB20000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [Yoshi's Crafted World](../../dm/games/01006000040C2000/README.md) | `game` → `host`, gap | unified memory semantics; off by default because a flushed range could cover an image a shader writes: tracking GPU writes would make it safe for every game |
-| `fps_target 60` | [ASTRAL CHAIN](../../dm/games/01007300020FA000/README.md), [DRAGON QUEST I & II HD-2D Remake](../../dm/games/0100D7C01F254000/README.md), [DRAGON QUEST III HD-2D Remake](../../dm/games/01003E601E324000/README.md), [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md), [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](../../dm/games/01006C300E9F0000/README.md), [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md), [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md), [FINAL FANTASY RESONANCE (Asian release)](../../dm/games/0100B8A026F14000/README.md), [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md), [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md), [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [OCTOPATH TRAVELER 0](../../dm/games/01005270232F2000/README.md), [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md), [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md), [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md), [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md), [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [TRIANGLE STRATEGY](../../dm/games/0100CC80140F8000/README.md) | `game`, at goal | a choice per game |
+| `fps_target 60` | [ASTRAL CHAIN](../../dm/games/01007300020FA000/README.md), [DRAGON QUEST I & II HD-2D Remake](../../dm/games/0100D7C01F254000/README.md), [DRAGON QUEST III HD-2D Remake](../../dm/games/01003E601E324000/README.md), [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md), [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](../../dm/games/01006C300E9F0000/README.md), [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md), [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md), [FINAL FANTASY RESONANCE (Asian release)](../../dm/games/0100B8A026F14000/README.md), [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md), [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md), [Metroid Dread](../../dm/games/010093801237C000/README.md), [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md), [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md), [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md), [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md), [OCTOPATH TRAVELER 0](../../dm/games/01005270232F2000/README.md), [OCTOPATH TRAVELER II](../../dm/games/0100A3501946E000/README.md), [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md), [Persona 5 Royal](../../dm/games/01005CA01580E000/README.md), [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md), [Pokémon Shield](../../dm/games/01008DB008C2C000/README.md), [Pokémon Sword](../../dm/games/0100ABF008968000/README.md), [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md), [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Echoes of Wisdom](../../dm/games/01008CF01BAAC000/README.md), [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md), [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [TRIANGLE STRATEGY](../../dm/games/0100CC80140F8000/README.md) | `game`, at goal | a choice per game |

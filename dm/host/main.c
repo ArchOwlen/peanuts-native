@@ -2,6 +2,7 @@
 #include "dm.h"
 #include "front.h"
 #include "pack_modules.h"
+#include "game_args.h"
 #include "../gfx/nvn/dmsh_chain.h"
 #include <stdatomic.h>
 #include <sys/resource.h>
@@ -10,7 +11,7 @@ void probe_install(void); void hid_keys_init(void); void stubs_report(void); voi
 typedef void (*fn0)(void); typedef void (*fn2)(uint64_t, uint64_t); typedef void (*fnp)(void *);
 static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbol %s", n); return p; }
 
-// Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
+// Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (else the profile's game_args), then DM_GAME_ARGS_ADD's words (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
 
 static void guest_main(void) {
@@ -71,7 +72,7 @@ static void fastboot_apply(void) {
     free(s);
 }
 static void host_preload(int argc, char **argv) {
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host (-PnxGenericHost=true, design/platform/IMPL-GENERIC.md): load the title's profile before anything below reads
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host (-PnxGenericHost=true): load the title's profile before anything below reads
     // DM_GAME_* (a profile/schema mismatch is a hard stop, never a silent default). DM_PROFILE_PATH is set by the launcher (GameActivity/PackService) beside DM_ROMFS;
     // DM_PROFILE_SEED (optional) is the same title's vk_prewarm.bin copy, "" when it has none.
     { const char *pp = getenv("DM_PROFILE_PATH");
@@ -119,9 +120,11 @@ static void host_preload(int argc, char **argv) {
         for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
         LOG("game arguments from the game profile: %s", DM_GAME_ARGS);
     }
+    const char *add = getenv("DM_GAME_ARGS_ADD");   // run-time arguments after those (the Android launcher's engine settings, profile key scene_arg; game_args.h)
+    if (add && *add) { g_argc = game_args_add(g_argv, g_argc, 63, strdup(add)); LOG("game arguments added: %s", add); }
     static char pm[512];   // an Android pack names the modules it was made with (pack.tsv "modules"): a game whose registered builds have different module sets loads those of its dump's build
     if (!n) n = pack_modules(argv[1], pm, sizeof pm, names, DM_GAME_NMOD);
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own module list instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own module list instead of a static const initialized from the macro
     if (!n) { for (int k = 0; k < (int)DM_GAME_NMOD; k++) names[n++] = g_profile.modules[k]; }
 #else
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)

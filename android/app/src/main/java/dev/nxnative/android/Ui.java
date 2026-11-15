@@ -195,7 +195,7 @@ final class Ui {
         t.setSingleLine(true);
         t.setEllipsize(TextUtils.TruncateAt.END);
         t.setContentDescription(s + ": tap for details");
-        t.setOnClickListener(v -> new AlertDialog.Builder(a).setTitle(title).setMessage(message).setPositiveButton("OK", null).show());
+        t.setOnClickListener(v -> new PadFocus.Builder(a).setTitle(title).setMessage(message).setPositiveButton("OK", null).show());
         return t;
     }
 
@@ -289,7 +289,10 @@ final class Ui {
      * to edge, targetSdk 35), at a readable width centered on a wide window, with a cream scrim under the status bar so scrolled cards never run under the clock.
      * Returns the column to fill.
      */
-    static LinearLayout page(Activity a, FrameLayout frame, int maxWidthDp) {
+    static LinearLayout page(Activity a, FrameLayout frame, int maxWidthDp) { return page(a, frame, maxWidthDp, false); }
+
+    /** The same; with a bar below the page (ReleasePage's Update / Later), which takes the navigation bar's inset itself: the page keeps a plain 16 dp under its last row */
+    static LinearLayout page(Activity a, FrameLayout frame, int maxWidthDp, boolean barBelow) {
         // Edge to edge on every Android: from Android 15 targetSdk 35 makes it so, but before it the window keeps its content clear of the bars itself and
         // consumes the insets, so the listener below never ran and the column had no gutter and no width limit (cards from edge to edge on Android 13)
         a.getWindow().setDecorFitsSystemWindows(false);
@@ -309,7 +312,7 @@ final class Ui {
             int w = a.getResources().getDisplayMetrics().widthPixels;
             int gutter = dp(a, a.getResources().getConfiguration().screenWidthDp < 360 ? 16 : 20);
             int side = Math.max(gutter, (w - i.left - i.right - dp(a, maxWidthDp)) / 2);
-            v.setPadding(side + i.left, i.top + dp(a, 8), side + i.right, i.bottom + dp(a, 24));
+            v.setPadding(side + i.left, i.top + dp(a, 8), side + i.right, barBelow ? dp(a, 16) : i.bottom + dp(a, 24));
             scrim.getLayoutParams().height = i.top;
             scrim.requestLayout();
             return in;
@@ -350,6 +353,36 @@ final class Ui {
 
     /** The back button of a page's header */
     static ImageView back(Context c, View.OnClickListener l) { return iconButton(c, R.drawable.ic_back, "Back", Kind.TONAL, l); }
+
+    /**
+     * Makes a card one touch target that a D-pad or controller can reach: focusable, with an accent ring while focused (the ring replaces the edge, so nothing moves),
+     * and l on a tap or the controller's confirm button. The card's own buttons stay separate stops
+     */
+    static void focusCard(Context c, LinearLayout card, View.OnClickListener l) {
+        android.graphics.drawable.StateListDrawable s = new android.graphics.drawable.StateListDrawable();
+        s.addState(new int[]{android.R.attr.state_focused}, round(col(c, R.color.bn_card), dp(c, 20), col(c, R.color.bn_accent), dp(c, 2.5f)));
+        s.addState(new int[]{}, card.getBackground());
+        card.setBackground(s);
+        card.setFocusable(true);
+        card.setClickable(true);
+        card.setOnClickListener(l);
+    }
+
+    /** A state line as a pill (the tint, a hairline edge), like the state chip of the settings pages; the words and their color are set by status() */
+    static TextView pill(TextView t) {
+        Context c = t.getContext();
+        t.setBackground(round(col(c, R.color.bn_tint), dp(c, 999), col(c, R.color.bn_card_stroke), dp(c, 1)));
+        t.setPadding(dp(c, 10), dp(c, 4), dp(c, 12), dp(c, 4));
+        return t;
+    }
+
+    /** A group's label with an action at its right ("Your games" and Add game) */
+    static LinearLayout sectionHeader(Context c, CharSequence label, View action) {
+        LinearLayout top = row(c);
+        top.addView(section(c, label), weight());
+        top.addView(action);
+        return top;
+    }
 
     // ---- Buttons ----
 
@@ -400,7 +433,7 @@ final class Ui {
         b.setIncludeFontPadding(false);
         b.setTextColor(col(c, textColor(k)));
         style(c, b, k, 14);
-        b.setOnClickListener(l);
+        b.setOnClickListener(dev.peanuts.ui.Feel.button(l));   // PEANUTS: a button's tap clicks and dips (dev.peanuts.ui.Feel; null stays null)
         return b;
     }
 
@@ -517,7 +550,7 @@ final class Ui {
             view.setPadding(dp(c, 10), dp(c, 7), dp(c, 10), dp(c, 7));
             view.setMinimumHeight(dp(c, 52));
             view.setBackground(ripple(c, round(Color.TRANSPARENT, dp(c, 12), 0, 0)));
-            view.setOnClickListener(l);
+            view.setOnClickListener(dev.peanuts.ui.Feel.row(l));   // PEANUTS: a row's tap ticks and dips (dev.peanuts.ui.Feel; null stays null)
             tile = text(c, emoji, 17, R.color.bn_text, 400);
             tile.setGravity(Gravity.CENTER);
             tile.setIncludeFontPadding(false);
@@ -581,7 +614,7 @@ final class Ui {
         Setting toggle(Context c, boolean on, android.widget.CompoundButton.OnCheckedChangeListener l) {
             toggle = new Switch(c);
             toggle.setChecked(on);
-            toggle.setOnCheckedChangeListener((b, x) -> { if (l != null) l.onCheckedChanged(b, x); says(); });   // the value line follows the switch (says)
+            toggle.setOnCheckedChangeListener((b, x) -> { dev.peanuts.ui.Feel.toggled(b, x); if (l != null) l.onCheckedChanged(b, x); says(); });   // the value line follows the switch (says)   // PEANUTS: Feel.toggled, a switch's haptic
             view.addView(toggle);
             if (!view.hasOnClickListeners()) view.setOnClickListener(v -> { if (toggle.isEnabled()) toggle.toggle(); });
             return this;
@@ -648,7 +681,7 @@ final class Ui {
                 t.setPadding(dp(c, 10), 0, dp(c, 10), 0);
                 t.setClickable(true);
                 t.setFocusable(true);
-                t.setOnClickListener(v -> { if (i != selected) { select(i); pick.accept(i); } });
+                t.setOnClickListener(v -> { if (i != selected) { dev.peanuts.ui.Feel.picked(v); select(i); pick.accept(i); } });   // PEANUTS: Feel.picked, the choice's haptic
                 items[k] = t;
                 addView(t, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
             }
@@ -721,7 +754,7 @@ final class Ui {
         t.setFocusable(true);
         t.setSelected(selected);
         t.setContentDescription(label);
-        t.setOnClickListener(l);
+        t.setOnClickListener(dev.peanuts.ui.Feel.nav(l));   // PEANUTS: a rail entry clicks, and its section's pane enters (dev.peanuts.ui.Feel)
         return t;
     }
 
@@ -767,14 +800,14 @@ final class Ui {
         int p = dp(a, 20);
         content.setPadding(p, dp(a, 4), p, dp(a, 8));
         sv.addView(content);
-        return new AlertDialog.Builder(a).setTitle(title).setView(sv);
+        return new PadFocus.Builder(a).setTitle(title).setView(sv);
     }
 
     /**
      * Asks before something is deleted or forgotten: what goes and what stays, in the message; the yes button in the danger color, Cancel the default.
      */
     static void confirmDanger(Activity a, String title, CharSequence message, String yes, Runnable r) {
-        AlertDialog d = new AlertDialog.Builder(a).setTitle(title).setMessage(message)
+        AlertDialog d = new PadFocus.Builder(a).setTitle(title).setMessage(message)
                 .setPositiveButton(yes, (x, w) -> r.run()).setNegativeButton("Cancel", null).create();
         d.setOnShowListener(x -> {
             Button b = d.getButton(AlertDialog.BUTTON_POSITIVE);

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window animations of the library's sheets (dev.peanuts.ui.Motion.sheet looks these up by name, so a build without this folder keeps the platform's) -->
+    <style name="PeanutsSheet">
+        <item name="android:windowEnterAnimation">@anim/peanuts_sheet_in</item>
+        <item name="android:windowExitAnimation">@anim/peanuts_fade_out</item>
+    </style>
+    <style name="PeanutsSheetReduced">
+        <item name="android:windowEnterAnimation">@anim/peanuts_fade_in</item>
+        <item name="android:windowExitAnimation">@anim/peanuts_fade_out</item>
+    </style>
+</resources>

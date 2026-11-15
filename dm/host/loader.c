@@ -590,6 +590,12 @@ void loader_hash_log(void) {
     }
 }
 
+// The render target pool's size (profile key rt_pool, rt_pool.h; rt_pool_apply below): render_cfg's max_render while a larger pool is written (hle_render.c), and the largest
+// size's, which the next start can pick (hle_render.c: a change while the game runs that needs more)
+static int g_rtp_raised, g_rtp_top; static unsigned g_rtp_w, g_rtp_h, g_rtp_tw, g_rtp_th;
+int dm_rt_pool_max_render(unsigned *w, unsigned *h) { if (!g_rtp_raised) return 0; *w = g_rtp_w; *h = g_rtp_h; return 1; }
+int dm_rt_pool_top(unsigned *w, unsigned *h) { if (!g_rtp_top) return 0; *w = g_rtp_tw; *h = g_rtp_th; return 1; }
+
 #if PLAT_IOS
 // iOS does not allow code loaded at run time to execute, and Apple allows an executable only one segment with execute permission (ITMS-90999): the image is compiled into this executable by dm/ios/tools/gen_embed.py --
 // the two code blocks (original text, patch area) are sections in __TEXT, and W (the rest of ro + data + bss) is a separate RW segment. The three blocks are not adjacent in the file; here one contiguous address range is reserved,
@@ -662,7 +668,7 @@ static void map_image(module_t *m, const char *dir) {
 // maximum instead broke the terrain: something else assumes the game's own maximum). Rows are checked: the table must grow, every list byte must be a level; read-only data
 // is still writable here (map_image seals the text and the patch area only)
 static int levels_apply(module_t *m, unsigned cw, unsigned ch) {
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro
     dm_pf_res_levels_t *rows = g_profile.res_levels;
 #else
     static const struct { const char *build; uint64_t table; unsigned n, nl; struct { uint64_t off; unsigned len; } l[12]; } rows[] = DM_GAME_RES_LEVELS;
@@ -695,10 +701,37 @@ static int levels_apply(module_t *m, unsigned cw, unsigned ch) {
     return 1;
 }
 
+// A main build with a render_cfg row takes DM_WINDOW_SIZE as the output of its render configurations instead (hle_render.c), at run time
+#include "render_cfg.h"
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host builds the host row types over the profile's own rows once, at first use
+static rcfg_row_t g_pf_rcfg[DM_PROFILE_RENDER_CFG_CAP]; static pthread_once_t g_pf_rcfg_once = PTHREAD_ONCE_INIT;
+static void pf_rcfg_build(void) {
+    rcfg_row_t *rows = g_pf_rcfg;
+    {
+        for (unsigned i = 0; i < DM_PROFILE_RENDER_CFG_CAP; i++) {
+            const dm_pf_render_cfg_t *s = &g_profile.render_cfg[i]; rcfg_row_t *d = &rows[i];
+            memset(d, 0, sizeof *d);
+            d->build = s->build; d->table = s->table; d->n = s->n; d->stride = s->stride; d->out_off = s->out_off; d->ren_off = s->ren_off;
+            for (unsigned k = 0; k < RCFG_MAX && k < DM_PROFILE_RENDER_CFG_SLOTS; k++) for (int j = 0; j < 4; j++) d->sz[k][j] = s->sz[k][j];
+            d->orig_w = s->orig_w; d->orig_h = s->orig_h; d->max_w = s->max_w; d->max_h = s->max_h; d->min_h = s->min_h;
+        }
+    }
+}
+const rcfg_row_t *dm_pf_rcfg_rows(void) { pthread_once(&g_pf_rcfg_once, pf_rcfg_build); return g_pf_rcfg; }
+#endif
+static int render_cfg_row(const char *build) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: see dm_pf_rcfg_rows
+    const rcfg_row_t *rows = dm_pf_rcfg_rows();
+#else
+    static const rcfg_row_t rows[] = DM_GAME_RENDER_CFG;
+#endif
+    for (int i = 0; i < DM_GAME_NRENDER_CFG; i++) if (rows[i].build[0] && !strcmp(rows[i].build, build)) return 1;
+    return 0;
+}
 static void window_apply(module_t *m) {
-    if (strcmp(m->name, "main") || m->nro) return;
+    if (strcmp(m->name, "main") || m->nro || render_cfg_row(m->build_id)) return;
     const char *e = getenv("DM_WINDOW_SIZE");
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro
     dm_pf_window_fn_t *rows = g_profile.window_fn;
 #else
     static const struct { const char *build; uint64_t wfn, hfn; unsigned w, h; } rows[] = DM_GAME_WINDOW_FN;
@@ -730,6 +763,84 @@ static void window_apply(module_t *m) {
     for (int i = 0; i < 2; i++) *(uint32_t *)(m->base + fn[i]) = 0x52800000u | (v[i] << 5);   // movz w0,#v (the old cut's bytes: 1920 = 00f08052, 1080 = 00878052)
     LOG("window: %ux%u (%s; main+%#llx / +%#llx; the game's own %ux%u, the pack's %ux%u)", w, h, own ? "the game's own" : "DM_WINDOW_SIZE",
         (unsigned long long)fn[0], (unsigned long long)fn[1], rows[r].w, rows[r].h, was[0], was[1]);
+}
+
+// The render target pool (profile key rt_pool, rt_pool.h): a game that makes its render target pool from one movz in its text gets the size the setting the run starts with
+// needs (DM_WINDOW_SIZE and DM_RENDER_PCT, read as hle_render.c reads them: render_cfg.h rcfg_setting): the game's own while the render size fits render_cfg's max_render and
+// the output is below the row's out_h, else the smallest larger size whose max_render holds the render size (rtp_need). A device of more than 12 GB of RAM (vka_low_ram() 0:
+// the same predicate as the low-RAM keys, inverted) gets at least the first larger size; DM_RT_POOL_MB=<MiB> sets it on any device (0: the game's own). Written here, while the
+// text is still writable (map_image, before the seal), and only when the module's build is the row's and the word is the row's; otherwise one [RED] line and the game's own
+// size. render_cfg's max_render takes the written size's only when it was written (dm_rt_pool_max_render). Not on iOS (the text is signed code there)
+#include "rt_pool.h"
+__attribute__((weak)) int vka_low_ram(void);
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host builds rtpool_row_t rows over the profile's rt_pool rows once, at first use
+static rtpool_row_t g_pf_rtp[DM_PROFILE_RT_POOL_CAP]; static pthread_once_t g_pf_rtp_once = PTHREAD_ONCE_INIT;
+static void pf_rtp_build(void) {
+    rtpool_row_t *rows = g_pf_rtp;
+    {
+        for (unsigned i = 0; i < DM_PROFILE_RT_POOL_CAP; i++) {
+            const dm_pf_rt_pool_t *s = &g_profile.rt_pool[i]; rtpool_row_t *d = &rows[i];
+            memset(d, 0, sizeof *d);
+            d->build = s->build; d->module = s->module; d->off = s->off; d->word = s->word; d->base_mb = s->base_mb; d->nt = s->nt; d->out_h = s->out_h;
+            for (unsigned k = 0; k < RTP_TIERS && k < DM_PROFILE_RT_POOL_TIERS; k++) { d->mb[k] = s->mb[k]; d->max_w[k] = s->max_w[k]; d->max_h[k] = s->max_h[k]; }
+        }
+    }
+}
+static const rtpool_row_t *dm_pf_rtpool_rows(void) { pthread_once(&g_pf_rtp_once, pf_rtp_build); return g_pf_rtp; }
+#endif
+static void rt_pool_apply(module_t *m) {
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: see dm_pf_rtpool_rows
+    const rtpool_row_t *rows = dm_pf_rtpool_rows();
+#else
+    static const rtpool_row_t rows[] = DM_GAME_RT_POOL;
+#endif
+    if (m->nro) return;
+    int r = -1, other = -1;
+    for (int i = 0; i < DM_GAME_NRT_POOL; i++) if (rows[i].build[0] && !strcmp(rows[i].module, m->name)) { if (!strcmp(rows[i].build, m->build_id)) r = i; else other = i; }
+    if (r < 0) {
+        if (other >= 0) LOG("[RED] [res] render-target pool: the profile's rt_pool row is for %s build %s, not %s: the game's own size", m->name, rows[other].build, m->build_id);
+        return;
+    }
+    const rtpool_row_t *row = &rows[r];
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: see dm_pf_rcfg_rows
+    const rcfg_row_t *rc = dm_pf_rcfg_rows();
+#else
+    static const rcfg_row_t rc[] = DM_GAME_RENDER_CFG;
+#endif
+    const rcfg_row_t *cfg = NULL;
+    for (int i = 0; i < DM_GAME_NRENDER_CFG; i++) if (rc[i].build[0] && !strcmp(rc[i].build, m->build_id)) cfg = &rc[i];
+    unsigned cw = cfg ? cfg->max_w : 0, ch = cfg ? cfg->max_h : 0, ow = 0, oh = 0, rw = 0, rh = 0; int pct = 50, need = -1;
+    if (cfg) {   // game.py makes an rt_pool row need a render_cfg row of the same build
+        rcfg_setting(cfg, getenv("DM_WINDOW_SIZE"), DM_GAME_RENDER_DEFAULT_OUT, getenv("DM_RENDER_PCT"), &ow, &oh, &pct);
+        rcfg_render(ow, oh, pct, 0, 0, &rw, &rh);
+        need = rtp_need(row, cw, ch, oh, rw, rh);
+    }
+    const char *e = getenv("DM_RT_POOL_MB");
+    long env = rtp_env_mb(e);
+    if (env == -2) LOG("[RED] [res] DM_RT_POOL_MB=%s: must be 0 (the game's own) or %u to %u MiB; the setting and the device decide", e, RTP_MIN_MB, RTP_MAX_MB);
+    int why, low = &vka_low_ram ? vka_low_ram() : -1;
+    unsigned mb = rtp_choose(row, low, env, need, &why);
+    char whyb[160];
+    if (why == 0) snprintf(whyb, sizeof whyb, "DM_RT_POOL_MB");
+    else if (why == 2) snprintf(whyb, sizeof whyb, "more than 12 GB of RAM");
+    else snprintf(whyb, sizeof whyb, "%s output %ux%u, render %ux%u (%d %%)%s", why == 1 ? "the setting needs it:" : "the setting:", ow, oh, rw, rh, pct,
+                  why == 3 ? low > 0 ? ", a device of 12 GB or less" : low < 0 ? ", no low-RAM predicate on this host" : "" : "");
+    if (row->off + 4 > m->text_end || (row->off & 3)) {
+        LOG("[RED] [res] render-target pool: %s+%#llx is outside %s's text: the game's own %u MiB, max_render %ux%u", m->name, (unsigned long long)row->off, m->name, row->base_mb, cw, ch);
+        return;
+    }
+    uint32_t was; int st = rtp_apply((uint32_t *)(m->base + row->off), row, mb, &was);
+    if (st < 0) {
+        LOG("[RED] [res] render-target pool: %s+%#llx is %08x, not the profile's %08x (%u MiB): nothing written, the game's own size, max_render %ux%u", m->name,
+            (unsigned long long)row->off, was, row->word, row->base_mb, cw, ch);
+        return;
+    }
+    g_rtp_raised = rtp_cap(row, st, mb, &g_rtp_w, &g_rtp_h);
+    if (row->nt && env < 0) { g_rtp_top = 1; g_rtp_tw = row->max_w[row->nt - 1]; g_rtp_th = row->max_h[row->nt - 1]; }   // the next start picks by the setting too
+    char wr[48];
+    if (st) snprintf(wr, sizeof wr, "%08x -> %08x", was, rtp_encode(row->word, mb)); else snprintf(wr, sizeof wr, "%08x kept", was);
+    LOG("[res] render-target pool %u MiB (%s%s; %s+%#llx %s): max_render %ux%u%s", mb, whyb, st ? "" : ", the game's own size", m->name, (unsigned long long)row->off, wr,
+        g_rtp_raised ? g_rtp_w : cw, g_rtp_raised ? g_rtp_h : ch, g_rtp_raised ? " (rt_pool's)" : st ? " (render_cfg's: below rt_pool's sizes)" : " (render_cfg's)");
 }
 
 // Switch 2 SDKs (Ounce) compile with APIBKey (pacibsp / autibsp / retab) and APGAKey (pacga), both process-wide on Linux arm64, except in
@@ -802,6 +913,15 @@ static void pac_patch_text(module_t *m) {
 // the modules' spans (the sizes map_image computes) and each image is placed at the next cursor, so the layout is the console's up to the patch area each module carries.
 // DM_MODULE_ARENA=0: separate mappings, as before
 static uint8_t *g_arena, *g_arena_cur, *g_arena_end;
+#define ARENA_TAIL ((size_t)1 << 20)   // PEANUTS
+static uint8_t *g_tail, *g_tail_end;   // PEANUTS: the arena's pages after the last module
+// PEANUTS: the next size bytes (whole 16 KiB pages) after the last module, readable, writable and zero, or NULL (no arena, or its tail is used up)
+void *dm_module_arena_tail(size_t size) {
+    if (!g_tail || !size || (size & 0x3FFF) || size > (size_t)(g_tail_end - g_tail)) return NULL;
+    uint8_t *p = mmap(g_tail, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    g_tail += size; return p;
+}
 static size_t module_span(module_t *m, const char *dir) {   // what map_image maps for m, before it runs
     char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, m->name);
     struct stat st; if (stat(path, &st)) die("stat %s", path);
@@ -810,9 +930,11 @@ static size_t module_span(module_t *m, const char *dir) {   // what map_image ma
 static void arena_reserve(module_t *mods, int n, const char *dir) {
     const char *e = getenv("DM_MODULE_ARENA"); if (e && !strcmp(e, "0")) return;
     size_t total = 0; for (int i = 0; i < n; i++) total += module_span(&mods[i], dir);
-    uint8_t *a = mmap(NULL, total, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    // PEANUTS: 1 MiB more after the last module, for a companion's helper code (dm_module_arena_tail): with the modules back to back and other mappings
+    // on both sides of the arena, no other page within a branch's reach of main is free (Pokemon Sword: main first, three modules after it)
+    uint8_t *a = mmap(NULL, total + ARENA_TAIL, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (a == MAP_FAILED) { LOG("[RED] module arena of %#zx bytes not reserved: modules mapped apart", total); return; }
-    g_arena = g_arena_cur = a; g_arena_end = a + total;
+    g_arena = g_arena_cur = a; g_arena_end = a + total; g_tail = g_arena_end; g_tail_end = g_tail + ARENA_TAIL;
     LOG("module arena %p +%#zx: %d modules back to back in load order", a, total, n);
 }
 static uint8_t *module_mmap(const char *name, size_t len) {   // the next len bytes of the arena, or a mapping of their own without one
@@ -839,7 +961,7 @@ static void map_image(module_t *m, const char *dir) {
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
-        free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m);
+        free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m); rt_pool_apply(m);
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
@@ -850,13 +972,104 @@ static void map_image(module_t *m, const char *dir) {
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = module_mmap(m->name, m->size);   // PEANUTS: module arena (see above)
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m);
+    memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m); rt_pool_apply(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
 }
 #endif
+
+// PEANUTS begin: cross-module branches of a build with code mods (dm/tools/xmod.py, patch_nso.py --xmod). A mod made for the console may branch straight from one
+// module into another at the distance the two have there, each right after the one before it: Luminescent Platinum for Pokemon Brilliant Diamond 1.3.0 patches 106
+// b / bl into main that go to the subsdk1 it adds (at main+0x5708000 on the console), and that module calls main 1,228 times the same way. Here every module carries
+// its key page and patch area, so the distances differ, and each such branch ran into whatever stood there. <module>.xmod.tsv lists them: the instruction's offset in
+// the image, b or bl, the module it goes to and the offset there; once every module has its base, each instruction's imm26 is set to reach that place. A row that
+// cannot be kept stops the start with its reason (a module that is not loaded, a table of another build, a distance beyond the 128 MB a branch reaches: the modules
+// must stand in the arena). The text is sealed by then (map_image): its pages are opened for the writes and sealed again. Not on iOS, whose code is signed in the
+// executable and which loads no pack
+// The same for an address such a module keeps as data, a ptr row: a relative relocation whose addend lies outside the module (that mod's subsdk1 has 116 in its GOT, for
+// globals of main: slot +0x5b050, addend -0xada100, main+0x4c2df00 on the console) gave the console's distance from this module's base, 0x170000 off here; the game
+// read 0 through it and stopped at subsdk1+0x172b8. The slot gets the target's real address once the module is relocated (relocate() writes base + addend there first)
+#if !PLAT_IOS
+static module_t *xmod_named(const char *name) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, name)) return &g_mod[i]; return NULL; }
+// ptrs 0: the table's b / bl rows, before relocation; 1: its ptr rows, after it. into: rows applied, by target module
+static unsigned xmod_apply(module_t *m, const char *dir, unsigned *into, int ptrs) {
+    char path[1024]; snprintf(path, sizeof path, "%s/%s.xmod.tsv", dir, m->name);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    typedef struct { uint64_t off, toff; module_t *to; int bl; } row_t;
+    row_t *rows = NULL; size_t n = 0, cap = 0;
+    char line[256], kind[8], to[32]; unsigned long off, toff;
+    uint64_t lo = ~0ull, hi = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') {
+            char id[40] = "";
+            if (sscanf(line, "# BUILD_ID %39s", id) == 1 && *m->build_id && strcmp(id, m->build_id)) die("%s is of build %s, %s is %s: build the game with its mods again", path, id, m->name, m->build_id);
+            continue;
+        }
+        int isptr = 0;
+        if (sscanf(line, "%lx %7s %31s %lx", &off, kind, to, &toff) != 4 || (strcmp(kind, "b") && strcmp(kind, "bl") && !(isptr = !strcmp(kind, "ptr"))))
+            die("%s: not a row of offset, b / bl / ptr, module, offset: %s", path, line);
+        module_t *t = xmod_named(to);
+        if (!t || t == m) die("%s: %s+%#lx goes into %s, which is not loaded (the modules come from pack.tsv's modules row): build the game with its mods again", path, m->name, off, to);
+        if (isptr) {   // a word of the module's own data (after its code, before bss and the key page), holding an address anywhere in the target's image
+            uint64_t end = m->key_page_off < m->size ? m->key_page_off : m->size;
+            if ((off & 7) || off < m->text_end || off + 8 > end || toff >= t->key_page_off) die("%s: the pointer at %s+%#lx to %s+%#lx is outside the modules' data", path, m->name, off, to, toff);
+        } else if ((off & 3) || off + 4 > m->text_end || (toff & 3) || toff >= t->text_end) die("%s: %s+%#lx to %s+%#lx is outside the code", path, m->name, off, to, toff);
+        if (isptr != ptrs) continue;
+        if (n == cap && !(rows = realloc(rows, (cap = cap ? cap * 2 : 256) * sizeof *rows))) die("%s: out of memory", path);
+        rows[n++] = (row_t){off, toff, t, !strcmp(kind, "bl")};
+        if (off < lo) lo = off;
+        if (off + 4 > hi) hi = off + 4;
+    }
+    fclose(f);
+    if (!n) { free(rows); return 0; }
+    if (ptrs) {   // data pages: writable as map_image left them (only the code and the key page are sealed)
+        for (size_t i = 0; i < n; i++) { *(uint64_t *)(m->base + rows[i].off) = (uint64_t)(uintptr_t)(rows[i].to->base + rows[i].toff); into[rows[i].to - g_mod]++; }
+        free(rows);
+        return (unsigned)n;
+    }
+    lo &= ~0x3FFFull; hi = (hi + 0x3FFF) & ~0x3FFFull;
+    if (mprotect(m->base + lo, hi - lo, PROT_READ | PROT_WRITE)) die("%s mprotect text for its cross-module branches", m->name);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t *w = (uint32_t *)(m->base + rows[i].off);
+        if ((*w & 0x7C000000) != 0x14000000 || (int)(*w >> 31) != rows[i].bl) die("%s: %s+%#llx holds %08x, not the %s the table names: the table is not this image's", path, m->name, (unsigned long long)rows[i].off, *w, rows[i].bl ? "bl" : "b");
+        int64_t d = (int64_t)(uintptr_t)(rows[i].to->base + rows[i].toff) - (int64_t)(uintptr_t)w;
+        if (d < -((int64_t)1 << 27) || d >= ((int64_t)1 << 27))
+            die("%s+%#llx %s to %s+%#llx: %lld MB apart here, more than the 128 MB a branch reaches (the mod's modules must stand back to back: the module arena, DM_MODULE_ARENA)",
+                m->name, (unsigned long long)rows[i].off, rows[i].bl ? "bl" : "b", rows[i].to->name, (unsigned long long)rows[i].toff, (long long)(d / (1 << 20)));
+        *w = (*w & 0xFC000000) | ((uint32_t)(d >> 2) & 0x3FFFFFF);
+        into[rows[i].to - g_mod]++;
+    }
+    if (mprotect(m->base + lo, hi - lo, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+    plat_icache_invalidate(m->base + lo, hi - lo);
+    free(rows);
+    return (unsigned)n;
+}
+static unsigned g_xmod_b[64][64];   // branches aimed before relocation, by module and target: logged with the pointers
+#endif
+// Every module's table: its branches (ptrs 0) after all modules are mapped and before anything is relocated or run, its pointers (ptrs 1) right after relocation.
+// One log line then: xmod: main 106 branches into subsdk1; subsdk1 1228 branches and 116 pointers into main
+static void xmod_apply_all(const char **mdir, int ptrs) {
+#if !PLAT_IOS
+    char log[1024] = ""; size_t at = 0;
+    for (int i = 0; i < g_nmod && i < 64; i++) {
+        unsigned into[64] = {0};
+        xmod_apply(&g_mod[i], mdir[i], ptrs ? into : g_xmod_b[i], ptrs);
+        for (int k = 0; ptrs && k < g_nmod && k < 64; k++) if ((g_xmod_b[i][k] || into[k]) && at < sizeof log - 1) {
+            at += (size_t)snprintf(log + at, sizeof log - at, "%s%s", at ? "; " : "", g_mod[i].name);
+            if (g_xmod_b[i][k] && at < sizeof log - 1) at += (size_t)snprintf(log + at, sizeof log - at, " %u branches", g_xmod_b[i][k]);
+            if (into[k] && at < sizeof log - 1) at += (size_t)snprintf(log + at, sizeof log - at, "%s %u pointers", g_xmod_b[i][k] ? " and" : "", into[k]);
+            if (at < sizeof log - 1) at += (size_t)snprintf(log + at, sizeof log - at, " into %s", g_mod[k].name);
+        }
+    }
+    if (at) LOG("xmod: %s", log);
+#else
+    (void)mdir; (void)ptrs;
+#endif
+}
+// PEANUTS end
 
 static char g_module_dir[1024];   // the folder the modules were loaded from (dm_module_dir)
 const char *dm_module_dir(void) { return g_module_dir; }
@@ -908,8 +1121,10 @@ void load_modules(const char *dir, const char **names, int n) {
         LOG("%s: base %p size %#zx", names[i], m->base, m->size);
         m->loaded = 1; g_loaded[g_nloaded++] = m; g_nmod++;
     }
+    xmod_apply_all(mdir, 0);   // PEANUTS: a code mod's branches between modules (see xmod_apply)
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
+    xmod_apply_all(mdir, 1);   // PEANUTS: and the addresses of another module it keeps as data, over what relocate() wrote there
     force_check();
     preload_nros(dir, nros);   // mapped now, relocated when the game loads them (hle_ro.c)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
@@ -923,6 +1138,18 @@ void load_modules(const char *dir, const char **names, int n) {
 void run_module_inits(void) {
     for (int i = 0; i < g_nmod; i++) {
         module_t *m = &g_mod[i];
+        // PEANUTS begin: DM_MOD_INIT_ARRAY=1 (a test switch, off by default): a module without DT_INIT that has an init_array (a mod's own module built with
+        // devkitA64, such as Luminescent Platinum's subsdk1: 5 entries, static constructors) gets its entries called here in order. rtld calls DT_INIT only,
+        // so by default they do not run, as far as is known on the console either; the switch is for a mod whose globals read as zero without them
+        if (!m->init && !m->nro && m->init_arraysz >= 8 && getenv("DM_MOD_INIT_ARRAY") && *getenv("DM_MOD_INIT_ARRAY") == '1') {
+            LOG("%s: no DT_INIT: its %llu init_array entries are called (DM_MOD_INIT_ARRAY=1)", m->name, (unsigned long long)(m->init_arraysz / 8));
+            for (uint64_t k = 0; k < m->init_arraysz / 8; k++) {
+                uint64_t f; memcpy(&f, m->base + m->init_array + 8 * k, 8);
+                if (f && f != (uint64_t)-1) ((void (*)(void))(uintptr_t)f)();
+            }
+            continue;
+        }
+        // PEANUTS end
         if (!m->init || m->nro) continue;   // an NRO's init runs when the game loads it (hle_ro.c)
         LOG("%s: DT_INIT +%#llx (init_array %llu entries)", m->name, m->init, m->init_arraysz / 8);
         ((void (*)(void))(m->base + m->init))();

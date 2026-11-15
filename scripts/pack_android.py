@@ -26,7 +26,7 @@
 # unfinished: the launcher refuses it, the next run rewrites it). Libraries of other versions in the pack's shaders/ are kept.
 # --code-only rewrites the modules and stops (pack.tsv, game.tsv and the shaders untouched); --keep-code packs without rewriting (the phone's two steps).
 # Usage: pack_android.py <game folder | .nup file> [--version N] [--out DIR] [-j N] [--shader-cache DIR] [--shader-pkg DIR] [--shader-python PY] [-J N] [--no-shaders] [--code-only | --keep-code] [--in-process]   (exit 1 on error)
-import argparse, hashlib, os, runpy, shutil, signal, subprocess, sys, time
+import argparse, hashlib, os, runpy, shutil, signal, struct, subprocess, sys, time   # PEANUTS: struct (cross_module)
 from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'scripts')); sys.path.insert(0, str(REPO / 'dm/games'))
@@ -81,6 +81,16 @@ def child_env(**kw):
     lib = os.path.join(sys.prefix, 'Library', 'bin')
     if os.path.isdir(lib): env['PATH'] = lib + os.pathsep + env.get('PATH', '')
     return dict(env, **kw)
+
+
+# PEANUTS begin: the phone's packer settings (android/app PackService) that change what a pack holds, so a pack made here is the one the Thor makes; a value
+# already in the environment wins (as the phone's ondevice/env.txt does). The phone's worker settings (DM_SPLIT_WORKER, DMSH_VK_WORKER) are left out: they stand in
+# for the process pools a computer's Python already has
+def peanuts_env(step):
+    """step 'split': DM_SPLIT_DIRECT=1 (the targeted split reads a file's recorded containers only); 'shaders': DMSH_VK_ZSTD_LEVEL=6 (the phone's level)"""
+    kw = dict(DM_SPLIT_DIRECT='1') if step == 'split' else dict(DMSH_VK_ZSTD_LEVEL='6')
+    return {k: v for k, v in kw.items() if k not in os.environ}
+# PEANUTS end
 
 
 def windows_job():
@@ -184,13 +194,14 @@ def rewrite_keys(src, g, pack=None):
     return out
 
 
-def upgrade_keys(srcs, out, g):
+def upgrade_keys(srcs, out, g, xmod=None):   # PEANUTS: xmod, as rewrite's
     """Each module's key that counts as current (rewrite_keys with the pack's game.tsv) but is not rewrite_key's is written as rewrite_key's (by rename), so the
     pack stays current when its copy of game.tsv is replaced. Other keys are left as they are"""
     for m, src in srcs.items():
         kf = out / f'{m}.android.key'
         if not kf.is_file(): continue
         have, keys = kf.read_text().strip(), rewrite_keys(src, g, out)
+        if xmod and m in xmod: keys = xmod_keys(keys, xmod[m])   # PEANUTS
         if have in keys and have != keys[0]:
             tmp = out / f'{m}.android.key.tmp'; write_lf(tmp, keys[0] + '\n'); os.replace(tmp, kf)
             print(f'  {m}: key brought to the current formula (same rewrite)')
@@ -225,7 +236,9 @@ def dump_modules(g, exe):
     for row in g.builds().values():
         want = [m for m in mods if m in row]
         if want and want == have and all(nso_build_id(exe / m) == row[m] for m in want): return have
-    return mods   # no row has this set of modules: the caller names what is missing
+    # No row has this set of modules (a build the profile does not register, e.g. Mario Kart World 1.0.0, whose row was dropped): "Try anyway" takes the
+    # modules the dump has, when main is among them; build-gated cuts do not apply (the caller flags it in red). Without main the caller names what is missing.
+    return have if 'main' in have else mods
 
 
 def optional_keys(g):
@@ -239,6 +252,112 @@ def absent_optional(g, pkg):
     f = pkg / '_absent.tsv'
     keys = {l for l in f.read_text().splitlines() if l} if f.is_file() else set()
     return keys if keys and keys <= optional_keys(g) else set()
+
+
+# PEANUTS begin: code mods (DESIGN-MODS.md "ExeFS binary patch (IPS/IPS32)"/"Code injection"), the modded variant build dev.peanuts.build.ModdedBuild
+# drives through --modules/--mod-exefs/--mod-patches below. A normal (unmodded) pack passes none of these three flags, so this block never runs for it.
+def merge_mod_modules(mods, srcs, modules_override, mod_exefs):
+    """mods/srcs (dump_modules()'s own list and the exefs-path dict) with a modded build's overrides folded in: modules_override (None, or the
+    variant's full module list, the profile's with any module a mod adds in the console's order - dev.peanuts.build.ModBuild.Plan.modules) replaces mods when given;
+    mod_exefs ({module name: source path}, --mod-exefs NAME=PATH) replaces or adds that module's source file. Returns (mods, srcs); never mutates
+    its arguments. An added module not in mod_exefs is left for the caller's usual "missing" check to catch (a plan that adds a module always
+    supplies its source, dev.peanuts.build.ModBuild.compose only adds a name when some mod's exefs/ has that file)."""
+    out_mods = list(modules_override) if modules_override is not None else list(mods)
+    out_srcs = dict(srcs)
+    sys.path.insert(0, str(REPO / 'dm/tools'))
+    import xmod
+    for name, path in mod_exefs.items():
+        out_mods = xmod.insert(out_mods, name)   # where the console loads it (an added subsdk1 before sdk), not after the profile's last module
+        out_srcs[name] = Path(path)
+    return out_mods, out_srcs
+
+
+def apply_mod_patches(name, src, patch_dirs, out, changed=None):
+    """src (a module's NSO path, stock or --mod-exefs-overridden) with name's exefs_patches applied (dm/tools/patch_ips.py's own IPS/IPS32 layer),
+    before the rewrite reads it - patch_nso.py's CUTS assert the module's original bytes and would otherwise abort on a mod's own edits. patch_dirs:
+    the directories to search for '<build id>.ips(32)' (patch_ips.stem_matches: Atmosphère's rule for the name), every enabled mod's patch sets in
+    priority order (a set is offered to every module and applies to the one whose build ID its file names). changed: a list that gets the offsets of
+    the text words the patches changed (cross_module searches them for branches into another module). Returns src unchanged when none match (not an error: patch_ips.py's own
+    documented case, e.g. a mod shipping exefs_patches for a build the dump is not). Writes the patched module (when any patch applies) to
+    out/.mod-src/<name>/<name> and prints one line this module's rewrite_key then hashes by that file's bytes and name, so a different patch result
+    gets its own key and really is rewritten (dm/tools/pack_android.py rewrite_keys: part(h, p.name, p.read_bytes()))."""
+    sys.path.insert(0, str(REPO / 'dm/tools'))
+    import ips as ips_mod, patch_ips, nso
+    try: mod = nso.load(src.read_bytes(), str(src))   # read_bytes: a module inside a .nup is a path of its own kind (nso_build_id), not one open() takes
+    except nso.Error as e: raise Error(f'{src}: {e}') from None
+    build_id16 = patch_ips.build_id_hex16(mod.build_id)
+    paths = patch_ips.patches_for([str(d) for d in patch_dirs], mod.build_id)
+    if not paths:
+        print(f'mod: no exefs_patches for {name} build {build_id16} in {", ".join(str(d) for d in patch_dirs)}: unpatched', flush=True)
+        return src
+    try:
+        image = patch_ips.apply_patches(mod.image, paths)
+    except ips_mod.Error as e:
+        raise Error(f'{name}: {e}') from None
+    dest_dir = out / '.mod-src' / name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / name
+    patch_ips.write_nso(mod, image, str(dest))
+    if changed is not None:
+        import xmod
+        changed += xmod.changed_words(mod.image, image, mod.text_end)
+    print(f'mod: {len(paths)} exefs_patches applied to {name} (build {build_id16}): {", ".join(paths)}', flush=True)
+    return dest
+
+
+def mod_memory_rows(title_id):
+    """Whether a build with code mods of this title has memory numbers of its own (dm/peanuts/profile/mod_memory.tsv: rows of <title ID> <key> <value>, which
+    gen_runtime_profile.py profile-modules reads). main() then writes the variant its own profile.bin whatever its mods do, a patch as well as an added module"""
+    f = REPO / 'dm/peanuts/profile/mod_memory.tsv'
+    if not f.is_file(): return False
+    rows = (line.split('#', 1)[0].split() for line in f.read_text(encoding='utf-8').splitlines())
+    return any(len(c) == 3 and c[0].upper() == title_id.upper() for c in rows)
+
+
+XMOD_KEY = 'cross-module layout'
+
+
+def cross_module(mods, srcs, supplied, patched, out):
+    """A build with code mods: the branches that go straight from one module into another (dm/tools/xmod.py), searched in every module a mod supplies (supplied: all
+    of its code) and in the words a patch changed in one of the game's (patched: {module: those offsets}). → {module: its layout file}, written to
+    out/.mod-src/<module>/<module>.xmod-layout for each module that has such branches or is the target of one: rewrite() passes it to patch_nso.py (--xmod),
+    which lists the branches in <module>.xmod.tsv for the loader, and hashes it into that module's key, so a change of any module's size or of the branches
+    rewrites it. A module that takes no part is rewritten as in a build without mods and gets its usual key; a table an earlier build left for it is removed
+    (the loader would apply it)."""
+    sys.path.insert(0, str(REPO / 'dm/tools'))
+    import nso, xmod
+    try: lay = xmod.layout({m: xmod.header(srcs[m].read_bytes()[:0x100], m) for m in mods})
+    except ValueError as e: raise Error(str(e)) from None
+    far, ptrs = {}, {}
+    for m in mods:
+        if m not in supplied and not patched.get(m): continue
+        try: mod = nso.load(srcs[m].read_bytes(), str(srcs[m]))
+        except nso.Error as e: raise Error(f'{srcs[m]}: {e}') from None
+        words = None if m in supplied else patched[m]
+        far[m] = ('all' if words is None else 'sites', words or [], xmod.far_branches(mod.image, mod.text_end, lay[m][2], words))
+        # the addresses a mod's module keeps as data (its relocations). Not searched in a module of the game that a patch changed: its relocations are the game's
+        # own, which never leave the module, and a patch of code adds none
+        if m in supplied:
+            try: ptrs[m] = xmod.far_pointers(mod.image, lay[m][2])
+            except (ValueError, struct.error) as e: raise Error(f'{srcs[m]}: its relocations cannot be read ({e})') from None
+    files = {}
+    for m, text in xmod.plan(lay, far, ptrs).items():
+        d = out / '.mod-src' / m; d.mkdir(parents=True, exist_ok=True)
+        files[m] = d / f'{m}.xmod-layout'
+        if not files[m].is_file() or files[m].read_text(encoding='utf-8') != text: write_lf(files[m], text)
+    for m in mods:
+        if m not in files: (out / f'{m}.xmod.tsv').unlink(missing_ok=True)
+    if files:
+        print('mod: cross-module branches: ' + '; '.join(f'{m} at main{lay[m][0]:+#x} on the console' + (f', {len(far[m][2])} out' if m in far and far[m][2] else '') + (f', {len(ptrs[m])} pointers out' if ptrs.get(m) else '') for m in files), flush=True)
+    return files
+
+
+def xmod_keys(keys, layout):
+    """A module's keys (rewrite_keys) when it is rewritten with a cross-module layout: each with the layout file's bytes hashed in, and xmod.py's, which
+    the rewriter reads such a module's relocations with (not one of REWRITER: no other module's key depends on it)"""
+    b = layout.read_bytes() + b'\0' + (REPO / 'dm/tools/xmod.py').read_bytes()
+    return [hashlib.sha256(k.encode() + b'\0' + XMOD_KEY.encode() + b'\0' + b).hexdigest() + ' target=android xmod' for k in keys]
+# PEANUTS end
 
 
 def nso_zbic(path):   # whether the module's segments are ZBIC (NSO flag bit 7, system 22.0.0 on), which nso.py needs a decoder for (nso.zbic_decoder)
@@ -299,7 +418,8 @@ def swap_in(out, m, key):
     before the rewrite started, so a pack stopped at any point has either the old module with no key, a mix with no key, or the new module with its key:
     a module without its key is one the launcher refuses (PackCheck) and the next run rewrites"""
     st = staging(out, m)
-    for f in sorted(st.iterdir()): os.replace(f, out / f.name)
+    for f in sorted(st.iterdir()):
+        if f.exists() or f.is_symlink(): os.replace(f, out / f.name)   # PEANUTS(upstream-candidate): an AppleDouble ._<name> on an exFAT/FAT drive goes with its file (split_shaders)
     st.rmdir()
     tmp = out / f'{m}.android.key.tmp'; write_lf(tmp, key + '\n'); os.replace(tmp, out / f'{m}.android.key')
 
@@ -313,17 +433,47 @@ def rewriter_src(src, out, m):
     f = d / src.name; f.write_bytes(src.read_bytes()); return f
 
 
-def rewrite(py, srcs, out, jobs, g, in_process=False):
+def write_orig(src, out, m):   # PEANUTS
+    """<m>.orig.bin for a pack that has none: the bytes the module's file has at the runs of <m>.changed.tsv, in the table's order, as patch_nso.py writes them with a
+    rewrite (the companion host reads them: dm/peanuts/peanuts.c rt_orig). The table must be of this file's build. Returns the bytes written"""
+    sys.path.insert(0, str(REPO / 'dm/tools'))
+    import nso
+    mod = nso.read(str(rewriter_src(src, out, m)))
+    text = bytes(mod.image[:mod.text_end]); bid = mod.build_id[:0x10].hex(); buf = bytearray()
+    for line in (out / f'{m}.changed.tsv').read_text().splitlines():
+        if line.startswith('# BUILD_ID'):
+            if line.split('\t')[1].strip() != bid: raise Error(f'{m}.changed.tsv is of build {line.split(chr(9))[1].strip()}, the file is {bid}')
+            continue
+        if not line or line.startswith('#'): continue
+        off, n = (int(x, 16) for x in line.split('\t')[:2])
+        if off + n > len(text): raise Error(f'{m}.changed.tsv names {off:#x}+{n:#x}, past the code')
+        buf += text[off:off + n]
+    tmp = out / f'{m}.orig.bin.tmp'; tmp.write_bytes(buf); os.replace(tmp, out / f'{m}.orig.bin')
+    return len(buf)
+
+
+def rewrite(py, srcs, out, jobs, g, in_process=False, xmod=None):
     """patch_nso.py --target android on each module into out (each its own <module>.* files); a module whose key file matches is kept. Each module is
     rewritten into a staging folder and swapped in when it is complete (swap_in), so a run stopped part way never leaves new code with old tables.
-    in_process: each in this process (run_in_process) with one worker, one module after the other"""
+    in_process: each in this process (run_in_process) with one worker, one module after the other.
+    PEANUTS: xmod = {module: layout file} (cross_module, a build with code mods): those modules are rewritten with --xmod and keyed with the file (xmod_keys)"""
     env = child_env(DM_GAME=g.id, DM_REWRITE_J=str(max(1, (os.cpu_count() or 4) // max(1, len(srcs)))))
     todo = {}
+    xmod = xmod or {}; xargs = lambda m: ['--xmod', str(xmod[m])] if m in xmod else []   # PEANUTS
     for m, src in srcs.items():
-        keys = rewrite_keys(src, g, out); key = keys[0]; kf = out / f'{m}.android.key'
+        keys = rewrite_keys(src, g, out)
+        if m in xmod: keys = xmod_keys(keys, xmod[m])   # PEANUTS
+        key = keys[0]; kf = out / f'{m}.android.key'
         if (out / f'{m}.patched.bin').is_file() and kf.is_file() and (have := kf.read_text().strip()) in keys:   # the current rewriter's key, an equivalent one's (EQUIV), an earlier formula's
-            if have != key: tmp = out / f'{m}.android.key.tmp'; write_lf(tmp, key + '\n'); os.replace(tmp, kf)   # the same rewrite: its key as rewrite_key's (upgrade_keys)
-            print(f'  {m}: unchanged, kept'); continue
+            # PEANUTS: a main kept from the rewriter before main.orig.bin (EQUIV: its pack counts as up to date) gets the file here, from the game's own file and the
+            # pack's main.changed.tsv (write_orig: seconds, where a rewrite of Octopath Traveler 0's 111 MB of code for it took the phone 25 minutes); rewritten only if that fails
+            ok = True
+            if m == 'main' and (out / 'main.changed.tsv').is_file() and not (out / 'main.orig.bin').is_file():
+                try: n = write_orig(src, out, m); print(f'  {m}: main.orig.bin made from the game\'s file ({n} bytes of the rewritten runs)')
+                except Exception as e: ok = False; print(f'  {m}: main.orig.bin could not be made ({e}): rewriting')
+            if ok:
+                if have != key: tmp = out / f'{m}.android.key.tmp'; write_lf(tmp, key + '\n'); os.replace(tmp, kf)   # the same rewrite: its key as rewrite_key's (upgrade_keys)
+                print(f'  {m}: unchanged, kept'); continue
         todo[m] = (src, key)
     for m in todo: (out / f'{m}.android.key').unlink(missing_ok=True)   # every module to rewrite is unfinished from here on: no mix of old and new modules passes
     if in_process:
@@ -343,7 +493,7 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
             print(f'  {m}: rewriting {src} (in process)', flush=True)
             t0 = time.monotonic()
             width = 1000 * size[m] // total
-            rc = run_in_process(REPO / 'dm/tools/patch_nso.py', [str(files[m]), staging(out, m), m, '--target', 'android'], {'DM_GAME': g.id, 'DM_REWRITE_J': '1'}, out / f'rewrite_{m}.log', (base, width))
+            rc = run_in_process(REPO / 'dm/tools/patch_nso.py', [str(files[m]), staging(out, m), m, '--target', 'android', *xargs(m)], {'DM_GAME': g.id, 'DM_REWRITE_J': '1'}, out / f'rewrite_{m}.log', (base, width))   # PEANUTS: xargs
             if rc:
                 tail = (out / f'rewrite_{m}.log').read_text(errors='replace').splitlines()[-20:]
                 raise Error(f'patch_nso.py exit code {rc} on {m}:\n' + '\n'.join(tail))
@@ -360,7 +510,7 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
                 m = pending.pop(0); kf = out / f'{m}.android.key'; kf.unlink(missing_ok=True); shutil.rmtree(staging(out, m), ignore_errors=True)
                 print(f'  {m}: rewriting {todo[m][0]}', flush=True)
                 log = open(out / f'rewrite_{m}.log', 'w')
-                procs[m] = (subprocess.Popen([py, str(REPO / 'dm/tools/patch_nso.py'), str(rewriter_src(todo[m][0], out, m)), str(staging(out, m)), m, '--target', 'android'], env=env, stdout=log, stderr=subprocess.STDOUT), log)
+                procs[m] = (subprocess.Popen([py, str(REPO / 'dm/tools/patch_nso.py'), str(rewriter_src(todo[m][0], out, m)), str(staging(out, m)), m, '--target', 'android', *xargs(m)], env=env, stdout=log, stderr=subprocess.STDOUT), log)   # PEANUTS: xargs
             for m in list(procs):
                 p, log = procs[m]
                 if p.poll() is None: continue
@@ -481,6 +631,7 @@ def split_shaders(a, g, vdir, pkg, parts=None):   # parts: the version's (romfs,
     tmp = pkg.with_name(pkg.name + '.tmp'); shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
     print(f'shaders: splitting the shaders out of {rd} into {pkg} with {py} (a few minutes)', flush=True)
     env = child_env(DM_GAME=g.id, DM_SPLIT_TARGETED='1')   # as the phone: only the files the profile's map names, when the build is the profile's and the tables come out the same
+    env.update(peanuts_env('split'))   # PEANUTS: as the phone's split (PackService): the direct scan
     r = subprocess.run([py, str(SPLIT), str(rd), str(ed / 'main'), str(tmp / 'pkg'),
                         *[str(tmp / f) for f in ('shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')]], env=env)
     if r.returncode: raise Error(f'shader_split.py exit code {r.returncode}')
@@ -498,7 +649,8 @@ def split_shaders(a, g, vdir, pkg, parts=None):   # parts: the version's (romfs,
     if absent:
         (pkg / '_absent.tsv').write_text(''.join(k + '\n' for k in absent))
         print(f'shaders: {len(absent)} of the profile\'s {len(want)} shaders are not in this dump (they belong to another registered build of the game, shader_optional.tsv): listed in {pkg.name}/_absent.tsv')
-    for f in tmp.iterdir(): f.replace(pkg.with_name(f.name))
+    for f in list(tmp.iterdir()):
+        if f.exists() or f.is_symlink(): f.replace(pkg.with_name(f.name))   # PEANUTS(upstream-candidate): macOS on an exFAT/FAT drive moves a file's AppleDouble ._<name> with it, so the listing's ._ entry is gone by its turn
     tmp.rmdir()
 
 
@@ -517,6 +669,7 @@ def pack_shaders(a, g, work, out, vdir, parts=None):
         print(f'shaders: building the Vulkan library {lib} from {pkg} with {py} (J={a.J}; about 10 minutes on DKB)', flush=True)
         (work / 'android-shaders' / 'work').mkdir(parents=True, exist_ok=True)
         env = child_env(DM_GAME=g.id, J=str(a.J), WORK=str(work / 'android-shaders' / 'work'))
+        env.update(peanuts_env('shaders'))   # PEANUTS: as the phone's shaders step (PackService): zstd 6
         keys = selected_keys(g.dir)   # a profile with a selected set (shader_seen.tsv): only its shaders, as the phone builds them (PackService, ShaderLibs.selection)
         if keys is not None:
             if not keys: raise Error(f'the profile\'s shader_seen.tsv names none of the shaders of its shader_map.tsv')
@@ -531,7 +684,7 @@ def pack_shaders(a, g, work, out, vdir, parts=None):
             if WINDOWS:
                 kf = work / 'android-shaders' / 'keys.txt'; write_lf(kf, ''.join(k + '\n' for k in keys)); args = ['@' + str(kf)]
             else: args = keys
-        r = subprocess.run([py, str(VK_BUILD_WIN if WINDOWS else VK_BUILD), '--target', 'vulkan', str(pkg), str(cache), *args], env=env)
+        r = subprocess.run([py, str(VK_BUILD_WIN if WINDOWS or sys.platform.startswith('linux') else VK_BUILD), '--target', 'vulkan', str(pkg), str(cache), *args], env=env)   # PEANUTS: on Linux too, for the translator's start (the repository's apphost is the Mac's; vk_android_win.py starts the dlls with dotnet)
         if r.returncode: raise Error(f'vk_android_build.py exit code {r.returncode} (a package that lacks the profile\'s shaders stops it: delete {pkg} and the split runs again)')
         if not library_current(lib, g): raise Error(f'vk_android_build.py finished but {lib} is not a full library of {g.id} with the current inputs')
     else: print(f'shaders: {lib} is current (game {g.id}, inputs {dmsh_chain.inputs(g)})')
@@ -598,6 +751,15 @@ def main():
     ap.add_argument('--keep-code', action='store_true', help='do not rewrite: the pack\'s modules must be there with their key files (the phone\'s pack step)')
     ap.add_argument('--made-by', help='who makes this pack, written as its made_by row (the phone\'s pack step: "app <version>"; the launcher then updates the pack\'s code by itself when only the tools changed)')
     ap.add_argument('--in-process', action='store_true', help='run the rewriter in this process, no subprocesses (the phone\'s packer); the shader library must be current or left out')
+    # PEANUTS begin: code mods (DESIGN-MODS.md), a modded variant build (dev.peanuts.build.ModdedBuild composes these from ModBuild.Plan). None given: this
+    # function behaves exactly as before - no mod ever changes a normal pack's modules, sources or build.
+    ap.add_argument('--modules', help='the modded build\'s full module list, comma-separated, profile order first then any module a mod adds '
+                     '(dev.peanuts.build.ModBuild.Plan.modules); default: the dump\'s own modules, unchanged')
+    ap.add_argument('--mod-exefs', action='append', default=[], metavar='NAME=PATH',
+                     help='a mod\'s exefs/NAME as that module\'s source, replacing the dump\'s own file or adding a module the dump does not have; repeatable')
+    ap.add_argument('--mod-patches', action='append', default=[], metavar='NAME=DIR',
+                     help='a mod\'s exefs_patches/NAME directory, applied (dm/tools/patch_ips.py) to NAME\'s image before the rewrite; repeatable')
+    # PEANUTS end
     a = ap.parse_args()
     if WINDOWS:
         for s in (sys.stdout, sys.stderr): s.reconfigure(encoding='utf-8', errors='backslashreplace')   # as the tools' output (child_env): one encoding for the reader
@@ -613,23 +775,71 @@ def main():
         except SystemExit: raise Error(f'no profile dm/games/{app:016X}: the Android pack needs one (build_ipa_from_nsp.py makes a provisional one)') from None
         ver = a.version if a.version is not None else max(vers, default=0)
         if ver and ver not in vers: raise Error(f'no updates/{ver} (have: {", ".join(map(str, sorted(vers))) or "none"})')
+        for tid, p in sorted(dlc.items()):   # the add-on's content meta record: the game version it needs (pack_dump.dlc_required_version)
+            if (need := pack_dump.dlc_required_version(p)) > ver:
+                print(f'[RED] DLC {tid:016X} needs game version {need} or later (its content meta record); this pack is version {ver}: the game may not use it', flush=True)
         vdir = pack_dump.version_dir(folder, vers, ver)
         exe, romfs = pack_dump.version_part(folder, vers, ver, 'exefs'), pack_dump.version_part(folder, vers, ver, 'romfs')   # its own, else the base's
         if not (exe / 'main.npdm').is_file() or not romfs.is_dir(): raise Error(f'{vdir}: no exefs/main.npdm and romfs (neither its own nor the base\'s)')
         if (pid := pack_dump.program_id(exe / 'main.npdm')) != app: raise Error(f'{vdir}: program ID {pid:016X}, the base is {app:016X}')
         mods = dump_modules(g, exe)
         srcs = {m: exe / m for m in mods}
+        out = (a.out or folder.parent / f'{app:016X}-work' / 'android-pack').resolve()
+        try: out.relative_to(REPO); raise Error(f'{out} is inside the repository: packs never go there')
+        except ValueError: pass
+        out.mkdir(parents=True, exist_ok=True)
+        # PEANUTS begin: code mods (DESIGN-MODS.md) - a modded variant build's module overrides, applied before the usual missing/ZBIC checks so they see
+        # the mod's own files, not the stock dump's. Stock call sites (no --modules/--mod-exefs/--mod-patches) are unaffected: mod_exefs/mod_patches_by_name
+        # are then both empty and modules_override is None, so merge_mod_modules returns (mods, srcs) unchanged.
+        mod_exefs = {}
+        for kv in a.mod_exefs:
+            name, _, path = kv.partition('=')
+            if not path: raise Error(f'--mod-exefs {kv!r}: expected NAME=PATH')
+            mod_exefs[name] = path
+        mod_patches_by_name = {}
+        for kv in a.mod_patches:
+            name, _, d = kv.partition('=')
+            if not d: raise Error(f'--mod-patches {kv!r}: expected NAME=DIR')
+            mod_patches_by_name.setdefault(name, []).append(d)
+        modules_override = a.modules.split(',') if a.modules else None
+        mods, srcs = merge_mod_modules(mods, srcs, modules_override, mod_exefs)
+        # said here in a sentence: the reads below (the patches, the layout) come before the usual check for missing modules, and ended in a traceback
+        if lost := [m for m in mods if m not in srcs]: raise Error(f'--modules names {", ".join(lost)}, which neither the game nor a mod has')
+        if gone := [f'{m} ({p})' for m, p in mod_exefs.items() if not srcs[m].is_file()]:
+            raise Error(f'a mod\'s module is not there: {", ".join(gone)}. The mod was deleted or changed since the build was started: build with mods again')
+        patched = {}
+        for name, dirs in mod_patches_by_name.items():
+            if name not in mods: raise Error(f'--mod-patches {name}=...: {name} is not in the module list ({" ".join(mods)})')
+            srcs[name] = apply_mod_patches(name, srcs[name], dirs, out, patched.setdefault(name, []))
+        # the patches go onto the module before anything reads it for the rewrite, and the branches between modules are worked out from the patched code
+        xmod_files = cross_module(mods, srcs, set(mod_exefs), patched, out) if mod_exefs or mod_patches_by_name else {}
+        # PEANUTS end
         if missing := [m for m in mods if not srcs[m].is_file()]: raise Error(f'{exe}: no {", ".join(missing)} (the profile\'s modules are {" ".join(mods)})')
         if not a.keep_code and (zb := [m for m in mods if nso_zbic(srcs[m])]):
             sys.path.insert(0, str(REPO / 'dm/tools')); import nso   # its ZBIC decoder, checked here so a missing one fails before any work
             try: ok = nso.zbic_decoder()
             except nso.Error as e: raise Error(f'{" ".join(zb)}: ZBIC-compressed (system 22.0.0+): {e}') from None
             if not ok: raise Error(f'{" ".join(zb)}: ZBIC-compressed (system 22.0.0+), and {sys.executable} has no decoder: {nso.ZBIC_MISSING} (android/README.md)')
-        out = (a.out or folder.parent / f'{app:016X}-work' / 'android-pack').resolve()
-        try: out.relative_to(REPO); raise Error(f'{out} is inside the repository: packs never go there')
-        except ValueError: pass
-        out.mkdir(parents=True, exist_ok=True)
         ids = {m: nso_build_id(srcs[m]) for m in mods}
+        # PEANUTS begin: code mods (DESIGN-MODS.md) - a modded build adding a module past the profile's own game.tsv row gets its own profile.bin (the
+        # generic host's per-title data, dm/peanuts/profile/gen_runtime_profile.py) written beside the pack, read instead of the APK asset
+        # (dev.peanuts.build.GenericProfile.envLines(Context,String,File) when <packDir>/profile.bin exists). A plain replace-only mod (mods unchanged
+        # from the dump's own list) needs none of this: the shipped per-title asset already lists every module the mod replaces.
+        # The same for a variant of a title that has memory numbers for its builds with mods (mod_memory.tsv, which profile-modules reads), whatever its mods
+        # do: only a build that adds a module was given them. A variant that needs no profile of its own keeps none that an earlier build of it left.
+        modded = bool(mod_exefs or mod_patches_by_name)
+        own_profile = mods != dump_modules(g, exe) or modded and mod_memory_rows(f'{app:016X}')
+        if modded and not own_profile: (out / 'profile.bin').unlink(missing_ok=True)
+        if own_profile:
+            gen = REPO / 'dm/peanuts/profile/gen_runtime_profile.py'
+            profile_bin, gen_log = out / 'profile.bin', out / 'rewrite_profile.log'
+            gen_args = ['profile-modules', f'{app:016X}', str(profile_bin), ','.join(mods)]
+            if a.in_process: rc = run_in_process(gen, gen_args, {}, gen_log)
+            else:
+                with open(gen_log, 'w') as f: rc = subprocess.call([sys.executable, str(gen), *gen_args], stdout=f, stderr=subprocess.STDOUT)
+            if rc: raise Error(f'gen_runtime_profile.py profile-modules failed (exit {rc}); see {gen_log}')
+            print(f'mod: wrote {profile_bin} with modules {" ".join(mods)} (the generic host\'s profile for this variant)', flush=True)
+        # PEANUTS end
         print(f'{app:016X} {g.get("name", "?")} version {ver}: {vdir}', flush=True)
         for m, known in unregistered(g, ids).items(): print(f'[RED] {m} build {ids[m]} is none of the profile\'s builds ({", ".join(known)}): build-gated cuts do not apply')
         if a.keep_code:
@@ -641,18 +851,20 @@ def main():
             print('  modules kept as they are (--keep-code)')
         else:
             try:
-                rewrite(sys.executable, srcs, out, max(1, a.j), g, a.in_process)
+                rewrite(sys.executable, srcs, out, max(1, a.j), g, a.in_process, xmod_files)   # PEANUTS: xmod_files
                 rewrite_variants(sys.executable, srcs, out, g, a.in_process)   # game.tsv variant rows (a native 4:3 mod) into <pack>/<variant>/
             finally: shutil.rmtree(out / '.nup-src', ignore_errors=True)   # the module copies a NUP game's rewrite read (rewriter_src)
         if a.code_only: print(f'done: the modules in {out} (--code-only: pack.tsv and the shaders unchanged)'); return
-        if a.keep_code: upgrade_keys(srcs, out, g)   # before the copy below replaces the game.tsv an earlier key was made with (a rewrite run did it in rewrite)
+        if a.keep_code: upgrade_keys(srcs, out, g, xmod_files)   # PEANUTS: xmod_files. Before the copy below replaces the game.tsv an earlier key was made with (a rewrite run did it in rewrite)
         shutil.copyfile(g.dir / 'game.tsv', out / 'game.tsv')
         shaders = None if a.no_shaders else pack_shaders(a, g, folder.parent / f'{app:016X}-work', out, vdir, (romfs, exe))
         scenes = scene_overlays(g, romfs, out)
         top = folder.parent if pack_dump.nup.is_nup(folder) else folder   # a NUP file's paths are `<name>.nup:<package>/...`, relative to its folder
         rel = lambda p: p.relative_to(top).as_posix()
         rows = [('format', str(FORMAT)), ('title_id', f'{app:016X}'), ('name', g.get('name', '')), ('version', str(ver)), ('target', 'android'),
-                ('modules', ' '.join(mods)), *[('build', f'{m}={ids[m]}') for m in mods], ('romfs', rel(romfs)),
+                # PEANUTS: a module a mod supplies is listed as mod_build, not build: the launcher compares every build row with the game's own file of that name
+                # (BuildCheck.build), which an added module does not have and a replaced one differs from, and would refuse to start the pack
+                ('modules', ' '.join(mods)), *[('mod_build' if m in mod_exefs else 'build', f'{m}={ids[m]}') for m in mods], ('romfs', rel(romfs)),
                 *[('aoc', f'{tid - app - 0x1000}\t{rel(p)}') for tid, p in sorted(dlc.items())],
                 *([('shaders', shaders.relative_to(out).as_posix())] if shaders else []), *[('scene_res', f'{n}\t{p}') for n, p in scenes], ('packer', commit()), *([('made_by', a.made_by)] if a.made_by else [])]
         stage('writing the pack\'s list of files')

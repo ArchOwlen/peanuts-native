@@ -1715,7 +1715,7 @@ static void report_build(void) {
 
 // This build's display version from the profile's build rows (by the whole main build ID), as GetDisplayVersion answers it
 static void profile_version(void) {
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table (design/platform/IMPL-GENERIC.md); DM_GAME_DISPLAY_VERSIONS is one of the
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own table; DM_GAME_DISPLAY_VERSIONS is one of the
     const char *bid = dm_main_build();   // nine macros game_profile_generic.h leaves undefined on purpose, so the #else branch's #ifdef would miss here
     for (unsigned j = 0; j < g_profile.ndisplay_versions; j++) if (!strcasecmp(bid, g_profile.display_versions[j].build)) snprintf(g_version, sizeof g_version, "%s", g_profile.display_versions[j].ver);
 #else

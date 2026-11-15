@@ -177,6 +177,34 @@ static void test_walk(void) {
         CHECK(r[12].what == VKA_R_SUPPORT, "support");
         CHECK(pool, "a pool record marks the draw as using set 1");
     }
+    // PEANUTS: the fallback arrays of dynamic texture handles (tex_dyn_slots; Octopath Traveler 0's particle vertex shaders): element k is slot k (combined, else separate), the sampler
+    // the separate sampler k or the combined handle's; the shader's c2 words are slot indices (VKA_POOL_DYN) and the pool bases are not added
+    {
+        vka_bstate d; memset(&d, 0, sizeof d);
+        d.tex[0][1] = 7 | 3u << 20; d.tex[0][DMSH_SEPTEX_SLOT0 + 2] = 9; d.samp[0][2] = 11u << 20; d.tex_base = 100; d.samp_base = 200;
+        dmsh_vk_bind db[] = {
+            {.kind = DMSH_VK_KIND_TEX_DYN, .desc = 4, .binding = 5, .count = 4, .reg = -1},
+            {.kind = DMSH_VK_KIND_SAMP_DYN, .desc = 0, .binding = 6, .count = 4, .reg = -1},
+        };
+        dmsh_vk_entry ed = {.stage = DMSH_VK_STAGE_VS, .bind_count = 2};
+        vka_res rd_[16]; int pl = 0; char wy[200] = "";
+        int nd = vka_walk(&d, 0, &ed, db, 0, 64, rd, NULL, rd_, 16, &pl, wy, sizeof wy);
+        CHECK(nd == 8, "dyn walk: %d results (%s)", nd, wy);
+        if (nd == 8) {
+            CHECK(rd_[0].what == VKA_R_NULL && rd_[1].what == VKA_R_TBUF && rd_[1].tid == 7 && rd_[2].what == VKA_R_TBUF && rd_[2].tid == 9 && rd_[3].what == VKA_R_NULL, "dyn texture elements: %d %d/%d", rd_[1].what, rd_[1].tid, rd_[2].tid);
+            CHECK((rd_[1].flags & VKA_RF_DYN) && rd_[1].elem == 1, "dyn elements are marked");
+            CHECK(rd_[4].what == VKA_R_NULL && rd_[5].what == VKA_R_TEX && rd_[5].sid == 3 && rd_[6].what == VKA_R_TEX && rd_[6].sid == 11, "dyn sampler elements: %d %d/%d", rd_[5].what, rd_[5].sid, rd_[6].sid);
+        }
+        CHECK(pl == VKA_POOL_DYN, "dyn arrays set only the dynamic bit: %d", pl);
+        uint8_t c2[DMSH_DRV_SIZE]; uint32_t w;
+        vka_drv_fill(&d, 0, 2, pl, c2);
+        memcpy(&w, c2 + DMSH_C2_TEX + DMSH_C2_ROW * 1, 4); CHECK(w == (1u | 1u << 20), "c2 combined slot 1 holds its index (with the sampler flag): %#x", w);
+        memcpy(&w, c2 + DMSH_C2_SEPTEX + DMSH_C2_ROW * 2, 4); CHECK(w == 2, "c2 separate texture 2 holds its index: %#x", w);
+        memcpy(&w, c2 + DMSH_C2_SAMP + DMSH_C2_ROW * 2, 4); CHECK(w == 2u << 20, "c2 sampler 2 holds its index << 20: %#x", w);
+        memcpy(&w, c2 + DMSH_C2_SEPTEX + DMSH_C2_ROW * 3, 4); CHECK(w == 0, "c2 unbound slot stays 0");
+        vka_drv_fill(&d, 0, 2, 0, c2);
+        memcpy(&w, c2 + DMSH_C2_SEPTEX + DMSH_C2_ROW * 2, 4); CHECK(w == 9, "without the dynamic bit c2 holds the handle: %u", w);
+    }
     // An array of handles in a uniform buffer (BindlessToArray, Fire Emblem Fortune's Weave's c[14][8 i + 0x340] cube maps): element k is the handle at the base + 8k, its sampler from the same word
     {
         uint32_t hs[3] = {21 | 31u << 20, 22 | 32u << 20, 23 | 33u << 20};

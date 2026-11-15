@@ -36,3 +36,6 @@ app_pool	0xCD500000
 # ---- Shader split (shader_split.py; MSHD containers) ----
 shader_groups	/system/shd/=shd
 shader_note	Metroid Dread shaders
+
+# PEANUTS: cutscenes at 60 fps through the frame step state page (patches.py; README "Frame rate"); a cap of 0 keeps the game's own 30 fps cutscenes
+fps_target	60

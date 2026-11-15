@@ -40,3 +40,8 @@ mem_used	0x4c00000
 # two BNSH in main, and YEBIS's post effects, a .tfxo file in a zlib stream in main (tfxo_streams)
 shader_groups	/bin/=bin /system_resource/=systemresource
 shader_note	Pokémon Shield shaders
+
+# PEANUTS: 60 fps (30 on the Switch): the host writes the interval-2 frame time (hle_fpslock.c, the "Game Freak frame time of interval 2" row for main a1680262...) and presents every vsync.
+# Game speed at 60 judged right on the device (Pokémon Sword, AYN Thor, 2026-11-14: walking, text, battles, cutscenes); Frame rate cap 30 is the Switch's rate
+# ---- Frame rate ----
+fps_target	60

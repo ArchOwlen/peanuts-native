@@ -145,7 +145,14 @@ HLE_FORCE("_ZN2nn2oe16GetOperationModeEv", "operation mode query; a fixed value 
 // Profile perf_mode boost: Boost whatever the operation mode, a combination a Switch 1 never reports, so a profile choice and not a default. Rhythm Heaven Groove keeps one flag per mode
 //   (main+0xa764 / main+0xa784): console means a TV, which gets a latency calibration (main+0x20d0, scene script main+0x4c0820), and Boost alone picks its 1920x1080 draw size
 //   (table main+0xada6d0, else 1280x720). Handheld with Boost: no TV calibration on a phone, full-size drawing
-HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "performance mode query; same as the operation mode (profile perf_mode boost: Boost)", int, h_oe_GetPerfMode, void) { return DM_GAME_PERF_BOOST ? 1 : opmode(); }
+// A game with a render_cfg row (hle_render.c): the player's graphics quality gives the performance mode, and this call writes the render configurations the game reads next.
+// Weak defaults for builds without hle_render.c (the unit tests that include this file)
+__attribute__((weak)) int dm_render_perf_mode(void) { return -1; }
+__attribute__((weak)) int dm_render_active(void) { return 0; }
+__attribute__((weak)) int dm_render_script(const char *key, int v) { (void)key; (void)v; return 0; }
+HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "performance mode query; same as the operation mode (profile perf_mode boost: Boost; render_cfg: the graphics quality's)", int, h_oe_GetPerfMode, void) {
+    int r = dm_render_perf_mode(); return r >= 0 ? r : DM_GAME_PERF_BOOST ? 1 : opmode();
+}
 // SDK 11 calls of Monster Hunter Rise: the CPU overclock query reads an apm session the host never opened (null read in sdk+0x35258 at the start of nnMain, main+0x6bc8650);
 // the default display resolution is the TV's (1080p docked) or the panel's (720p handheld) and only changes with the operation mode
 // Taiko Risshiden V DX (SDK 12.3.3) turns it on in nnMain (main+0x2e1e4c): the setter goes through the same apm session (null read at sdk+0x362b8). The host does not scale clocks;
@@ -173,7 +180,7 @@ static int gfx_setting(void) {
     return v;
 }
 static int gfx_scale_of(int setting, int mode) { return setting < 3 ? setting : mode == 1; }
-static int gfx_scale(void) { return gfx_scale_of(gfx_setting(), opmode()); }
+static int gfx_scale(void) { return dm_render_active() ? 0 : gfx_scale_of(gfx_setting(), opmode()); }   // render_cfg: 0, the configurations carry the sizes
 HLE_FORCE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", "graphics scale (Switch 2, through am): 0 handheld, 1 console (DM_GRAPHICS_SCALE or the in-game panel: 0-2 in every mode)", int, h_oe_GfxScale, void) { return gfx_scale(); }
 HLE_FORCE("_ZN2nn2oe28GetGraphicsScalingParametersEv", "graphics scaling parameters (Switch 2, through am): 10 / 20 / 30 for graphics scale 0 / 1 / 2", unsigned, h_oe_GfxScaleParams, void) { return 10u * (gfx_scale() + 1); }
 HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics scale change notification switch (Switch 2, through am): message 300",
@@ -184,6 +191,7 @@ static void *g_defres_ev[DEFRES_EV]; static _Atomic int g_defres_n;
 // Operation mode and graphics scale changes, as the console makes them (docking, the system's graphics settings): the whole new state first, then one notification per query
 // whose answer changed (30 and 31 for the mode, 300 for the scale), each only when the game turned it on, so a game that re-queries on the first one already sees all of it.
 // m -1 keeps the mode; scale -2 keeps the setting, 3 follows the mode, 0-2 holds that scale in every mode
+__attribute__((weak)) void dm_hid_opmode_changed(void) {}   // PEANUTS: hle_hid.c; the weak default is for builds without it (the unit tests that include this file)
 static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;   // two producers (the panel, an overheat downgrade) do not interleave their read and store
 static void oe_state_set(int m, int scale) {
     pthread_mutex_lock(&g_state_lock);
@@ -197,11 +205,14 @@ static void oe_state_set(int m, int scale) {
         if (g_ntf_opmode) mq_push(MSG_OPMODE);
         if (g_ntf_perfmode && !DM_GAME_PERF_BOOST) mq_push(MSG_PERFMODE);   // the performance mode follows the operation mode (profile perf_mode boost: always Boost, it does not change)
         int n = atomic_load(&g_defres_n); for (int i = 0; i < n; i++) hle_signal_system_event(g_defres_ev[i]);
+        dm_hid_opmode_changed();   // PEANUTS: player 1's controller moves between No1 and Handheld with the mode: the style events fire, as on the console
     }
     if (scale_changed && g_ntf_gfxscale) mq_push(MSG_GFXSCALE);
 }
 // The launcher's in-game panel (Game resolution while the game runs, Native.graphicsModeSet): the graphics scale and operation mode of the choice's graphics_scale row
 // (Profile.resolutionLive). scale -1 follows the mode and m -1 is the profile's op_mode: both -1 is what a start without the lines gives (Original without a row)
+// hle_render.c: a render setting changed while the game runs; the game reads it in GetPerformanceMode, which notification 31 asks for
+void dm_oe_perfmode_notify(void) { if (g_ntf_perfmode) mq_push(MSG_PERFMODE); }
 __attribute__((visibility("default"))) void nxhost_graphics_mode_set(int scale, int m) {
     LOG("main: Game resolution from the launcher's in-game panel: graphics scale %d, operation mode %d (-1: the game's own)", scale, m);
     oe_state_set(m < 0 ? DM_GAME_OPMODE : m, scale < 0 ? 3 : scale);
@@ -241,7 +252,7 @@ HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "set
 }
 
 // Scripted state changes (verify lifecycle / overheat downgrade / a graphics scale change without a window): DM_OE_SCRIPT="focus=3@10,focus=1@20,opmode=0@30,gscale=2@40" (second N;
-// gscale=-1 follows the operation mode again); bg=1 / bg=0 run the whole background round trip (see script_bg)
+// gscale=-1 follows the operation mode again); bg=1 / bg=0 run the whole background round trip (see script_bg); outh= / rscale= / quality= a render_cfg game's setting (hle_render.c)
 // Time counts from the game's first notification fetch. Coexists with front end calls.
 #include <unistd.h>
 // bg=1 / bg=0: the whole "to background / back to foreground" sequence, in the same order as the scene lifecycle in front_ios.m (resign active -> enter background; enter foreground -> become active), minus the audio session reset iOS does on returning.
@@ -261,7 +272,8 @@ static void *oe_script(void *arg) {
         else if (!strcmp(key, "opmode")) dm_set_opmode(v);
         else if (!strcmp(key, "gscale")) oe_state_set(-1, v < 0 ? 3 : v);   // 0-2, or -1: follow the operation mode again
         else if (!strcmp(key, "bg")) script_bg(v);
-        else die("DM_OE_SCRIPT unknown key '%s' (focus / opmode / gscale / bg)", key);
+        else if (dm_render_script(key, v)) {}   // outh / rscale / quality: a render_cfg game's output height, render scale and graphics quality (hle_render.c)
+        else die("DM_OE_SCRIPT unknown key '%s' (focus / opmode / gscale / bg / outh / rscale / quality)", key);
     }
     return NULL;
 }

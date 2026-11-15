@@ -123,7 +123,7 @@ class Targeted(unittest.TestCase):
         self.same(full, t)
         self.assertEqual(sorted(os.listdir(scan)), ['full', 'targeted', 'targeted.failed'])
         t2, said = self.split('again', True, scan)   # a rerun (the phone's after a stop) goes straight to the full scan, from its kept results
-        self.assertIn('an earlier run on these inputs found the targeted scan', said)
+        self.assertIn("targeted split: not taken, the targeted scan's tables were found to differ from the profile's by an earlier run on these inputs: every file is scanned", said)   # PEANUTS: the wording since the direct mode (DM_SPLIT_DIRECT: each mode names itself)
         self.assertIn('resuming the split: 24 file(s) already scanned', said)
         self.assertNotIn('only these are scanned', said)
         self.same(full, t2)

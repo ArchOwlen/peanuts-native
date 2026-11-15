@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden DSMod fork
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <functional>
+#include <map>
+#include <string_view>
+#include <mutex>
+#include <string>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -294,6 +299,29 @@ void ModRuntime::InitializeGameModule() {
         if (rt.module_snapshot && ValidString(name, MaxName)) {
             rt.module_snapshot->ints[name] = value;
         }
+        // PEANUTS: a module's state counters (names ending in _failures, _hidden, _supported, _request or _version: whether its guest
+        // writes and its helper took) go to the log when they change, at most 300 lines a run; nothing shows them on this host
+        if (ValidString(name, MaxName)) {
+            const std::string_view n{name};
+            const auto ends = [&](std::string_view tail) { return n.size() >= tail.size() && n.substr(n.size() - tail.size()) == tail; };
+            static const bool all = [] { const char* e = std::getenv("DM_RT_VALUES"); return e && *e && *e != '0'; }(); // PEANUTS: DM_RT_VALUES=1: every value
+            if (all || ends("_failures") || ends("_hidden") || ends("_supported") || ends("_request") || ends("_version")) {
+                static std::mutex mu;
+                static std::map<std::string, s64, std::less<>> last; // looked up by the view: no string made per publish
+                static int lines;
+                std::scoped_lock lk{mu};
+                const auto it = last.find(n);
+                if ((it == last.end() || it->second != value) && lines < (all ? 3000 : 300)) {
+                    ++lines;
+                    if (it == last.end()) {
+                        last.emplace(n, value);
+                    } else {
+                        it->second = value;
+                    }
+                    LOG_INFO(Core, "DSMod module value {} = {}", name, value);
+                }
+            }
+        }
     };
     module_host.publish_f64 = [](void* p, const char* name, double value) {
         auto& rt = *static_cast<ModRuntime*>(p);
@@ -305,6 +333,21 @@ void ModRuntime::InitializeGameModule() {
         auto& rt = *static_cast<ModRuntime*>(p);
         if (!rt.module_snapshot || !ValidString(name, MaxName) || !ValidString(value, MaxText)) {
             return;
+        }
+        // PEANUTS: a module's diagnostic texts (names ending in ".diag": why a reader is not ready) go to the log when they change; nothing shows them on this host
+        if (const size_t nl = std::strlen(name); nl > 5 && std::strcmp(name + nl - 5, ".diag") == 0) {
+            static std::mutex mu;
+            static std::map<std::string, std::string, std::less<>> last; // looked up by the view: no string made per publish
+            std::scoped_lock lk{mu};
+            const std::string_view key{name, nl}, text{value};
+            const auto it = last.find(key);
+            if (it == last.end()) {
+                last.emplace(key, text);
+                LOG_INFO(Core, "DSMod module text {} = '{}'", name, value);
+            } else if (it->second != text) {
+                it->second = text;
+                LOG_INFO(Core, "DSMod module text {} = '{}'", name, value);
+            }
         }
         if (std::strcmp(name, "__map_state") == 0) {
             rt.AcceptModuleMapState(value);
@@ -600,11 +643,31 @@ bool ModRuntime::LockMapStateUnlessRaster(MapStateLock& lock) const {
     const auto start = std::chrono::steady_clock::now();
     for (;;) {
         if (lock.try_lock()) {
+            map_lock_refused_run = 0; // PNRT
             return true;
         }
         if (map_raster_busy.load(std::memory_order_acquire) != 0 ||
             std::chrono::steady_clock::now() - start > Grace) {
-            return false;
+            // PNRT: Peanuts ticks on a thread of its own (the game's vsync does not run on it), so
+            // waiting out a raster costs the page its tick, not the game a frame. Deferring for
+            // good starved the publish: after a second of refusals (the page's ~30 Hz publish
+            // attempts, plus the map updates') take the lock for real and let the frame through.
+            constexpr u32 ForceAfter = 60;
+            if (++map_lock_refused_run < ForceAfter) {
+                return false;
+            }
+            lock.lock();
+            map_lock_refused_run = 0;
+            if (++map_lock_forced_waits <= 3 || (map_lock_forced_waits % 100) == 0) {
+                LOG_INFO(Core,
+                         "DSMod: a map raster starved the page's publish; waited it out "
+                         "(wait #{}, {} ms)",
+                         map_lock_forced_waits,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count());
+            }
+            return true;
         }
         std::this_thread::yield();
     }

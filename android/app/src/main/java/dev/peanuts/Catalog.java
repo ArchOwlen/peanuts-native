@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
 
 /**
  * The companion catalog: the Eden Duo companions' GitHub releases, whose assets are `<TITLEID>-<Name>-<version>.dsmod.zip` (older ones `<TITLEID>.dsmod.zip`); every
- * release is kept (CRITIQUE-phase1.md: same GitHub Releases API as today, just stop discarding older releases), newest version first per title, so a game's companion
+ * release is kept (found in review: same GitHub Releases API as today, just stop discarding older releases), newest version first per title, so a game's companion
  * can be installed, switched between versions or rolled back (dev.peanuts.ui.CompanionVersions). Names come from the repository's catalog.json (title id → game name).
  * Same packages, same format as Eden Duo (PACKAGE_FORMAT.md).
  */

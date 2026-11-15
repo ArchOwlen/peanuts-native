@@ -12,7 +12,7 @@ get_filename_component(NX_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../.. A
 add_compile_options(-ffile-prefix-map=${NX_REPO_ROOT}/=)   # PEANUTS: see above
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../host ${CMAKE_CURRENT_BINARY_DIR}/host)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/import ${CMAKE_CURRENT_BINARY_DIR}/nximport)   # PEANUTS: the importer (libnximport.so, dev.peanuts.importer.Native)
-# PEANUTS: -PnxGenericHost=true (design/platform/IMPL-GENERIC.md) links one libnxlaunch.so against the one libnxhost.so instead of a pair per title
+# PEANUTS: -PnxGenericHost=true links one libnxlaunch.so against the one libnxhost.so instead of a pair per title
 if(NX_GENERIC_HOST)
   add_library(nxlaunch SHARED nxlaunch.c ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/peanuts/peanuts_jni.c)
   target_include_directories(nxlaunch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/host/android ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../dm/gfx/vk_android)

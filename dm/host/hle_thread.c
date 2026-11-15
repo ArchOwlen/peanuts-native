@@ -689,11 +689,13 @@ static void thr_bt(thr_t *t) {
     }
     plat_thread_resume(t->mport);
 }
+__attribute__((weak)) void dm_audren_dump(void);   // PEANUTS: hle_audren.c (a unit that links this file without it has none)
 void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] handle table use %d / %d, threads created so far %llu\n", nh, MAX_H, g_next_id - 0x51);
     fprintf(stderr, "[dm] same-core handoffs %llu, total %.1f ms\n", (unsigned long long)g_preempt_n, g_preempt_ns / 1e6);
+    if (dm_audren_dump) dm_audren_dump();   // PEANUTS: the audio renderer's state; its render thread (host-created, listed below) is what a stalled audio clock hangs on
     for (thr_t *t = g_all; t; t = t->all) {
         module_t *m = module_of((void *)t->last_lr);
         // Thread name: SDK ThreadType+0x1a0 is the name pointer (ThreadManager::SetInitialThreadNameUnsafe 0x34a2a4); x2 of CreateThread = ThreadType*
@@ -709,7 +711,7 @@ void svc_thread_dump(void) {
         int have_raw = (t->wkind == 1 || t->wkind == 2 || t->wkind == 3) && t->waddr && !plat_mem_read(t->waddr & ~0xfull, raw, 64);
         char life[96]; uint64_t nowns = now_ns();
         if (t->exited) snprintf(life, sizeof life, " created at tick %u, exited at tick %u (%.1f s ago)", t->born_tick, t->exit_tick, (nowns - t->exit_ns) / 1e9); else if (!t->born_ns) snprintf(life, sizeof life, " present since process start"); else snprintf(life, sizeof life, " created at tick %u (%.1f s ago)", t->born_tick, (nowns - t->born_ns) / 1e9);
-        fprintf(stderr, "[dm] thread %#x '%s' priority %d core %d mask %#llx CPU %.2fs svc %llu %s%s%s waits:%s addr=%#llx%s last svc %#x lr=%s+%#llx\n", t->handle, nm, t->prio, t->core, (unsigned long long)t->mask,
+        fprintf(stderr, "[dm] thread %#x '%s'%s priority %d core %d mask %#llx CPU %.2fs svc %llu %s%s%s waits:%s addr=%#llx%s last svc %#x lr=%s+%#llx\n", t->handle, nm, t->host_owned ? " (host-created)" : "", t->prio, t->core, (unsigned long long)t->mask,   // PEANUTS: host-created marked
                 cpu, t->nsvc, t->exited ? "exited" : "", t->started ? "" : "not started", life, kinds[t->wkind & 7], t->waddr, own, t->last_svc,
                 m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr);
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));

@@ -5,16 +5,16 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * A rough free-space check before a build writes anything big (AUDIT/UX-SPEC §3.2, critique-phase1 §1 must-fix 7, critique-phase2a §A must-fix 3: warn-only,
+ * A rough free-space check before a build writes anything big (warn-only,
  * two volumes compared each against only what it needs, no new game.tsv parser).
  * <p>
- * Two volumes matter, and they are compared separately, never against the combined total (critique-phase2a §A-3a):
+ * Two volumes matter, and they are compared separately, never against the combined total (found in review):
  * <ul>
  * <li>the game folder (maybe an SD card), which only needs room for the merged .nup when a base/update/DLC needs importing ({@link #freeBytes} against
  *     {@code importBytes} alone, not import+pack);</li>
  * <li>the app's own external storage, {@code getExternalFilesDir(null)} (AppStorage.java, where {@code AppStorage}/the pack actually lands) — NOT
  *     {@code getFilesDir()}, which is internal storage the pack is never written to — which needs room for the pack, estimated from {@code packBasisBytes}:
- *     the merged .nup's size when importing, else the existing dump-folder/.nup base's own size on disk (critique-phase2a §A-3c: a dump-folder base used to
+ *     the merged .nup's size when importing, else the existing dump-folder/.nup base's own size on disk (found in review: a dump-folder base used to
  *     estimate 0, i.e. "0.5 GB", which is wrong for a multi-GB game; callers must measure the base's real size when it needs no import).</li>
  * </ul>
  * The multiplier below is a flat, uncalibrated guess (no per-game pack_size_hint exists yet): this is why {@link #warning} only ever warns, and
@@ -31,7 +31,7 @@ public final class SpaceEstimate {
         return total;
     }
 
-    /** A dump-folder or .nup base's real size on disk, recursive for a folder (critique-phase2a §A-3c): the basis for the pack estimate when nothing needs
+    /** A dump-folder or .nup base's real size on disk, recursive for a folder (found in review): the basis for the pack estimate when nothing needs
      *  importing (the base already holds everything, updates and DLC included, the way LibraryScanner groups a dump folder's Source) */
     public static long onDiskBytes(File f) {
         if (f == null || !f.exists()) return 0;
@@ -52,16 +52,17 @@ public final class SpaceEstimate {
     /** A folder's free space (its own volume: an SD card's game folder and the app's external storage are usually different volumes, AUDIT F10) */
     public static long freeBytes(File dir) {
         if (dir == null) return Long.MAX_VALUE;   // unknown: never the reason to warn
-        File d = dir.isDirectory() ? dir : dir.getParentFile();
+        File d = dir;   // the nearest folder that exists: a build folder's <title ID>/pack is made by the build itself, and a missing path reads as 0 bytes free
+        while (d != null && !d.isDirectory()) d = d.getParentFile();
         return d == null ? Long.MAX_VALUE : d.getUsableSpace();
     }
 
     /**
-     * A short, one- or two-sentence warning when either volume looks short, each checked against only what it needs, else null (critique-phase2a §A-3a/b).
+     * A short, one- or two-sentence warning when either volume looks short, each checked against only what it needs, else null (found in review).
      * importBytes: the merged .nup's size, relevant only when needsImport (0 otherwise — nothing new is written to the game folder for an existing
      * dump/.nup base); packBasisBytes: {@link #onDiskBytes} of the base when it needs no import, else importBytes again (the .nup about to be written is
      * what the pack step will actually read from); gameDir: where the .nup lands (null: unknown, never warns); appExternal: {@code getExternalFilesDir(null)},
-     * never {@code getFilesDir()} (critique-phase2a §A-3b)
+     * never {@code getFilesDir()} (found in review)
      */
     public static String warning(long importBytes, long packBasisBytes, boolean needsImport, File gameDir, File appExternal) {
         StringBuilder s = new StringBuilder();

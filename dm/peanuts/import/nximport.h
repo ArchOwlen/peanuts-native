@@ -33,8 +33,9 @@ NXIMPORT_API int nximport_write_nup(const char *out_nup, const char **inputs, in
 // The writer's reader threads (decrypt + decompress run in parallel; the .nup is the same whatever the count): n <= 0 = automatic (the NXIMPORT_THREADS
 // environment variable if set, else the online CPUs capped at 6). Set before nximport_write_nup; about 256 MiB of buffers are in flight whatever n.
 NXIMPORT_API void nximport_set_threads(int n);
-// The shared system fonts out of a firmware folder (FontStandard 0100000000000811 → standard.ttf, FontNintendoExtended 0100000000000810 → nintendo_ext.ttf):
-// *.nca files found in the folder and up to two levels below (Eden's nand/system/Contents/registered layout, or a flat folder; a <id>.nca/00 folder too).
+// The shared system fonts out of firmware (FontStandard 0100000000000811 → standard.ttf, FontNintendoExtended 0100000000000810 → nintendo_ext.ttf).
+// firmware_dir is either a folder (*.nca files in it and up to two levels below — Eden's nand/system/Contents/registered layout, or a flat folder;
+// a <id>.nca/00 folder too) or a .zip of the same NCAs flat inside it (nx_zip.c; stored or deflated members, ZIP64 sizes if the zip tool wrote them).
 NXIMPORT_API int nximport_firmware_fonts(const char *firmware_dir, const char *out_dir);
 // Checks a .nup (superblock, TOC SHA-256, bounds) and lists every file: path is "<package>/<exefs|romfs>/<path>" with the package named as a selector
 // (base, update/<version>, addon/<title id>). entry may be NULL (check only); returning non-zero from it stops the listing (not an error).

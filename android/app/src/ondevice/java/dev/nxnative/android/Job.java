@@ -91,6 +91,24 @@ final class Job {
         return j;
     }
 
+    // PEANUTS begin: a modded variant build (dev.peanuts.build.ModdedBuild/Prepare.runModded, DESIGN-MODS.md "Code injection"/"ExeFS binary patch"):
+    // its own job, created the normal way (create()) with its own work/pack folders, carrying the rewrite step's extra argv and reusing the normal
+    // build's own shaders - a normal (unmodded) job never has mod_args set and never calls reuseShaders, so this is additive only.
+    /** The rewrite step's extra argv for a modded build (pack_android.py --modules/--mod-exefs/--mod-patches), one token per line; "" for a normal job.
+     *  PackService's "rewrite" case appends this (split on "\n") to its own argv when non-empty. */
+    synchronized String modArgs() { return o.optString("mod_args", ""); }
+
+    synchronized void modArgs(String joinedArgv) throws JSONException { o.put("mod_args", joinedArgv); }
+
+    /** Skips split/shaders for this job (marks both done) and points its shader cache at the normal pack's own library, the same shape as adopt()'s
+     *  "shaders already current" case above - a code mod never changes shaders, so the variant build always reuses the normal pack's, never retranslates. */
+    synchronized void reuseShaders(File normalPackShaders) throws JSONException {
+        o.put("shader_cache", normalPackShaders.getPath());
+        stepState("split", "done");
+        stepState("shaders", "done");
+    }
+    // PEANUTS end
+
     static Job read(File f) throws IOException {
         try {
             JSONObject o = new JSONObject(new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8));
@@ -330,6 +348,12 @@ final class Job {
 
     /** The step ended in this process (done, failed, paused): its unfinished starts are forgotten. All steps' when the user starts the job again (Retry, Resume) */
     synchronized void ended(String s) { try { step0(s).put("starts", 0); } catch (JSONException e) { throw new IllegalStateException(e); } }
+
+    /** PEANUTS: how many times Android ended this job's process (the job was still "running" when the service started: a sticky restart, or Resume after a kill). Kept
+     *  across the user's Retry, unlike a step's "starts": BuildMemory halves the build's workers for each */
+    synchronized int memLevel() { return o.optInt("mem_level", 0); }
+
+    synchronized void memLevelUp() { try { o.put("mem_level", memLevel() + 1); } catch (JSONException e) { throw new IllegalStateException(e); } }
 
     synchronized void endedAll() { for (String s : STEPS) ended(s); }
 

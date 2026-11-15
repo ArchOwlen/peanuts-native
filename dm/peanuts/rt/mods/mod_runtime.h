@@ -742,9 +742,12 @@ private:
     bool IsVisited(const std::string& area, float wx, float wy) const;
     /// `border_weight` (per pixel, 0..255, may be null) is the grey outline's share of the pixel,
     /// lerped in after the dim so the anti-aliased border never dims and fills stay flat.
+    /// `rect` (x0, y0, x1, y1; x1/y1 exclusive; null = the whole image) limits the pass to those
+    /// pixels (the incremental reveal: only the changed cells' pixels are recomputed).
     void MaskUnvisited(std::vector<u32>& pixels, const std::string& area, int width, int height,
                        const std::vector<u8>* border_weight, const std::vector<u8>* solid_color,
-                       MapFadeEndpoint endpoint = MapFadeEndpoint::Animated) const;
+                       MapFadeEndpoint endpoint = MapFadeEndpoint::Animated,
+                       const std::array<int, 4>* rect = nullptr) const;
     const std::vector<u8>& GeometryMask(const std::string& area); ///< which grid cells have map
     /// Cached mask of the cells belonging to one room_categories entry, keyed
     /// (area, category_id). Replaces the old SpecialRoomMask/TransportRoomMask/EmmyRoomMask (three
@@ -835,6 +838,34 @@ private:
     /// short holds (spinning with a yield, at most 250 us), returns false without the lock while
     /// a raster is in progress or the holder outlasts that.
     bool LockMapStateUnlessRaster(MapStateLock& lock) const;
+    /// PNRT: consecutive LockMapStateUnlessRaster refusals (tick thread), and the total of the waits
+    /// that ended one. A raster that restarts as fast as it ends (a handheld, the CPU canvas path:
+    /// every reveal is a new raster) refused every publish for good and the page stayed on its
+    /// first frame.
+    mutable u32 map_lock_refused_run{0};
+    mutable u32 map_lock_forced_waits{0};
+    /// PNRT: the last complete composite of an area (Animated endpoint) with the reveal cells it
+    /// was built from. A reveal-only change (same pre-fog, border, colour state) copies it and
+    /// recomputes just the pixels of the changed cells instead of the whole 3 Mpx image.
+    /// Guarded by map_state_mutex (GetImage's "map:" span).
+    struct MapCompositeMemo {
+        int w{}, h{};
+        std::shared_ptr<const Image> prefog;
+        std::string border_key, state_suffix;
+        bool unlocked{};
+        std::vector<u8> cells;
+        std::shared_ptr<const Image> image;
+        /// Cell box (c0, r0, c1, r1 inclusive; c1 < c0 = none) that was still fading when built.
+        std::array<int, 4> fading{0, 0, -1, -1};
+        std::string size_key;  ///< "<area>@<w>x<h>"
+        std::string pulse_key; ///< the pulse companion built with `image` ("" = none)
+    };
+    mutable std::map<std::string, MapCompositeMemo> map_composite_memo;
+    /// PNRT counters for the snapshot line: base rasters, composites built (and how many were
+    /// incremental), ms of the last composite and of the last base raster, publishes skipped for
+    /// a busy map.
+    mutable std::atomic<u32> map_base_rasters{0}, map_composites{0}, map_composites_incremental{0},
+        map_last_composite_ms{0}, map_base_last_ms{0}, map_publish_skipped{0}, map_fade_steps{0};
     /// One module map publication (AcceptModuleMap / AcceptModuleMapState), copied out of the
     /// module's buffers so it can be applied after the call returns. Tick thread only.
     struct PendingMapUpdate {

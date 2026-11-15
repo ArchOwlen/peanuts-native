@@ -14,7 +14,8 @@
 
 // The host ABI the rows were checked against: when DMSH_VK_ABI moves, the table is not used (vka_abi_compat_of) until its rows are checked again against the new
 // headers and this line is raised (the unit test t_android_shlib fails meanwhile)
-#define VKA_ABI_COMPAT_FOR "228b73bd10f6"
+// PEANUTS: raised for the kinds TEX_DYN (23) and SAMP_DYN (24) (dmsh_abi_vk.h, 2026-11-14): additive, an older library holds neither, its row differs as before
+#define VKA_ABI_COMPAT_FOR "d9c33f6111c1"
 // The rows' ABIs, space-separated, in the table's order: what the launcher reads (build.gradle NX_DMSH_VK_ABI_COMPAT, ShaderLibs.playable)
 #define DMSH_VK_ABI_COMPAT "674db0a4ff79"
 

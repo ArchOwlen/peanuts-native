@@ -305,6 +305,8 @@ static const char *refusal(const vka_shlib *L, const dmsh_vk_entry *e) {
     }
     const dmsh_vk_bind *b = vka_shlib_binds(L, e);
     for (unsigned i = 0; i < e->bind_count; i++) if (b[i].kind == DMSH_VK_KIND_UNKNOWN) return "a binding the build could not place";
+    for (unsigned i = 0; i < e->bind_count; i++)   // PEANUTS: the fallback arrays of dynamic texture handles (DMSH_VK_KIND_TEX_DYN) only where the profile says the handles come from c2's tables, as Metal's TEXD
+        if ((b[i].kind == DMSH_VK_KIND_TEX_DYN || b[i].kind == DMSH_VK_KIND_SAMP_DYN) && !DM_GAME_TEX_DYN_SLOTS) return "dynamic texture handles (profile key tex_dyn_slots is off)";
     return NULL;
 }
 // A module of a stage sg_plan runs as one lane (no subgroup operations there on this device, or a subgroup size the library is not right for that cannot be pinned) has them
@@ -331,7 +333,7 @@ static void one_lane_env(void) {
     else if (g_one_nenv) VLOG("subgroup_one_lane: %d shader key%s from DM_VK_ONE_LANE", g_one_nenv, g_one_nenv == 1 ? "" : "s");
 }
 static int one_lane_forced(uint64_t key) {
-#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own key list instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+#ifdef DM_RUNTIME_PROFILE   // PEANUTS: the generic host reads the profile's own key list instead of a static const initialized from the macro
     const uint64_t *prof = g_profile.subgroup_one_lane;
 #else
     static const uint64_t prof[] = DM_GAME_SUBGROUP_ONE_LANE;
@@ -677,6 +679,24 @@ int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask) {
     VkShaderModule m = vka_shader_fout_module(s, umask, smask);
     return m && m != vka_shader_module(s, DMSH_VK_MOD_BASE);
 }
+// PEANUTS begin: resolution scale (DM_RES_SCALE, vka_tex.c vka_resscale.inc): what a shader made while it is on does with the translator's scale code: rs_fetch
+// (it reads render_scale[1 + i]: vka_draw.c rs_fetch_fix brings its 2D textures to one scale), and the counts of the `res scale:` statistics line. A shader that
+// fetches or sizes an image by pixel through no helper at all (texture arrays, pool reads, other shapes) reads a scaled image at the wrong texels: the first 16 are named
+static void rs_scan(vka_shader *s, const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m) {
+    size_t nb = 0; char err[96]; uint32_t *w = vka_shlib_spirv(L, m, &nb, err, sizeof err);
+    if (!w) return;
+    uint32_t bind = UINT32_MAX;
+    for (uint32_t k = 0; k < e->bind_count; k++) if (s->b[k].kind == DMSH_VK_KIND_SUPPORT && s->b[k].set == DMSH_VK_SET_DRAW) bind = s->b[k].binding;
+    unsigned fl = vkrs_spv_scan(w, nb / 4, bind);
+    free(w);
+    s->rs_fetch = (fl & VKRS_SPV_TEX) != 0;
+    atomic_fetch_add(&vka_rs_sh[0], 1);
+    if (fl & VKRS_SPV_TEX) atomic_fetch_add(&vka_rs_sh[1], 1);
+    if ((fl & VKRS_SPV_PIXEL) && !(fl & VKRS_SPV_TEX) && atomic_fetch_add(&vka_rs_sh[2], 1) < 16)
+        VLOG("res scale: %s shader %016llx fetches from or sizes an image by pixel with no scale helper (a texture array, a pool read or a shape the translator does not scale): a scaled image it reads that way is read at the texture's coordinates",
+             stage_name(e->stage), (unsigned long long)s->key);
+}
+// PEANUTS end
 vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
     pthread_mutex_lock(&g_mu);
     shent *h = sh_find(key, L);
@@ -694,6 +714,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
         memset(s->fcomp, 0xf, sizeof s->fcomp);
         if (m && V.memu && (e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS)) {}   // drawn through compute: its converted modules are made at its first draw (vka_memu.c)
         else if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module_(L, e, m, key, &why, err, sizeof err, e->stage == DMSH_VK_STAGE_FS && VKA_ENV("DM_VK_FOUT_COMPS", 1) ? s->fcomp : NULL);
+        if (m && !why && vka_rs_on() && s->mods[DMSH_VK_MOD_BASE]) rs_scan(s, L, e, m);   // PEANUTS: DM_RES_SCALE: its use of the translator's scale code (above)
         if (!why && e->stage == DMSH_VK_STAGE_GS && VKA_ENV("DM_VK_GS_CLAIM", 1)) {   // memory writes: made once per primitive (vka_spv_gs_claim)
             char e2[256] = ""; s->gs_fx = gs_words(s, NULL, NULL, e2, sizeof e2);
             if (s->gs_fx < 0) VRED("geometry shader %016llx: memory writes not put under a claim (%s): drawn as it is, its writes repeated by the device's runs of each primitive", (unsigned long long)key, e2);

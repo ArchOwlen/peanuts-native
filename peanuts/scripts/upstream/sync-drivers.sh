@@ -1,7 +1,7 @@
 #!/bin/sh
 # Diff (and, gated, pull) the GPU driver list (DriverFetch.java REPOS[]) from upstream/android.
 #
-# This is NOT "no-risk metadata" (CRITIQUE-phase1.md UPSTREAM §2 must-fix #7): every entry in
+# This is NOT "no-risk metadata" (found in review): every entry in
 # REPOS[] is a URL the app will download and run native code from (a Turnip/Adreno driver). A
 # new entry is a new third-party code source, not an inert label change. This script always
 # prints the diff and never auto-applies; --apply only stages the merge-base-safe checkout (we

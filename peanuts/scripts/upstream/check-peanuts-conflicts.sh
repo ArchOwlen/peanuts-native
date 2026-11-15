@@ -17,7 +17,7 @@ echo
 
 # Search the whole tree except the Peanuts-owned source trees -- a marker there is expected and
 # not a rebase risk. This intentionally covers more than dev/nxnative/android and dm/host (the
-# original draft's scope): CRITIQUE-phase1.md found PEANUTS-relevant hunks scattered across
+# original draft's scope): a review found PEANUTS-relevant hunks scattered across
 # dm/gfx/vk_android, dm/gfx/tools and dm/games too.
 grep -rln 'PEANUTS' -- . \
     ':!peanuts' ':!dm/peanuts' ':!android/app/src/main/java/dev/peanuts' ':!android/app/src/peanuts' ':!PEANUTS.md' \

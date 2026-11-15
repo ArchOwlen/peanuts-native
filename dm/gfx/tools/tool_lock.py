@@ -26,11 +26,14 @@ def xlate_command(path):
     """The command that starts the translator program at path (the apphost dmsh_xlate in dmsh_xlate_bin): [path] where the apphost runs. The apphost in the repository is the
     Mac's; the dlls beside it are portable, so on Windows it is <path>.exe when there is one (an apphost made for Windows), else `dotnet <path>.dll` (the .NET 10 runtime's
     dotnet on PATH, or DOTNET_ROOT's)"""
-    if os.name != 'nt' or os.path.splitext(path)[1].lower() in ('.exe', '.cmd', '.bat'): return [path]
+    # PEANUTS: Linux too starts the dlls with dotnet: the apphost in the repository is a Mach-O file, and starting it there is "Exec format error" (the PC builder on Linux)
+    linux = sys.platform.startswith('linux') and not path.lower().endswith('.dll') and os.path.isfile(path + '.dll')
+    if not linux and (os.name != 'nt' or os.path.splitext(path)[1].lower() in ('.exe', '.cmd', '.bat')): return [path]
     if os.path.isfile(path + '.exe'): return [path + '.exe']
     dll = path if path.lower().endswith('.dll') else path + '.dll'
     root = os.environ.get('DOTNET_ROOT')
-    dotnet = os.path.join(root, 'dotnet.exe') if root and os.path.isfile(os.path.join(root, 'dotnet.exe')) else shutil.which('dotnet') or 'dotnet'
+    exe = 'dotnet.exe' if os.name == 'nt' else 'dotnet'   # PEANUTS
+    dotnet = os.path.join(root, exe) if root and os.path.isfile(os.path.join(root, exe)) else shutil.which('dotnet') or 'dotnet'
     return [dotnet, dll]
 
 NO_RUN = 'does not run'
@@ -44,6 +47,7 @@ def xlate_embedded():
 
 def no_run_message(embedded):
     if os.name == 'nt': return f'the translator {embedded}: it needs the .NET 10 runtime (x64) and dotnet on PATH (winget install Microsoft.DotNet.Runtime.10); unset DOTNET_ROOT if it names another one'
+    if sys.platform.startswith('linux'): return f'the translator {embedded}: it needs the .NET 10 runtime and dotnet on PATH (or DOTNET_ROOT naming it)'   # PEANUTS
     return f'the translator {embedded}: it needs the .NET 10 runtime for this Mac\'s architecture (brew install --cask dotnet-sdk); unset DOTNET_ROOT if it names another one'
 
 def check_tools():

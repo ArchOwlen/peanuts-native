@@ -2,6 +2,8 @@ package dev.peanuts.ui;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -21,8 +23,9 @@ import java.util.Map;
  * A game's sheet (SPEC.md): a Banana dialog (PUi.sheet, Close as the negative button) of Setting rows: its base, the update that goes in (the newest found;
  * Choose another… picks a file), its DLC (the ones matched by title ID; Add… picks more), its companion from the catalog ("Install after the build" toggle), then
  * Build (Rebuild for a ready game), which hands the sheet's {@link State} to the build pipeline through {@link Library#startBuild} and closes: progress lives on the
- * game's card. Without prod.keys an NSP/XCI's Build is off, with "Add keys…" beside it (the keys picker; the sheet re-renders when they land). A game this app has
- * no profile for gets Profile.missing's sentence only.
+ * game's card. Keys and firmware fonts are a one-time setup requirement (owner, 2026-11-13): without either, Build is off here, with "Add keys…"/"Choose
+ * firmware…" beside it (the sheet re-renders once they land); {@link Library#startBuild} checks the same two file-presence flags again as a last line of
+ * defense, so nothing but a cheap check runs on every build once setup is done. A game this app has no profile for gets Profile.missing's sentence only.
  */
 public final class GameSheet {
     static final int REQ_UPDATE = LibrarySettings.REQ_SHEET_UPDATE, REQ_DLC = LibrarySettings.REQ_SHEET_DLC;
@@ -43,7 +46,7 @@ public final class GameSheet {
         public String companionPackage, companionVersion; public boolean installCompanion; public File companionRoot;
         /** The catalog item (CompanionPort.Item), for the installer */
         public Object companionItem;
-        /** The player's explicit "Build anyway" for a version not in the profile's build list (P1, critique-phase1 must-fix 2): never set on its own */
+        /** The player's explicit "Build anyway" for a version not in the profile's build list (P1): never set on its own */
         public boolean buildAnyway;
     }
 
@@ -84,10 +87,29 @@ public final class GameSheet {
         render();
         dialog = PUi.sheet(a, title.name, box).setNegativeButton("Close", null).create();
         dialog.setOnDismissListener(d -> { if (current == this) current = null; });
+        Motion.sheet(dialog);
+        Haptics.quiet(200);   // the focus that lands inside the sheet is silent: the press that opened it was the feedback
         dialog.show();
+        android.widget.Button close = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);   // Close is quiet (cancel is everywhere); the D-pad on it ticks like the rows
+        if (close != null) close.setOnKeyListener(Haptics.KEYS);
+    }
+
+    private PUi.Setting companionRow;   // the Companion row of this render: its switch changes its line in place (a rebuild would cut the switch's own animation)
+
+    /** The Companion row's line, as the sheet's choice and the disk are now */
+    private String companionLine() {
+        String installed = companion == null ? null : CompanionPort.installedVersion(title.companionRoot(), companion.packageName);
+        return companion == null ? "No companion in the catalog for this game"
+                : installed == null ? companion.packageName + " " + companion.version + " · " + size(companion.size) + (installCompanion ? " · Install after the build" : " · Not installed after the build")
+                : installed.equals(companion.version) ? "installed " + installed + " · up to date"
+                : "installed " + installed + " · " + companion.version + " " + (installCompanion ? "after the build" : "available");
     }
 
     private void render() {
+        try { rows(); } finally { Haptics.watch(box); }   // the D-pad's focus haptic on every row, switch and button the sheet has now
+    }
+
+    private void rows() {
         box.removeAllViews();
         String missing = title.status == LibraryScanner.Status.NO_PROFILE ? Upstream.profileMissing(title.titleId, title.name) : null;
         if (missing != null) { PUi.add(box, PUi.body(a, missing), 0); return; }
@@ -111,8 +133,8 @@ public final class GameSheet {
         String up = updateGone ? chosenUpdate.file.getName() + " — this file is no longer where the app found it. Pick it again."
                 : chosenUpdate == null ? (title.updates.isEmpty() ? "None found · Choose…" : "None · Choose…")
                 : chosenUpdate.file.getName() + " · " + versionText(chosenUpdate.version) + (chosenUpdate == newest ? ", the newest found" : "") + " · Choose another…";
-        PUi.add(box, new PUi.Setting(a, "⬆️", "Update", v -> { if (!building) LibrarySettings.pickFile(a, REQ_UPDATE, "Pick the update (.nsp / .xci)"); }).value(up).chevron(a).view, 0);
-        // Version (P1, UX-SPEC §2.2): the version the player has vs. what this build's profile supports, read before Build rather than discovered deep into a run
+        PUi.add(box, new PUi.Setting(a, "⬆️", "Update", v -> { if (!building) { Haptics.play(v, Haptics.Word.TICK); LibrarySettings.pickFile(a, REQ_UPDATE, "Pick the update (.nsp / .xci)"); } }).value(up).chevron(a).view, 0);
+        // Version (P1): the version the player has vs. what this build's profile supports, read before Build rather than discovered deep into a run
         boolean fileGone = baseGone || updateGone;
         if (!fileGone) renderVersionRow();
         // DLC
@@ -120,30 +142,46 @@ public final class GameSheet {
         for (LibraryScanner.Source d : title.dlcs) names.add(d.name.isEmpty() ? d.file.getName() : d.name);
         for (File f : extraDlc) { boolean known = false; for (LibraryScanner.Source d : title.dlcs) if (d.file.equals(f)) known = true; if (!known) names.add(f.getName()); }
         String dl = names.isEmpty() ? "None found · Add…" : names.size() + (names.size() == 1 ? " found: " : " found: ") + String.join(", ", names) + " · Add…";
-        PUi.add(box, new PUi.Setting(a, "➕", "DLC", v -> { if (!building) LibrarySettings.pickFile(a, REQ_DLC, "Pick a DLC (.nsp)"); }).value(dl).chevron(a).view, 0);
-        if (!extraDlc.isEmpty()) PUi.add(box, PUi.button(a, "Forget the DLC you added", PUi.Kind.QUIET, v -> { extraDlc.clear(); saveDlc(); render(); }), 0, PUi.wrap());
+        PUi.add(box, new PUi.Setting(a, "➕", "DLC", v -> { if (!building) { Haptics.play(v, Haptics.Word.TICK); LibrarySettings.pickFile(a, REQ_DLC, "Pick a DLC (.nsp)"); } }).value(dl).chevron(a).view, 0);
+        if (!extraDlc.isEmpty()) PUi.add(box, PUi.button(a, "Forget the DLC you added", PUi.Kind.QUIET, v -> { Haptics.play(v, Haptics.Word.CLICK); extraDlc.clear(); saveDlc(); render(); }), 0, PUi.wrap());
         // Companion
         File root = title.companionRoot();
         String installed = companion == null ? null : CompanionPort.installedVersion(root, companion.packageName);
         boolean canInstall = companion != null && !companion.version.equals(installed);
-        String cs = companion == null ? "No companion in the catalog for this game"
-                : installed == null ? companion.packageName + " " + companion.version + " · " + size(companion.size) + (installCompanion ? " · Install after the build" : " · Not installed after the build")
-                : installed.equals(companion.version) ? "installed " + installed + " · up to date"
-                : "installed " + installed + " · " + companion.version + " " + (installCompanion ? "after the build" : "available");
-        PUi.Setting comp = new PUi.Setting(a, "🖥️", "Companion", null).value(cs);
-        if (canInstall) comp.toggle(a, installCompanion, (v, on) -> { installCompanion = on; PeanutsPrefs.installCompanion(a, title.titleId, on); render(); });
+        PUi.Setting comp = new PUi.Setting(a, "🖥️", "Companion", null).value(companionLine());
+        companionRow = comp;
+        // the switch: only the row's line depends on it (the build reads the choice when it starts), so the line is written in place and the rows stay
+        if (canInstall) comp.toggle(a, installCompanion, (v, on) -> {
+            Haptics.toggle(v, on);
+            installCompanion = on;
+            PeanutsPrefs.installCompanion(a, title.titleId, on);
+            if (companionRow == comp) comp.value(companionLine());
+        });
         PUi.add(box, comp.view, 0);
-        // P2.5: "Versions…" opens the Companion Versions sheet (dev.peanuts.ui.CompanionVersions, another agent's package) when the catalog has this title at
+        // P2.5: "Versions…" opens the Companion Versions sheet (dev.peanuts.ui.CompanionVersions) when the catalog has this title at
         // all. onClose: installedVersion (above) is read live from disk on every render, not cached in a field here, so re-rendering after a rollback/switch
-        // is the whole refresh — critique-phase2a §B's "cached state goes stale" note, satisfied without a separate cache to invalidate
-        if (companion != null) PUi.add(box, PUi.button(a, "Versions…", PUi.Kind.QUIET, v -> dev.peanuts.ui.CompanionVersions.open(a, title.titleId, this::render)), 2, PUi.wrap());
+        // is the whole refresh — the review's "cached state goes stale" note, satisfied without a separate cache to invalidate
+        if (companion != null) PUi.add(box, PUi.button(a, "Versions…", PUi.Kind.QUIET, Haptics.on(Haptics.Word.TICK, v -> dev.peanuts.ui.CompanionVersions.open(a, title.titleId, this::render))), 2, PUi.wrap());
+        // Launcher support (owner request, LAUNCHERS.md): a pinned shortcut that starts this title through dev.nxnative.android.FrontendLaunch's own
+        // title_id path (FRONTENDS.md) — a ready game starts at once, a game not yet built opens Home with it instead. Shown whenever the launcher
+        // supports pinning (dev.peanuts.launch.GameShortcuts.supported), not only for a READY title, matching how Home's own Add-to-home-screen entry
+        // (upstream, FRONTENDS.md) is not restricted to ready games either
+        if (dev.peanuts.launch.GameShortcuts.supported(a))
+            PUi.add(box, PUi.button(a, "Add to home screen", PUi.Kind.QUIET, Haptics.on(Haptics.Word.CLICK, v -> addToHomeScreen())), 2, PUi.wrap());
         PUi.add(box, PUi.divider(a), 12, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, PUi.dp(a, 1)));
-        // Build
-        boolean needKeys = title.base != null && title.base.needsImport() && !PeanutsPrefs.hasKeys(a);
-        if (needKeys) {
+        // Build prerequisites (owner, 2026-11-13): keys and firmware fonts are a one-time setup requirement, checked cheaply (file presence only, never
+        // re-validated against the importer here) before any build starts — not just an NSP/XCI import. A missing firmware font can crash some games at
+        // boot (dm/games/01008CF01BAAC000/README.md). This chip and the two buttons below stop appearing anywhere once both are in the app.
+        boolean needKeys = !PeanutsPrefs.hasKeys(a);
+        boolean needFonts = !PeanutsPrefs.hasFonts(a);
+        boolean missingSetup = needKeys || needFonts;
+        if (missingSetup) {
+            String what = needKeys && needFonts ? "Keys and firmware are needed before building."
+                    : needKeys ? "Keys are needed before building."
+                    : "Firmware is needed before building.";
             LinearLayout r = PUi.row(a);
-            r.addView(PUi.warnChip(a, "Keys needed", "Keys needed", "Importing an NSP or XCI decrypts it with your own prod.keys. Add them, then Build."));
-            TextView t = PUi.small(a, "Importing an NSP needs your prod.keys.");
+            r.addView(PUi.warnChip(a, "Setup needed", "Setup needed", what));
+            TextView t = PUi.small(a, what);
             t.setPadding(PUi.dp(a, 10), 0, 0, 0);
             r.addView(t, PUi.weight());
             PUi.add(box, r, 14);
@@ -151,17 +189,22 @@ public final class GameSheet {
         if (title.base == null) PUi.add(box, PUi.body(a, "No base game found. Only an update or DLC is in the folder."), 14);
         if (fileGone) PUi.add(box, PUi.body(a, "Pick the file again above before building."), 14);
         if (building) PUi.add(box, PUi.small(a, "Building now: the progress is on the game's card."), 14);
-        // Space needed (P4/SpaceEstimate, warn-only: critique-phase1 must-fix 7 — never disables Build, the multiplier is uncalibrated)
+        // Space needed (P4/SpaceEstimate, warn-only — never disables Build, the multiplier is uncalibrated)
         renderSpaceLine();
         boolean unsupported = chosenVersionState() == LibraryScanner.VersionState.UNSUPPORTED;
         LinearLayout actions = PUi.row(a);
         PUi.Action build = PUi.action(a, R.drawable.ic_build, ready ? "Rebuild" : unsupported ? "Build anyway" : "Build", PUi.Kind.PRIMARY, v -> startBuild());
-        build.setEnabled(!building && title.base != null && !needKeys && title.home != null && !fileGone);
+        build.setEnabled(!building && title.base != null && !missingSetup && title.home != null && !fileGone);
         actions.addView(build, PUi.weight());
         if (needKeys) {
             LinearLayout.LayoutParams lp = PUi.wrap();
             lp.leftMargin = PUi.dp(a, 10);
-            actions.addView(PUi.button(a, "Add keys…", PUi.Kind.SOFT, v -> LibrarySettings.pickKeys(a)), lp);
+            actions.addView(PUi.button(a, "Add keys…", PUi.Kind.SOFT, Haptics.on(Haptics.Word.TICK, v -> LibrarySettings.pickKeys(a))), lp);
+        }
+        if (needFonts) {
+            LinearLayout.LayoutParams lp = PUi.wrap();
+            lp.leftMargin = PUi.dp(a, 10);
+            actions.addView(PUi.button(a, "Choose firmware…", PUi.Kind.SOFT, Haptics.on(Haptics.Word.TICK, v -> LibrarySettings.pickFirmwareSource(a))), lp);
         }
         PUi.add(box, actions, 14);
     }
@@ -169,7 +212,7 @@ public final class GameSheet {
     private static String size(long bytes) { return bytes >= 1 << 20 ? String.format(Locale.US, "%.1f MB", bytes / 1048576.0) : String.format(Locale.US, "%.0f KB", bytes / 1024.0); }
 
     /**
-     * The version state of whichever file is actually chosen right now (critique-phase2a §A must-fix 1): {@code title.versionState} (LibraryScanner) is
+     * The version state of whichever file is actually chosen right now (found in review): {@code title.versionState} (LibraryScanner) is
      * computed from {@code title.version()}, the newest update found on disk — not the file the player picked with "Choose another…", which can be an
      * older, or an unlisted, file. Recomputing this live on every render (instead of caching it) means {@link #picked} needs no extra step to stay current:
      * calling {@code render()} after a pick is already enough. Returns UNKNOWN when there is no profile build data to compare against (never blocks or warns)
@@ -182,7 +225,7 @@ public final class GameSheet {
     }
 
     /**
-     * The Version row (P1, UX-SPEC §2.2): "You have" is the chosen update's version (else the base's), "This build supports" lists the profile's builds with
+     * The Version row (P1): "You have" is the chosen update's version (else the base's), "This build supports" lists the profile's builds with
      * the recommended one marked. Nothing is shown for UNKNOWN (no profile builds data: never a reason to block or warn)
      */
     private void renderVersionRow() {
@@ -235,7 +278,7 @@ public final class GameSheet {
     }
 
     /**
-     * A dump-folder or .nup base's size on disk, cached across sheet opens by title ID (critique-phase2b §A-1: Engage's dump folder alone is 206,874
+     * A dump-folder or .nup base's size on disk, cached across sheet opens by title ID (found in review: Engage's dump folder alone is 206,874
      * files — one base, the game's exefs plus romfs, so the recursive {@code SpaceEstimate.onDiskBytes} walk is real filesystem I/O, not a quick stat, and
      * must never run on the UI thread). A title's base rarely changes between sheet opens, and this is only ever a cosmetic estimate, so a process-lifetime
      * cache (never invalidated by a rescan) is an acceptable trade for not re-walking a 200K-file dump every time its sheet opens
@@ -244,7 +287,7 @@ public final class GameSheet {
     private boolean computingSpace;   // this sheet instance already started the background walk for its base — render() runs again once, not on every pass
 
     /**
-     * The "Needs about X GB" line (P4/SpaceEstimate §3.2, critique-phase2a §A must-fix 3, critique-phase2b §A-1): warn-only, never disables Build. Compares
+     * The "Needs about X GB" line (P4/SpaceEstimate §3.2): warn-only, never disables Build. Compares
      * the game folder's volume against only the import size, and the app's external storage volume (not internal — {@code getExternalFilesDir(null)},
      * where AppStorage actually puts the pack) against only the pack size, whose basis is the merged .nup's size when importing, else the existing base's
      * real size on disk. For a dump-folder/.nup base not yet in {@link #ON_DISK_CACHE}, this renders "Checking space…" and kicks off exactly one background
@@ -276,8 +319,13 @@ public final class GameSheet {
             return;
         }
         long packBasis = needsImport ? importBytes : (cachedBasis != null ? cachedBasis : 0L);
+        // A build folder (Settings - Library - Build folder), when set, is where this title's .nup and pack both go instead: measure its volume, not the
+        // game folder's / the app's own storage
+        File buildGameDir = PeanutsPrefs.buildGameDir(a, title.titleId);
         String gameDir = PeanutsPrefs.gameDir(a);
-        String warn = SpaceEstimate.warning(importBytes, packBasis, needsImport, gameDir == null ? null : new File(gameDir), a.getExternalFilesDir(null));
+        File importDest = buildGameDir != null ? buildGameDir : (gameDir == null ? null : new File(gameDir));
+        File packVolume = buildGameDir != null ? new File(buildGameDir, "pack") : a.getExternalFilesDir(null);
+        String warn = SpaceEstimate.warning(importBytes, packBasis, needsImport, importDest, packVolume);
         if (warn != null) PUi.add(box, PUi.warnChip(a, "Low disk space", "Low disk space", warn + " Build still works; it may just run out partway through."), 14);
         else {
             long need = SpaceEstimate.totalNeeded(importBytes, packBasis, needsImport);
@@ -302,7 +350,7 @@ public final class GameSheet {
 
     /**
      * The same {@link State} {@link #state()} would build, rebuilt from a title and its persisted sheet choices (PeanutsPrefs) with no sheet open — for the
-     * build card's "Resume" (critique-phase2a §A must-fix 2): it must actually resume the job, not just reopen the sheet. The job itself resumes on its own
+     * build card's "Resume" (found in review): it must actually resume the job, not just reopen the sheet. The job itself resumes on its own
      * (Prepare.java's existing job.json path); this only has to reconstruct the same request the sheet would have sent
      */
     static State resumeState(Activity a, LibraryScanner.Title t, CompanionPort.Item companion) {
@@ -327,7 +375,7 @@ public final class GameSheet {
     }
 
     /**
-     * Build, or Build anyway: for an UNSUPPORTED version (P1, critique-phase1 must-fix 2) this always asks first — Prepare.java never relaxes the check on its
+     * Build, or Build anyway: for an UNSUPPORTED version (P1) this always asks first — Prepare.java never relaxes the check on its
      * own any more, so without this confirm the build would just stop and ask again from the failed card instead of going on
      */
     private void startBuild() {
@@ -342,10 +390,11 @@ public final class GameSheet {
     private void doStartBuild(boolean anyway) {
         State s = state();
         s.buildAnyway = anyway;
-        if (s.base == null) { Toast.makeText(a, "No base game found", Toast.LENGTH_SHORT).show(); return; }
-        if (s.home == null) { Toast.makeText(a, "Set the game folder first (Settings › Library)", Toast.LENGTH_LONG).show(); return; }
+        if (s.base == null) { Haptics.play(box, Haptics.Word.REJECT); Toast.makeText(a, "No base game found", Toast.LENGTH_SHORT).show(); return; }
+        if (s.home == null) { Haptics.play(box, Haptics.Word.REJECT); Toast.makeText(a, "Set the game folder first (Settings › Library)", Toast.LENGTH_LONG).show(); return; }
         String why = lib.startBuild(s);
-        if (why != null) { new AlertDialog.Builder(a).setTitle("Build").setMessage(why).setPositiveButton("OK", null).show(); return; }
+        if (why != null) { Haptics.play(box, Haptics.Word.REJECT); new AlertDialog.Builder(a).setTitle("Build").setMessage(why).setPositiveButton("OK", null).show(); return; }
+        if (lib.building(title.titleId)) Haptics.play(box, Haptics.Word.HEAVY);   // the build was accepted (a refusal by the pipeline says so in its own dialog)
         dialog.dismiss();
     }
 
@@ -369,7 +418,24 @@ public final class GameSheet {
         render();
     }
 
-    /** The keys landed (Add keys…): Build comes on */
+    /**
+     * Add to home screen (owner request, LAUNCHERS.md): pins a shortcut for this exact title ID, with the library's own cover art as its icon. The
+     * icon file is read off the UI thread (it can be a disk read the same as {@link #renderSpaceLine}'s walk, and on a game whose cover has not been
+     * fetched yet {@link LibraryScanner#icon} itself may call out to the importer); {@link dev.peanuts.launch.GameShortcuts#pin} only ever receives
+     * this title's own titleId and name, never a path, so the shortcut it builds can only ever point back at a title the library itself scanned
+     */
+    private void addToHomeScreen() {
+        String titleId = title.titleId, name = title.name;
+        new Thread(() -> {
+            File f = LibraryScanner.icon(a, title);
+            Bitmap cover = f == null ? null : BitmapFactory.decodeFile(f.getPath());
+            a.runOnUiThread(() -> dev.peanuts.launch.GameShortcuts.pin(a, titleId, name, cover));
+        }, "peanuts-shortcut").start();
+    }
+
+    /** The keys landed (Add keys…): Build comes on if firmware fonts are there too. NOTE for the owner of LibrarySettings.java (not touched here): only
+     *  copyKeys calls this today; extractFonts does not call it after "Choose firmware…" lands fonts, so a sheet already open needs closing and reopening
+     *  to notice new fonts. Calling this from extractFonts's UI.post the same way keysLanded does would close that gap. */
     void keysChanged() { render(); }
 
     private void saveDlc() {

@@ -16,7 +16,10 @@ import java.io.File;
  * The host gets these as plain paths (DM_SAVE, the pack folder), as before. Android removes the folder with the app; the manifest's hasFragileUserData lets the user
  * keep it on uninstall. Save backups stay on shared storage (&lt;Switch2&gt;/save-backups/&lt;id&gt;: Prefs.backupsDir), so they outlive an uninstall either way.
  */
-final class AppStorage {
+// PEANUTS: class and pack() made public (was package-private) so dev.peanuts.build.ModdedBuild/Prepare can ask for a modded variant's own pack
+// folder by its variant id, the same call every other pack lookup already goes through (AppStorage.pack(c, titleId) - here titleId is a variant id
+// like "<TITLEID>-mod-<hash>", ModStore.variantId, which this method treats as an ordinary title id: it only ever builds a path and recovers a swap).
+public final class AppStorage {
     private AppStorage() {}
 
     static File root(Context c) {
@@ -30,9 +33,15 @@ final class AppStorage {
     /** The folder that holds the packs (packs/&lt;title ID&gt;) */
     static File packs(Context c) { return new File(root(c), "packs"); }
 
-    /** A game's pack folder in app storage; a swap that stopped part way (PackZip.swapIn) is put back first */
-    static File pack(Context c, String titleId) {
+    /** A game's pack folder: in app storage when it is there already, else the build folder's {@code <title ID>/pack} when the user set one (Settings ›
+     *  Library › Build folder) — a new build then lands there instead of the app's own storage, organized by title ID; an existing pack already in app
+     *  storage keeps using it, so setting the folder later never moves anything. A swap that stopped part way (PackZip.swapIn) is put back first. */
+    public static File pack(Context c, String titleId) {
         File p = new File(packs(c), titleId);
+        if (!new File(p, "pack.tsv").isFile()) {   // PEANUTS: no pack in app storage yet; a build folder, if set, is where a NEW one goes (PeanutsPrefs.buildPackDir)
+            File build = dev.peanuts.PeanutsPrefs.buildPackDir(c, titleId);
+            if (build != null) p = build;
+        }
         PackZip.recover(p);
         return p;
     }

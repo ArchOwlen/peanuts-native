@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 static _Thread_local char nx_errbuf[512];
 void nx_err(const char *fmt, ...) {
@@ -144,7 +145,11 @@ int nx_container_open(NxContainer *c, const char *path) {
     c->fd = open(path, O_RDONLY | O_CLOEXEC);
     if (c->fd < 0) { nx_err("cannot open %s: %s", path, strerror(errno)); return -1; }
     struct stat st; if (fstat(c->fd, &st) || !S_ISREG(st.st_mode)) { nx_err("%s is not a file", path); goto fail; }
+#ifdef POSIX_FADV_SEQUENTIAL
     (void)posix_fadvise(c->fd, 0, 0, POSIX_FADV_SEQUENTIAL);   // the importer streams: a larger readahead window
+#elif defined(F_RDAHEAD)
+    (void)fcntl(c->fd, F_RDAHEAD, 1);   // macOS has no posix_fadvise: its readahead switch (on by default; asked for all the same)
+#endif
     uint8_t h[0x400]; if ((uint64_t)st.st_size < 0x400) { nx_err("%s: too small", path); goto fail; }
     if (nx_pread_all(c->fd, h, sizeof h, 0)) goto fail;
     if (!memcmp(h, "PFS0", 4)) { c->kind = 0; if (read_fs0(c, 0, 0, NULL)) goto fail; }
@@ -669,8 +674,21 @@ static int nacp_strings(NxNca *ctl, char name[256], char publisher[256]) {
     NxNode *root = nx_romfs_tree(ctl, s); if (!root) return -1;
     NxNode *f = nx_node_find(root, "control.nacp"); uint8_t *b = NULL; int rc = -1;
     if (f && !f->is_dir && f->size >= 0x3000 && !nx_node_read_whole(f, &b, 0x4000)) {
-        for (int i = 0; i < 16; i++) { const uint8_t *e = b + 0x300 * i; if (e[0]) { snprintf(name, 256, "%.255s", (const char *)e); snprintf(publisher, 256, "%.255s", (const char *)e + 0x200); rc = 0; break; } }   // entry 0 is AmericanEnglish
+        // A control.nacp of system 20.0.0 and later may hold its titles deflated: the byte at 0x3215 is 1, the first two bytes are the deflated length and
+        // the raw deflate stream that follows inflates to 32 entries of 0x300 bytes (Breath of the Wild 1.9.0's update). Read as plain text they are noise
+        uint8_t *tl = NULL; int nt = 16; const uint8_t *tb = b;
+        if (f->size >= 0x3216 && b[0x3215] == 1) {
+            unsigned cl = b[0] | (unsigned)b[1] << 8; z_stream zs; memset(&zs, 0, sizeof zs);
+            if (cl && cl <= 0x3000 - 2 && (tl = calloc(1, 0x6000)) && inflateInit2(&zs, -15) == Z_OK) {
+                zs.next_in = b + 2; zs.avail_in = cl; zs.next_out = tl; zs.avail_out = 0x6000;
+                int zr = inflate(&zs, Z_FINISH); inflateEnd(&zs);
+                if ((zr == Z_STREAM_END || zr == Z_OK || zr == Z_BUF_ERROR) && zs.total_out >= 0x300) { tb = tl; nt = (int)(zs.total_out / 0x300); }
+            }
+            if (tb == b) { nx_err("control.nacp: its deflated titles could not be read"); free(tl); free(b); nx_node_free(root); return -1; }
+        }
+        for (int i = 0; i < nt; i++) { const uint8_t *e = tb + 0x300 * i; if (e[0]) { snprintf(name, 256, "%.255s", (const char *)e); snprintf(publisher, 256, "%.255s", (const char *)e + 0x200); rc = 0; break; } }   // entry 0 is AmericanEnglish
         if (rc) rc = 0;
+        free(tl);
     }
     free(b); nx_node_free(root); return rc;
 }

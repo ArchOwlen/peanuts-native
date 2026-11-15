@@ -12,7 +12,7 @@ if (!nxGames) throw new GradleException('nxGames: no game (gradle.properties nam
 nxGames.each { g ->
     if (!(g ==~ /[0-9A-F]{16}/)) throw new GradleException("nxGames: each game must be a title ID (16 upper-case hex digits), not $g")
 }
-// PEANUTS: -PnxGenericHost=true builds one libnxhost.so/libnxlaunch.so for nxGames instead of one compiled-in pair per title (design/platform/IMPL-GENERIC.md).
+// PEANUTS: -PnxGenericHost=true builds one libnxhost.so/libnxlaunch.so for nxGames instead of one compiled-in pair per title.
 // Each title still needs its own runtime profile data (dm/peanuts/profile/gen_runtime_profile.py), packed into assets below, not a compiled header.
 def nxGenericHost = providers.gradleProperty('nxGenericHost').getOrElse(providers.gradleProperty('nxApp').getOrElse('') == 'peanuts' ? 'true' : 'false') == 'true'   // PEANUTS: on by default for the Peanuts app; -PnxGenericHost=false gives one host per title
 // -PnxPlay=true builds a second app (dev.nxnative.android.play, "Banana Native") that installs beside the test app, so test installs leave it alone
@@ -41,6 +41,12 @@ def gitOut = { List<String> a -> try { providers.exec { commandLine(['git'] + a)
 def commit = gitOut(['rev-parse', '--short=12', 'HEAD'])
 def branch = gitOut(['rev-parse', '--abbrev-ref', 'HEAD'])
 def dirty = gitOut(['status', '--porcelain', '--untracked-files=no']) ? '+dirty' : ''
+// PEANUTS: what the Peanuts Native app shows as its build, in place of branch@commit[+dirty]: "peanuts-native-<version>" for the release (-PnxRelease=true, its
+// -PnxVersion) and "peanuts-native-<version>-dev" for every other build, <version> then being the one in work (peanuts/VERSION, unless -PnxVersion names one).
+// The commit stays in each log's "nxnative <version> (<commit>)" line. Empty for any other app
+def peanutsVersionFile = file('../../peanuts/VERSION')
+def peanutsVersion = providers.gradleProperty('nxVersion').getOrElse(peanutsVersionFile.isFile() ? peanutsVersionFile.text.trim() : '0.0.0')
+def nxPeanutsId = nxApp == 'peanuts' ? "peanuts-native-${peanutsVersion}" + (nxRelease ? '' : '-dev') : ''
 // Lossless Scaling frame generation (GPL-3.0-or-later, dm/gfx/vk_android/lsfg): in by default, which makes the APK GPL-3.0-or-later; -PnxLsfg=false builds without it (the packer's libdmsh_xlate.so is GPL-3.0-or-later too: android/NOTICE.md)
 def nxLsfg = providers.gradleProperty('nxLsfg').getOrElse('true') != 'false'
 // Preparing the game on the phone (android/ONDEVICE.md): "+ Add game" on a dump without a usable pack offers Prepare, which runs PackService (a foreground service
@@ -94,8 +100,16 @@ def stampOf = { String game -> def f = new File(repo, "dm/games/$game/vk_delta.t
     deltaCurrent(game, ls) ? ls.findAll { it ==~ /stamp\t[0-9a-f]{12}\t[0-9a-f]{64}\t[0-9a-f]{64}/ }.collect { it.split('\t').drop(1).join(':') }.join(';') : '' }
 // and last what Game resolution sets for it (Profile.resolutionEnv): "window" with window_fn or res_levels rows (DM_WINDOW_SIZE: the window, or a cap on a dynamic
 // resolution), "scale:<choice>=<scale>/<console|handheld>,…" with graphics_scale rows (DM_GRAPHICS_SCALE and DM_OPMODE), empty when it has none (the launcher then offers no
-// Game resolution for it)
-def resolutionOf = { String game -> !tsvRows(game, 'window_fn').isEmpty() || !tsvRows(game, 'res_levels').isEmpty() ? 'window' : tsvRows(game, 'graphics_scale').with { rs -> rs.isEmpty() ? '' : 'scale:' + rs.collect { c -> "${c[1].trim()}=${c[2].trim()}/${c[3].trim()}" }.join(',') } }
+// Game resolution for it). A game with a render_cfg row gets "render:<min output height>:<original WxH>:<render_cfg max_render WxH>:<rt_pool's own MiB>:<MiB=WxH>/…:<out_h>"
+// instead (the rt_pool fields empty without that row): the Resolution, Upscaling quality and Graphics quality rows (Profile.renderCfg; DM_WINDOW_SIZE, DM_RENDER_PCT, DM_GFX_QUALITY)
+def renderOf = { String game ->
+    def rc = tsvRows(game, 'render_cfg'); if (rc.isEmpty()) return ''
+    def kv = rc[0].drop(8).findAll { it.contains('=') }.collectEntries { def p = it.trim().split('=', 2); [(p[0]): p[1]] }
+    def rp = tsvRows(game, 'rt_pool').collect { r -> r.collect { it.trim() } }
+    def pool = rp.isEmpty() ? '::' : rp[0][5] + ':' + rp[0].drop(6).findAll { it ==~ /\d+=\d+x\d+/ }.join('/') + ':' + (rp[0].find { it.startsWith('out_h=') }?.substring(6) ?: '0')
+    "render:${kv['min'] ?: '720'}:${kv['original'] ?: ''}:${kv['max_render'] ?: ''}:${pool}"
+}
+def resolutionOf = { String game -> !renderOf(game).isEmpty() ? renderOf(game) : !tsvRows(game, 'window_fn').isEmpty() || !tsvRows(game, 'res_levels').isEmpty() ? 'window' : tsvRows(game, 'graphics_scale').with { rs -> rs.isEmpty() ? '' : 'scale:' + rs.collect { c -> "${c[1].trim()}=${c[2].trim()}/${c[3].trim()}" }.join(',') } }
 // The RomFS checks (game.tsv romfs_check rows, as "<path>|<line>|<expected or main>", ';' between them: Profile.romfsChecks, RomfsCheck.java)
 def romfsChecksOf = { String game -> tsvRows(game, 'romfs_check').findAll { it.size() >= 4 }.collect { c -> [c[1].trim(), c[2].trim(), c[3].trim().replaceAll(/[\\"]/, ' ')].join('|') }.join(';') }
 // The profile's GPU timestamp mode (game.tsv gpu_timestamps: segment or submission, the host's default when it has no row): Game settings › GPU timing names it as "Game default"
@@ -138,10 +152,16 @@ def optionsOf = { String game ->
         [env, label, desc, mode, implies, needs].collect { it.replaceAll(/[\t\n\\"]/, ' ').replaceAll(/[;|]/, ',').trim() }.join('|')
     }.join(';')
 }
-// The 3D scene overlays for Advanced (game.tsv scene_scale rows, only with a scene_scale_palette row: dm/tools/scene_res.py): "<name>|<label>|<scale>|<mode>", ';' between them (Profile.scenes, SceneRes)
-def sceneOf = { String game -> tsvRows(game, 'scene_scale_palette').isEmpty() ? '' : tsvRows(game, 'scene_scale').findAll { it.size() >= 4 }.collect { c ->
-    def name = c[1].trim(); def label = c.size() > 4 ? c.drop(4).join(' ').trim() : name
-    [name, label ?: name, c[2].trim(), c[3].trim()].collect { it.replaceAll(/[\t\n\\"]/, ' ').replaceAll(/[;|]/, ',').trim() }.join('|') }.join(';') }
+// The 3D scene choices for Advanced (or 3D scene): the overlays (game.tsv scene_scale rows, only with a scene_scale_palette row: dm/tools/scene_res.py), "<name>|<label>|<scale>|<mode>",
+// then the game arguments (scene_arg rows: dm/games/game.py scene_args checks them), "<name>|<label>|<scale or ->|arg|<arguments with {s} replaced>"; ';' between them (Profile.scenes, SceneRes)
+def sceneOf = { String game ->
+    def clean = { String s -> s.replaceAll(/[\t\n\\"]/, ' ').replaceAll(/[;|]/, ',').trim() }
+    def label = { c, String name -> (c.size() > 4 ? c.drop(4).join(' ').trim() : name) ?: name }
+    def overlays = tsvRows(game, 'scene_scale_palette').isEmpty() ? [] : tsvRows(game, 'scene_scale').findAll { it.size() >= 4 }.collect { c ->
+        [c[1].trim(), label(c, c[1].trim()), c[2].trim(), c[3].trim()].collect(clean).join('|') }
+    def args = tsvRows(game, 'scene_arg').findAll { it.size() >= 5 }.collect { c ->
+        [c[1].trim(), label(c, c[1].trim()), c[2].trim(), 'arg', c[3].trim().split(/\s+/).collect { it.replace('{s}', c[2].trim()) }.join(' ')].collect(clean).join('|') }
+    (overlays + args).join(';') }
 // The Resolution presets (game.tsv res_preset rows, the first the default; a floor:H / fixed:H scene needs a scene_scale_palette row and the window's scene_output row, else the
 // row is left out; dm/tools/scene_res.py checks the rows): "<id>|<label>|<window>|<default, floor or fixed>|<height>|<output width>|<output height>|<measured or open>", ';' between them (Profile.presets, ResPresets)
 def presetsOf = { String game ->
@@ -154,6 +174,11 @@ def presetsOf = { String game ->
         if (m == null || (m[0] != 'default' && (!pal || o == null))) return null
         [id, label ?: id, win, m[0], m[1], o ? o[0][0] : '0', o ? o[0][1] : '0', o ? o[1] : 'open'].collect { it.replaceAll(/[\t\n\\"]/, ' ').replaceAll(/[;|]/, ',').trim() }.join('|')
     }.findAll { it != null }.join(';') }
+// The Resolution choices that earlier profiles had (game.tsv res_preset_from rows, "<old id> <id>"): "<old id>=<id>", ';' between them (Profile.presetFrom, ResPresets.mapStored).
+// A row naming an id the profile does not offer, or an old id that is still a preset, is left out (dm/tools/scene_res.py res_presets refuses it)
+def presetFromOf = { String game ->
+    def ids = presetsOf(game).split(';').findAll { it }.collect { it.split('\\|')[0] }
+    tsvRows(game, 'res_preset_from').findAll { it.size() >= 3 && it[1].trim() ==~ /[A-Za-z0-9_-]+/ && it[2].trim() in ids && !(it[1].trim() in ids) }.collect { it[1].trim() + '=' + it[2].trim() }.join(';') }
 // The pixel shaders the game's Speedhack setting drops (game.tsv skip_layers: shader keys, comma separated), or empty. The launcher then offers the toggle (Prefs.skipLayersGame)
 def skipLayersOf = { String game -> tsvRows(game, 'skip_layers').with { rs -> rs.isEmpty() || rs[0].size() < 2 ? '' : rs[0][1].trim().replaceAll(/[^0-9a-fA-F,]/, '') } }
 // The recommended settings per phone (game.tsv recommend rows: "<match> <setting>=<value> …", in order, a later matching row winning; Recommend.java, dm/games/README.md
@@ -200,7 +225,10 @@ def recommendOf = { String game ->
         }
         match + '|' + set.join(' ')
     }.join(';') }
-def nxProfiles = nxGames.collect { g -> [g, nameOf(g).replaceAll(/[\t\n\\"]/, ' '), shaderTotalOf(g), shaderInputsOf(g), buildsOf(g), reqsOf(g), statusOf(g), deltaOf(g), stampOf(g), resolutionOf(g), romfsChecksOf(g), gpuTsOf(g), windowOf(g), decoupleOf(g), drsOf(g), fpsLimitOf(g), dlssOf(g), presentOnlyOf(g), stepsOf(g), tsvRows(g, 'mesh_vegetation_cut').isEmpty() ? '' : '1', optionsOf(g), sceneOf(g), presetsOf(g), skipLayersOf(g), recommendOf(g), variantsOf(g)].join('\\t') }.join('\\n')
+def linkPlayOf = { String game -> tsvRows(game, 'link_play').any { it.size() > 1 && it[1].trim() == '1' } ? '1' : '' }   // opt-in join settings only for profiles with checked Link Play
+def aspectsOf = { String game -> tsvRows(game, 'aspect').findAll { it.size() > 1 && it[1].trim() }.collect { it[1].trim() }.join(',') }   // game.tsv aspect rows: the picture shapes whose 3D cameras the host follows, no module variant ("21:9,4:3"); Game settings > Aspect ratio
+def handheldGames = nxGames.findAll { g -> tsvRows(g, 'op_mode').any { it.size() > 1 && it[1].trim() == 'handheld' } }.join(' ')   // PEANUTS: the games whose profile says op_mode handheld (ScreenMode's default for them)
+def nxProfiles = nxGames.collect { g -> [g, nameOf(g).replaceAll(/[\t\n\\"]/, ' '), shaderTotalOf(g), shaderInputsOf(g), buildsOf(g), reqsOf(g), statusOf(g), deltaOf(g), stampOf(g), resolutionOf(g), romfsChecksOf(g), gpuTsOf(g), windowOf(g), decoupleOf(g), drsOf(g), fpsLimitOf(g), dlssOf(g), presentOnlyOf(g), stepsOf(g), tsvRows(g, 'mesh_vegetation_cut').isEmpty() ? '' : '1', optionsOf(g), sceneOf(g), presetsOf(g), skipLayersOf(g), recommendOf(g), variantsOf(g), presetFromOf(g), linkPlayOf(g), aspectsOf(g)].join('\\t') }.join('\\n')
 def lockOf = { String key -> def f = new File(repo, 'dm/gfx/tools/dmsh_chain.lock'); f.isFile() ? (f.readLines().find { it.startsWith(key + '\t') }?.split('\t')?.getAt(1) ?: 'unknown') : 'unknown' }
 
 android {
@@ -221,6 +249,8 @@ android {
         buildConfigField 'String', 'NX_COMMIT', "\"${commit ?: 'unknown'}\""
         buildConfigField 'String', 'NX_BRANCH', "\"${branch ?: 'unknown'}\""
         buildConfigField 'String', 'NX_DIRTY', "\"${commit ? dirty : ''}\""
+        buildConfigField 'String', 'NX_PEANUTS_HANDHELD', "\"$handheldGames\""   // PEANUTS: see handheldGames above
+        buildConfigField 'String', 'NX_PEANUTS_ID', "\"$nxPeanutsId\""   // PEANUTS: see nxPeanutsId above
         buildConfigField 'boolean', 'NX_LSFG', "$nxLsfg"
         // The play app and the release behave alike (saves/<id>, the user's build tag, no test switches); every other app is a test app
         buildConfigField 'boolean', 'NX_PLAY', "${nxPlay || nxLive}"
@@ -243,7 +273,7 @@ android {
         buildConfigField 'boolean', 'NX_GENERIC_HOST', "$nxGenericHost"   // PEANUTS: Native.java/PackService.java branch on this instead of the per-title libnxhost_<id>.so name
         externalNativeBuild {
             cmake {
-                // PEANUTS: -PnxGenericHost=true (design/platform/IMPL-GENERIC.md) builds one libnxhost.so/libnxlaunch.so that loads any of nxGames' profiles at
+                // PEANUTS: -PnxGenericHost=true builds one libnxhost.so/libnxlaunch.so that loads any of nxGames' profiles at
                 // run time, instead of a compiled-in pair per title - gated here, not on by default, so the per-title path (today's APK) stays available.
                 if (nxGenericHost) {
                     arguments '-DNX_GENERIC_HOST=ON', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON', "-DNX_LSFG=${nxLsfg ? 'ON' : 'OFF'}"
@@ -301,6 +331,44 @@ def nxDigest = tasks.register('nxDigestAssets', Sync) {
 android.sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/nxdigest/assets'))
 tasks.named('preBuild') { dependsOn nxDigest }
 
+// The shared-font stand-in (GameFonts.java, dm/third_party/fonts): Noto Sans Regular, subset, with its licence, copied at every build into the APK's assets/fonts/
+def nxFontAssets = tasks.register('nxFontAssets', Sync) {
+    from(new File(repo, 'dm/third_party/fonts')) { include 'NotoSans-Regular-subset.ttf', 'OFL.txt' }
+    into layout.buildDirectory.dir('generated/nxfonts/assets/fonts')
+}
+android.sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/nxfonts/assets'))
+tasks.named('preBuild') { dependsOn nxFontAssets }
+
+// The Nintendo extension shared font's stand-in (button icons in game text, e.g. "Press L + R"): dm/tools/make_ext_font.py makes assets/fonts/nintendo_ext.ttf at
+// every build where its inputs changed (no font file in the sources); GameFonts places it beside standard.ttf in DM_FONT_DIR (hle_sdk16.c, shared-font type 5).
+// Its letters come from the bundled Noto Sans above (SIL OFL, so the APK ships no system font's glyphs); -PnxLetterFont=<a .ttf> names another. It needs a python3
+// with fontTools (android/environment.yml). Without fontTools the APK is built without it, and the games draw '?' for the icons (said here, and by the host's [YELLOW] line)
+def nxFontOut = layout.buildDirectory.dir('generated/nxextfont/assets/fonts')
+def nxFont = tasks.register('nxExtFont') {
+    def tool = new File(repo, 'dm/tools/make_ext_font.py')
+    def letters = providers.gradleProperty('nxLetterFont').getOrElse(new File(repo, 'dm/third_party/fonts/NotoSans-Regular-subset.ttf').path)
+    inputs.file(tool)
+    inputs.file(letters)
+    outputs.dir(nxFontOut)
+    outputs.upToDateWhen { nxFontOut.get().file('nintendo_ext.ttf').asFile.isFile() }   // one not made (no fontTools then) is tried again at the next build
+    doLast {
+        def out = nxFontOut.get().file('nintendo_ext.ttf').asFile
+        out.parentFile.mkdirs()
+        def cmd = ['python3', tool.path, out.path, letters]
+        def p
+        try { p = new ProcessBuilder(cmd).redirectErrorStream(true).start() } catch (IOException e) { p = null; logger.warn("[RED] nintendo_ext.ttf not made (python3: $e.message): button icons in game text will be drawn as '?'") }
+        if (p != null) {
+            def text = p.inputStream.text
+            if (p.waitFor() != 0 || !out.isFile()) {
+                out.delete()
+                logger.warn("[RED] nintendo_ext.ttf not made: button icons in game text will be drawn as '?' (dm/tools/make_ext_font.py needs fontTools: android/environment.yml)\n" + text.trim())
+            } else logger.lifecycle(text.trim())
+        }
+    }
+}
+android.sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/nxextfont/assets'))
+tasks.named('preBuild') { dependsOn nxFont }
+
 // ./gradlew apk → out/nxnative-android.apk (-PnxPlay=true: nxnative-android-play.apk; -PnxApp=<suffix>: nxnative-android-<suffix>.apk)
 tasks.register('apk', Copy) {
     dependsOn 'assembleRelease'
@@ -357,6 +425,8 @@ if (nxPackEngine == 'native') {
     def toolsZip = tasks.register('nxPackTools', Zip) {
         from(repo) {
             include 'scripts/*.py', 'dm/tools/*.py', 'dm/games/*.py', 'dm/gfx/nvn/*.h'
+            include 'dm/peanuts/profile/mod_memory.tsv'   // PEANUTS: a modded variant's memory numbers, read by gen_runtime_profile.py
+            include 'dm/peanuts/profile/gen_runtime_profile.py'   // PEANUTS: a build with a code mod that adds a module writes its own profile.bin with it (pack_android.py --modules); without the file every such build stopped at "Rewriting the game's code"
             include 'dm/tools/rewriter_equiv/*'   // earlier rewriter files of identical output: their pack keys still count (pack_android.py EQUIV, RewriteKey)
             nxGames.each { include "dm/games/$it/**" }   // the profile of each game the APK runs
             include 'dm/games/*/patches.py'   // every profile's rewriter patches: patch_nso.py lists them all in build_src.sha256, as on the Mac
@@ -397,7 +467,7 @@ if (nxPackEngine == 'native') {
     tasks.named('preBuild') { dependsOn jni, assets }
 }
 
-// PEANUTS: -PnxGenericHost=true (design/platform/IMPL-GENERIC.md): each nxGames title's runtime profile (dm/peanuts/profile/gen_runtime_profile.py) and prewarm
+// PEANUTS: -PnxGenericHost=true: each nxGames title's runtime profile (dm/peanuts/profile/gen_runtime_profile.py) and prewarm
 // seed, generated at build time (never compiled into libnxhost.so) into assets/profiles/<title ID>.profile.bin and .seed. dev.peanuts.build.GenericProfile copies
 // them to app-private storage and sets DM_PROFILE_PATH/DM_PROFILE_SEED (GameActivity.start()); PackService does the same for the on-device Unreal Oodle worker.
 if (nxGenericHost) {
@@ -418,7 +488,7 @@ if (nxGenericHost) {
                 if (p.waitFor() != 0) throw new GradleException("gen_runtime_profile.py ${args.join(' ')} failed:\n$text")
                 text
             }
-            // The build guard (design/platform/IMPL-GENERIC.md §1): fails the whole build loudly if game.py's header() ever emits a macro this generator
+            // The build guard: fails the whole build loudly if game.py's header() ever emits a macro this generator
             // does not know, before any per-title file is written - never a silently wrong or missing profile for one title discovered only on a device.
             logger.lifecycle(run(['check-all']).trim())
             def o = genDir.get().asFile

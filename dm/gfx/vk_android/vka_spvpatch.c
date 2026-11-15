@@ -662,6 +662,16 @@ uint32_t *vka_spv_img_retype(const uint32_t *w, size_t nw, uint32_t base, uint64
             o.w[o.n - len + 1] = cls[v] & 32 ? stwin[vimg[k]][c] : twin[vimg[k]][c];
             i += len; continue;
         }
+        // PEANUTS: a copy of a loaded image is the same image under another id (the dynamic slot arrays' select chains copy the element they load, 71e82538): it takes the twin type too.
+        // Octopath Traveler 0's 43 particle vertex shaders stopped here and read their integer textures through float views, which convert the values: the boost effect's particles
+        // took garbage positions and sizes and covered the battle
+        if (op == OpCopyObject && len == 4 && w[i + 3] < bound && cls[w[i + 3]] && !(cls[w[i + 3]] & 16) && limg[w[i + 3]] && w[i + 2] < bound) {
+            uint32_t x3 = w[i + 3], c = (cls[x3] & 3) - 1, m = limg[x3] - 1;
+            cls[w[i + 2]] = cls[x3]; limg[w[i + 2]] = limg[x3];
+            if (!put_n(&o, in, len)) FAIL("out of memory");
+            o.w[o.n - len + 1] = cls[x3] & 32 ? stwin[m][c] : twin[m][c];
+            i += len; continue;
+        }
         if ((op == OpSampledImage || op == OpImage) && len >= 4 && w[i + 3] < bound && cls[w[i + 3]] && w[i + 2] < bound) {   // a texture and a sampler combined, or the image of a combined one
             uint32_t x3 = w[i + 3], c = (cls[x3] & 3) - 1, m = limg[x3] - 1;
             if (!limg[x3] || (op == OpSampledImage) == ((cls[x3] & 32) != 0)) FAIL("opcode %u on a retyped image of the other kind (id %u)", op, x3);

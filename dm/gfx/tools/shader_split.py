@@ -880,16 +880,29 @@ def pkz_shaders(path, rel, ents, out):
             scan_blob(d, f'/{rel}/{name}', out)
 
 CPK = b'CPK '
-def cpk_jobs(files, parts=64):
+def cpk_jobs(files, parts=64, names=None):   # PEANUTS: names= (the targeted scan's entries, see below)
     """Every entry of every CRI CPK archive in ranges of about equal length (Bayonetta 2: six in the RomFS root, 9.5 GB, 6,091 files, 12 GB of them CRILAYLA-compressed; its shaders are BNSH
-    files in shader.dat, shader2.dat and shadereff.dat, but no file name is relied on). → ([(path, rel, entries), …], the CPK paths)"""
+    files in shader.dat, shader2.dat and shadereff.dat, but no file name is relied on). → ([(path, rel, entries), …], the CPK paths)
+    PEANUTS: names ({rel: entry names}, the targeted scan's, cpk_map_entries): only those entries of that CPK, when it has every one of them (Persona 5 Royal: its 30,646 shaders are in 10
+    GSC files of ALL_USEU.CPK, which the scan otherwise reads whole in 63 ranges, ~30 min of the phone's build); else every entry, as before. The targeted scan's tables are compared with
+    the profile's afterwards (profile_differs), and a difference falls back to the full scan, so a shader outside these entries is never lost"""
     import cpk
     with_head = []
     for p, r in files:
         if p.lower().endswith('.cpk'):
             with open(p, 'rb') as f: h = f.read(4)
             if h != CPK: continue
-            try: with_head.append((p, r, cpk.files(p)))
+            try:
+                es = cpk.files(p)
+                if names and names.get(r):   # PEANUTS: the map's entries only (see the doc above)
+                    # a name is an entry, or a member path inside one ('<entry>/<member>': an archive in the CPK)
+                    ent = {e[0] for e in es}
+                    hit = {n: next((n[:i] for i in [len(n)] + [i for i in range(len(n) - 1, 0, -1) if n[i] == '/'] if n[:i] in ent), None) for n in names[r]}
+                    if all(hit.values()):
+                        want_e = set(hit.values()); keep = [e for e in es if e[0] in want_e]
+                        print(f'targeted CPK: /{r}: {len(keep):,} of {len(es):,} entries hold the shaders of the profile\'s shader_map.tsv; only these are read', flush=True); es = keep
+                    else: print(f'[RED] /{r}: {sum(1 for v in hit.values() if not v):,} of the map\'s entries are not in the CPK; every entry is read', flush=True)
+                with_head.append((p, r, es))
             except (ValueError, struct.error, KeyError, UnicodeDecodeError) as e:   # a layout cpk.py does not read: scanned as a loose file, as before CPKs were read (13 Sentinels and Catherine: Full Body were not checked)
                 print(f'[RED] /{r}: the CPK cannot be read ({e}); scanned as one file', flush=True)
     jobs, step = [], sum(e[3] for _, _, es in with_head for e in es) / parts
@@ -900,6 +913,17 @@ def cpk_jobs(files, parts=64):
             if size >= step: jobs.append((p, r, tuple(cur))); cur, size = [], 0
         if cur: jobs.append((p, r, tuple(cur)))
     return jobs, {p for p, _, _ in with_head}
+
+# PEANUTS: the targeted scan's CPK entries (cpk_jobs' names=): {rel of a .cpk of files: {entry names}} from the map's sources, '/<cpk>/<entry>#…' (cpk_shaders labels each
+# shader '/<rel>/<entry name>' + its container), the entry being the source between the CPK's path and its first '#'
+def cpk_map_entries(files):
+    cpks = {r for _, r in files if r.lower().endswith('.cpk')}
+    if not cpks: return {}
+    out = {}
+    for s in map_sources():
+        r = source_file(s, cpks)
+        if r and len(s) > len(r) + 1 and s[len(r)] == '/': out.setdefault(r, set()).add(s[len(r) + 1:].split('#', 1)[0])
+    return out
 
 def cpk_shaders(path, rel, ents, out):
     """A range of CPK entries (cpk_jobs), each decoded (CRILAYLA or stored) and scanned like a loose file"""
@@ -3005,8 +3029,8 @@ DIRECT = None   # {relative path: ([(member path, kind, offset)], (the map's key
 DIRECT_FORMS = re.compile(r'#BNSH@(0x[0-9a-f]+)#var[0-9]+$|#BAHS@(0x[0-9a-f]+)$|#IDRK@(0x[0-9a-f]+)#GLSLC@0x[0-9a-f]+(#var)?$')
 
 def source_file(s, rels):
-    """The RomFS file of a map source (without its leading '/'): the shortest prefix ending at a '/' or '#' or the end that is a file of the dump (rels), or None"""
-    return next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#'] + [len(s)] if s[:i] in rels), None)
+    """The RomFS file of a map source (without its leading '/'): the shortest prefix ending at a '/', '#' or ':' or the end that is a file of the dump (rels), or None"""
+    return next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#:'] + [len(s)] if s[:i] in rels), None)   # ':' a Unity bundle's member (profile_files)
 
 # PEANUTS: on-device split support (see file header)
 def map_sources(keys=False):
@@ -3111,6 +3135,31 @@ def posix_rel(path, root):   # a file's path in the RomFS, with '/' on every sys
 
 def scan_batch(jobs):   # scan_file over a batch of jobs, in a pool worker
     return [scan_file(j) for j in jobs]
+
+SPILL = int(os.environ.get('DM_SPLIT_SPILL', 32 << 20))   # bytes: a worker's pickled result larger than this comes back through a file (scan_batch_spilled)
+
+def scan_batch_spilled(jobs):
+    """scan_batch in a pool worker, its result pickled here: ('b', bytes) when small, ('f', path) of a temporary file holding it when larger than SPILL.
+    The pool sends a worker's result back through a pipe in one write; on Windows a write of a very large result (one archive's shaders, hundreds of MB)
+    fails with WinError 87 (ERROR_INVALID_PARAMETER) in multiprocessing's PipeConnection, and the split stopped (Pokemon Pokopia, issue #202).
+    unspill reads it back in the parent and deletes the file"""
+    data = pickle.dumps(scan_batch(jobs), protocol=pickle.HIGHEST_PROTOCOL)
+    if len(data) <= SPILL: return 'b', data
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix='dm_split_', suffix='.pkl')
+    try:
+        with os.fdopen(fd, 'wb') as f: f.write(data)
+    except BaseException:
+        _remove(path); raise
+    return 'f', path
+
+def unspill(v):   # scan_batch_spilled's value → scan_batch's result; a file is deleted once read. Read with ResultUnpickler: only the types a scan result holds
+    kind, x = v
+    if kind == 'f':
+        try:
+            with open(x, 'rb') as f: return ResultUnpickler(f).load()
+        finally: _remove(x)
+    return ResultUnpickler(__import__('io').BytesIO(x)).load()
 
 
 class InProcess:
@@ -3277,12 +3326,12 @@ def pooled(ex, jobs, total, start=0, chunk=1, cache=None):
                 kept[first] = r = scan_batch(b); cache.add(first, r); done += len(b)
                 if done == start + len(jobs) or time.monotonic() - shown >= 0.5: print(f'progress: {done}/{total}', flush=True); shown = time.monotonic()
         else:
-            futures = {ex.submit(scan_batch, b): first for first, b in todo}
+            futures = {ex.submit(scan_batch_spilled, b): first for first, b in todo}
             pending = set(futures)
             while pending:   # a timed wait, not as_completed: the count is shown every half second even while one slow range is all that is left
                 finished, pending = cf.wait(pending, timeout=0.5, return_when=cf.FIRST_COMPLETED)
                 for f in finished:   # each result into the cache as it comes
-                    kept[futures[f]] = r = f.result(); cache.add(futures[f], r); done += len(r)
+                    kept[futures[f]] = r = unspill(f.result()); cache.add(futures[f], r); done += len(r)
                 if not pending or time.monotonic() - shown >= 0.5: print(f'progress: {done}/{total}', flush=True); shown = time.monotonic()
     finally:
         AT = None
@@ -3357,7 +3406,8 @@ def main():
         if want is not None:
             big, todo = scan_jobs(files, want)
             dg = scan_digest(inputs, big + todo + mains)
-            print(f'targeted split: {len(want):,} of {len(files):,} RomFS files hold the shaders of the profile\'s shader_map.tsv (main build {", ".join(build_id(m) for m in main_v)}); only these are scanned', flush=True)
+            if not (rd and os.path.isfile(tf := os.path.join(rd, 'targeted.failed')) and open(tf).read().strip() == dg):   # PEANUTS: not on a rerun that an earlier run's targeted.failed sends to the full scan, as before the modes loop
+                print(f'targeted split: {len(want):,} of {len(files):,} RomFS files hold the shaders of the profile\'s shader_map.tsv (main build {", ".join(build_id(m) for m in main_v)}); only these are scanned', flush=True)
             # PEANUTS: on-device split support (see file header) — the direct scan first (DM_SPLIT_DIRECT: the recorded containers of each file, direct_targets), the targeted
             # scan of the whole files when its tables differ; each keeps its own results and its own 'failed' digest (ScanCache's digest with the containers, as the results hold other shaders)
             modes = [('targeted', None, dg)]
@@ -3388,6 +3438,11 @@ def main():
         out = split_tables(list(results), big, todo, dumps, J, common, zdicts, ScanCache(cd, scan_digest(inputs, big + todo + mains)) if cd else None)
     stage('writing the shaders found')
     write_outputs(out, pkg, mapout, factsout, pairsout, psopairsout)
+    if d := os.environ.get('DM_SPLIT_DIFF_DIR'):   # PEANUTS: the tables written, kept as final.<name> (a profile regenerated from a device's full scan: the build deletes its own copies)
+        import shutil
+        os.makedirs(d, exist_ok=True)
+        for p in (mapout, factsout, pairsout, psopairsout):
+            if p and os.path.isfile(p): shutil.copyfile(p, os.path.join(d, 'final.' + os.path.basename(p)))
 
 class Fallback(Exception): pass   # the targeted scan cannot give the full scan's outputs (split_tables)
 
@@ -3417,7 +3472,7 @@ def profile_files(files, main_v):
             if len(c) > 4 and c[0].endswith('.bin') and c[4].startswith('/') and not c[4].startswith(NOT_ROMFS): srcs.add(c[4][1:])
     rels, want = {r for _, r in files}, set()
     for s in srcs:
-        r = next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#'] + [len(s)] if s[:i] in rels), None)
+        r = next((s[:i] for i in [i for i, ch in enumerate(s) if ch in '/#:'] + [len(s)] if s[:i] in rels), None)   # PEANUTS: ':' too, a Unity bundle's member (/Data/data.unity3d:Resources/...: Engage, Castlevania, Brilliant Diamond fell back to the full scan)
         if r is None: return None, f'the profile\'s shader_map.tsv names /{s}, and the dump has no such file'
         want.add(r)
     # the files that hold only copies of shaders found earlier name no row's source, but their variations can pair them anew (Donkey Kong Bananza: 42 of its 15,576
@@ -3440,7 +3495,12 @@ def profile_differs(t, pairsout, psopairsout):
         p = GAME.table(name)
         if text is None or not os.path.isfile(p): continue
         with open(p, encoding='utf-8', newline='') as f: want = absent_tables(name, f.read(), absent)
-        if table_rows(want.encode()) != table_rows(text.encode()): return f'made a {name} that differs from the profile\'s'   # PEANUTS: by rows, not comment lines (table_rows)
+        if table_rows(want.encode()) != table_rows(text.encode()):   # PEANUTS: by rows, not comment lines (table_rows)
+            if d := os.environ.get('DM_SPLIT_DIFF_DIR'):   # PEANUTS: the targeted table and the profile's as compared, to see why a title falls back to the full scan
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, 'targeted.' + name), 'w', encoding='utf-8', newline='') as f: f.write(text)
+                with open(os.path.join(d, 'profile.' + name), 'w', encoding='utf-8', newline='') as f: f.write(want)
+            return f'made a {name} that differs from the profile\'s'
     if absent: print(f'targeted split: compared with the profile\'s tables less the {len(absent)} shader(s) of shader_optional.tsv this dump does not have ({", ".join(sorted(absent)[:3])})', flush=True)
     return None
 
@@ -3485,7 +3545,7 @@ def scan_jobs(files, want=None):
     bd_jobs, bdts = bdt_jobs(files)   # Dark Souls Remastered's dvdbnd archives: the entries of each .bdt by its .bhd5 index, in ranges
     arc_jobs, arcs = smash_arc_jobs(files)   # Super Smash Bros. Ultimate's data.arc: its current files, in ranges
     pz_jobs, pkzs = pkz_jobs(files)   # Bayonetta 3's PKZ archives, Oodle Kraken decoded by the game's own decoder in the Mac host
-    ck_jobs, cpks = cpk_jobs(files)   # Bayonetta 2's CRI CPK archives (CRILAYLA entries)
+    ck_jobs, cpks = cpk_jobs(files, names=cpk_map_entries(files) if want is not None else None)   # Bayonetta 2's CRI CPK archives (CRILAYLA entries); PEANUTS: targeted, the map's entries only
     # Portal's game.zip (Deflate members). A zip is found by its first bytes, so this opens each file it is given: only the wanted ones, since a zip needs no other file
     # (Mario Kart World's 206,326 RomFS files took 29 s here on a Mac and minutes on a Windows PC before the targeted scan had printed anything)
     zp_jobs, zips = zip_jobs(files if want is None else [f for f in files if f[1] in want])
@@ -3509,14 +3569,17 @@ def split_tables(results, big, files, dumps, J, common, zdicts, cache, targeted=
     for rel, uniq, pr, extra in results:
         if extra == 'defer': defer.append(rel)
         elif isinstance(extra, dict): trees.update(extra)
-    if defer and targeted: raise Fallback(f'found Unity serialized files without type trees ({defer[0]}), whose trees may come from files it left out')
+    # PEANUTS: targeted, the second pass is tried too (Fire Emblem Engage's unity default resources borrow a tree the targeted bundles or KNOWN_TREES hold: the targeted scan was
+    # abandoned for all 206,874 files); only a file still without a tree falls back, and the tables are compared with the profile's afterwards as always (profile_differs)
     if defer:
         # a hash no bundle supplied takes the layout unityfs.py has for it (KNOWN_TREES); only here, so files a bundle lends a tree to keep their place in the tables (Ace Attorney's built-ins)
         import unityfs
         for k in unityfs.KNOWN_TREES: trees.setdefault(k, unityfs.known_tree(*k))
         byrel = {r: p for p, r in files}
-        with pool(J, common, trees, zdicts) as ex: again = list(ex.map(scan_file, [(byrel[r], r) for r in defer]))
+        with pool(J, common, trees, zdicts) as ex: again = ([scan_file((byrel[r], r)) for r in defer] if isinstance(ex, InProcess) else   # workers' large results through a file (scan_batch_spilled)
+                     [x for v in ex.map(scan_batch_spilled, [[(byrel[r], r)] for r in defer]) for x in unspill(v)])
         for rel, uniq, pr, extra in again:
+            if extra == 'defer' and targeted: raise Fallback(f'found Unity serialized files without type trees ({rel}), whose trees may come from files it left out')   # PEANUTS: targeted (above)
             if extra == 'defer': red(f'{rel}: Unity serialized file without type trees, and no bundle has a Shader type tree of the same hash to borrow')
         results = [r for r in results if r[3] != 'defer'] + again
     if dumps:

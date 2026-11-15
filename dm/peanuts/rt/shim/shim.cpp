@@ -2,6 +2,7 @@
 // and the pluggable guest-memory accessor.
 
 #include <algorithm>
+#include <set>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -262,6 +263,65 @@ private:
 };
 
 } // namespace
+
+// A game's RomFS under its mods' folders (peanuts_rt.cpp: PnRtConfig::romfs_overlay_dirs)
+class LayeredDir final : public VfsDirectory {
+public:
+    explicit LayeredDir(std::vector<VirtualDir> layers_) : layers{std::move(layers_)} {}
+    std::string GetName() const override {
+        return layers.back()->GetName();
+    }
+    std::string GetFullPath() const override {
+        return layers.back()->GetFullPath();
+    }
+    std::vector<VirtualFile> GetFiles() const override {
+        std::vector<VirtualFile> out;
+        std::set<std::string> seen;
+        for (const auto& l : layers) {
+            for (auto& f : l->GetFiles()) {
+                if (f && seen.insert(f->GetName()).second) out.push_back(std::move(f));
+            }
+        }
+        return out;
+    }
+    std::vector<VirtualDir> GetSubdirectories() const override {
+        std::vector<VirtualDir> out;
+        std::set<std::string> seen;
+        for (const auto& l : layers) {
+            for (const auto& d : l->GetSubdirectories()) {
+                if (d && seen.insert(d->GetName()).second) {
+                    if (auto sub = GetSubdirectory(d->GetName())) out.push_back(std::move(sub));
+                }
+            }
+        }
+        return out;
+    }
+    VirtualFile GetFile(std::string_view name) const override {
+        for (const auto& l : layers) {
+            if (auto f = l->GetFile(name)) return f;
+        }
+        return nullptr;
+    }
+    VirtualDir GetSubdirectory(std::string_view name) const override {
+        std::vector<VirtualDir> subs;
+        for (const auto& l : layers) {
+            if (auto d = l->GetSubdirectory(name)) subs.push_back(std::move(d));
+        }
+        if (subs.empty()) return nullptr;
+        if (subs.size() == 1) return subs.front();
+        return std::make_shared<LayeredDir>(std::move(subs));
+    }
+
+private:
+    std::vector<VirtualDir> layers;
+};
+
+VirtualDir MakeLayeredDir(std::vector<VirtualDir> layers) {
+    std::erase(layers, nullptr);
+    if (layers.empty()) return nullptr;
+    if (layers.size() == 1) return layers.front();
+    return std::make_shared<LayeredDir>(std::move(layers));
+}
 
 VirtualDir OpenHostDirectory(const std::filesystem::path& path) {
     std::error_code ec;

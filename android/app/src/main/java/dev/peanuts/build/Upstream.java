@@ -42,6 +42,15 @@ final class Upstream {
         return f.get(self);
     }
 
+    /** Sets a declared field on self by reflection (the write-side counterpart of {@link #get}) - used by ModdedBuild/Prepare.runModded to redirect a
+     *  freshly made DumpCheck.Result's "work" field at the variant's own work folder before Job.create reads it, instead of DumpCheck's own fixed
+     *  &lt;dump&gt;/../&lt;id&gt;-work convention, so the modded job never shares (and so never fights over) the normal job's job.json. */
+    static void set(Object self, String field, Object value) throws ReflectiveOperationException {
+        Field f = self.getClass().getDeclaredField(field);
+        f.setAccessible(true);
+        try { f.set(self, value); } catch (IllegalAccessException e) { throw new ReflectiveOperationException(field, e); }
+    }
+
     static String str(Object o) { return o == null ? "" : o.toString(); }
 
     // ---- DumpCheck ----
@@ -81,6 +90,13 @@ final class Upstream {
         return s == null ? null : s.toString();
     }
 
+    /** PackCheck.code(c, pack, dump): TRUE when the pack's rewritten code is this APK's rewriter's (its tools, the profile's patches.py and build rows), FALSE when it
+     *  is out of date, null when it cannot be judged */
+    static Boolean packCode(Context c, Object pack, File dump) throws ReflectiveOperationException {
+        Object s = call(k("PackCheck"), null, "code", new Class<?>[] {Context.class, k("Pack"), File.class}, c, pack, dump);
+        return s instanceof Boolean ? (Boolean) s : null;
+    }
+
     /** PackCheck.shaders(packDir, titleId): the shader library's problem, null when current */
     static String packShaders(File packDir, String titleId) throws ReflectiveOperationException {
         Object s = call(k("PackCheck"), null, "shaders", new Class<?>[] {File.class, String.class}, packDir, titleId);
@@ -111,6 +127,16 @@ final class Upstream {
     static void jobTryAnyway(Object job, boolean on) throws ReflectiveOperationException { call(job.getClass(), job, "tryAnyway", new Class<?>[] {boolean.class}, on); }
 
     static boolean jobTryAnyway(Object job) throws ReflectiveOperationException { return Boolean.TRUE.equals(call(job.getClass(), job, "tryAnyway", new Class<?>[0])); }
+
+    /** Job.modArgs(joinedArgv): a modded variant job's extra rewrite-step argv, one token per line (dev.peanuts.build.ModdedBuild.rewriteArgv) */
+    static void jobModArgs(Object job, String joinedArgv) throws ReflectiveOperationException {
+        call(job.getClass(), job, "modArgs", new Class<?>[] {String.class}, joinedArgv);
+    }
+
+    /** Job.reuseShaders(normalPackShaders): skips split/shaders on a modded variant job and points its shader cache at the normal pack's own library */
+    static void jobReuseShaders(Object job, File normalPackShaders) throws ReflectiveOperationException {
+        call(job.getClass(), job, "reuseShaders", new Class<?>[] {File.class}, normalPackShaders);
+    }
 
     // ---- Prefs: the game's own env lines (its Game settings) ----
 

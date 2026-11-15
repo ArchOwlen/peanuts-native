@@ -248,5 +248,5 @@ applies to every change however it was produced. See `peanuts/docs/AGENTS.md` fo
 ## How changes get in
 
 There is no public CI for this project yet (it mirrors Banana Native's own stance: there's no CI on its public repo
-either). The repository does have an `origin` remote (a local bare repo) — there is just no public/GitHub remote yet.
+either).
 Run the checks yourself and say in the PR description what ran, on what device and driver, and what was not checked.

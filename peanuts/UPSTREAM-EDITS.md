@@ -9,7 +9,7 @@ confirmed with `git log --diff-filter=A` + `git cat-file -e upstream/android:<pa
 
 ## Round 2 (2026-11-12) — hunk-level re-check
 
-The critic (`CRITIQUE-phase2a.md` §C) simulated `upstream-update.sh`'s coming `--check` mode: every
+A review simulated `upstream-update.sh`'s coming `--check` mode: every
 added/changed line block vs `git merge-base HEAD upstream/android` must carry a `PEANUTS` marker
 within the hunk or on the line directly above it — a header comment several lines above a later
 hunk in the same file does **not** satisfy a later hunk. Round 1's file-header-only markers on
@@ -51,12 +51,16 @@ brief, these are listed here rather than marked:
 
 | File | Hunk summary (from `git log --author=igawa6 -p`) | Why unmarked | Upstream candidate |
 |---|---|---|---|
-| `dm/gfx/tools/vk_android_build.py` | `vk_android_build.py` changes referenced across several Peanuts commits (worker pool, zstd level plumbing read by `PackService`/`ue_ondevice.py`'s callers) | feeds `DMSH_VK_CHAIN` | Yes — the worker-pool and zstd-level changes are general perf wins (per CRITIQUE-phase1.md §2 must-fix 4), not Peanuts-specific; should go upstream as a PR so this cost stops recurring on every sync |
+| `dm/gfx/tools/vk_android_build.py` | `vk_android_build.py` changes referenced across several Peanuts commits (worker pool, zstd level plumbing read by `PackService`/`ue_ondevice.py`'s callers) | feeds `DMSH_VK_CHAIN` | Yes — the worker-pool and zstd-level changes are general perf wins (per review), not Peanuts-specific; should go upstream as a PR so this cost stops recurring on every sync |
 | `dm/gfx/tools/vk_android_same.tsv` | two added rows mapping our tool digests onto the current chain version | feeds `DMSH_VK_CHAIN` (comparison table, byte-sensitive) | No — these rows are proof-of-no-change evidence for *our* specific chain state; they need to be re-proven against each new upstream chain version, not sent upstream as-is |
+| `dm/gfx/tools/vk_android_spv.py` | `_remap_operands`: OpImageWrite and OpAtomicStore (instructions with no result id) get their own branches, so a promoted local's load is replaced in the image write's coordinate too (2026-11-14, OCTOPATH TRAVELER 0, issue #9: 2,142 of its 2,521 compute shaders failed spirv-val with "ID has not been defined"); `OP_ATOMIC_STORE` constant | feeds `DMSH_VK_CHAIN`; the change moves the chain version (`dmsh_chain_vk.h` 4b1886941d10 → 4ccbdc391b15) | Yes — a plain correctness fix in a translator post-pass; it changes the output only of modules that failed validation before |
 
-No igawa6 commit touches `dm/gfx/tools/vk_android_spv.py`, `dm/gfx/tools/vk_android_delta.py`, or
-`dm/gfx/nvn/dmsh_abi_vk.h`, so there is nothing to log for those three beyond noting they are
-exceptions by the same rule if a future change ever touches them.
+| `dm/gfx/tools/vk_android_spv.py` (2026-11-14, second edit) | `buffer_textures_split`: a buffer texture the translator declares as a combined image and sampler of Dim Buffer becomes a plain sampled Buffer image (UNIFORM_TEXEL_BUFFER, no sampler); `OP_IMAGE` constant (OCTOPATH TRAVELER 0: 6,749 compute, 2,090 vertex and 74 pixel shaders' bindings read as unbound) | feeds `DMSH_VK_CHAIN` | Yes — a general fix: Vulkan has no combined descriptor of a texel buffer |
+| `dm/gfx/tools/vk_android_build.py` (2026-11-14, second edit) | calls `buffer_textures_split` before reflection; the kinds `TEX_DYN` / `SAMP_DYN` for Ryujinx's `<stage>_tb_cb0_40000000` / `_s_cb0_40000000` fallback arrays (profile key `tex_dyn_slots`) | feeds `DMSH_VK_CHAIN` | Yes, with the host side (vka_bind.c) |
+| `dm/gfx/nvn/dmsh_abi_vk.h` | `DMSH_VK_KIND_TEX_DYN` (23) and `DMSH_VK_KIND_SAMP_DYN` (24) | feeds `DMSH_VK_CHAIN` and `DMSH_VK_ABI` | Yes, with the two edits above |
+
+`dm/gfx/tools/vk_android_delta.py` is untouched; it is an exception by the same rule if a future change
+touches it.
 
 ## Marker status of every upstream file we touch
 
@@ -70,17 +74,19 @@ not edited (see table above).
 | `android/app/build.gradle` | marked | no (Peanuts-specific: applicationId/targets/res overlay) |
 | `android/app/.gitignore` | marked | no |
 | `android/app/src/main/AndroidManifest.xml` | marked | no |
+| `android/app/src/main/java/dev/nxnative/android/AppStorage.java` | **fixed this pass (2026-11-13)** — `pack()` routes a new pack to a build folder's `<title ID>/pack` when one is set and the title has no pack in app storage yet | no (Peanuts-specific: `PeanutsPrefs.buildPackDir`, the owner's custom-build-folder feature) |
 | `android/app/src/main/cpp/CMakeLists.txt` | marked | no |
 | `android/app/src/main/java/dev/nxnative/android/GameActivity.java` | marked | no |
 | `android/app/src/main/java/dev/nxnative/android/GameSettings.java` | marked | no |
 | `android/app/src/main/java/dev/nxnative/android/MainActivity.java` | marked | no |
+| `android/app/src/main/java/dev/nxnative/android/PadFocus.java` | marked (2026-11-14, Round 7) | no |
 | `android/app/src/main/java/dev/nxnative/android/Signer.java` | marked (rebrand) | no |
 | `android/app/src/main/java/dev/nxnative/android/Ui.java` | marked (rebrand) | no |
 | `android/app/src/main/java/dev/nxnative/android/Updater.java` | marked (rebrand) | no |
 | `android/app/src/ondevice/AndroidManifest.xml` | marked | no |
 | `android/app/src/ondevice/java/dev/nxnative/android/Job.java` | marked | no |
 | `android/app/src/ondevice/java/dev/nxnative/android/PackService.java` | marked | no (Peanuts-specific worker/env wiring) |
-| `android/host/CMakeLists.txt` | marked (as last checked; may have further changes from a concurrent agent) | no |
+| `android/host/CMakeLists.txt` | marked (as last checked; may have further changes since) | no |
 | `dm/games/01006BB00C6F0000/game.tsv` | **fixed this pass** | no (per-game data row) |
 | `dm/games/01008CF01BAAC000/game.tsv` + `README.md` | **fixed this pass** | no (per-game data row) |
 | `dm/games/0100BA4026E94000/game.tsv` | marked (pre-existing, Castlevania `mem_map_limit off`) | no |
@@ -92,18 +98,21 @@ not edited (see table above).
 | `dm/gfx/vk_android/vka_tex.c` | **fixed this pass** (3 features: buffer textures, NULL-texture clear, sampler table size) | **yes**, all three — MK8D NULL-registration fix, Three Houses sampler-table and buffer-texture fixes are general correctness fixes |
 | `dm/host/crash.c` | **fixed this pass** | **yes** — stripped-library lib+offset printing is a general diagnostics improvement |
 | `dm/host/hle_audren.c` | **fixed this pass** | **yes** — clock-paced render thread fixes AAudio's bursty release cadence generally, not just for Android/Peanuts |
-| `dm/host/hle_fpslock.c` | **fixed this pass** (5 hunks: new lock kind + 2 per-game rows + 2 code paths) | partial — `EXTRA_VSYNCS_U8` kind and its read/write paths are general infra (**yes**); the two per-game rows (Link's Awakening, Echoes of Wisdom) are game tweaks, **candidates to move into a `peanuts.tsv` overlay** once that mechanism exists (CRITIQUE-phase1.md §2 "nice to have"), not upstream PRs |
+| `dm/host/hle_fpslock.c` | **fixed this pass** (5 hunks: new lock kind + 2 per-game rows + 2 code paths) | partial — `EXTRA_VSYNCS_U8` kind and its read/write paths are general infra (**yes**); the two per-game rows (Link's Awakening, Echoes of Wisdom) are game tweaks, **candidates to move into a `peanuts.tsv` overlay** once that mechanism exists ("nice to have"), not upstream PRs |
 | `dm/host/loader.c` | **fixed this pass** (module arena, 1 header + 3 call sites) | **yes** — fixes a real OOB read on Android's top-down mmap layout (Link's Awakening), general to any Android host |
 | `dm/host/plat/plat_android.c` | **fixed this pass** | **yes** — excludes the guard page from the reported stack range, general Bionic-vs-glibc/Darwin correctness fix |
-| `docs/env_switches.tsv` | fixed (drift + new rows, see IMPL-C.md) | n/a (docs) |
+| `docs/env_switches.tsv` | fixed (drift + new rows) | n/a (docs) |
+| `scripts/pack_android.py` | **fixed this pass (2026-11-13)** — `--modules`/`--mod-exefs`/`--mod-patches`, block-marked (Round 5) | no (Peanuts-specific: code mods, DESIGN-MODS.md) |
+| `scripts/pack_android.py` | marked (2026-11-14, PR #13): the AppleDouble skip in `split_shaders`/`swap_in`, `peanuts_env` | partly: the AppleDouble skip yes (summary 11); `peanuts_env` no |
+| `docs/guides/pc-mac-packing.md` | marked (`<!-- PEANUTS begin/end -->` section: send the pack to the phone) | no (Peanuts-specific) |
 
-## Generic host runtime-profile sites (design/platform/IMPL-GENERIC.md, CRITIQUE-generic.md §4)
+## Generic host runtime-profile sites
 
 Behind `-PnxGenericHost=true` only (`DM_RUNTIME_PROFILE`, defined by `dm/peanuts/profile/game_profile_generic.h`); the default per-title build and the
 Mac/iOS Makefile build take the unchanged `#else` branch at every one of these, byte for byte. Listed here so a person rebasing a conflict at one of
 these lines knows the `#ifdef DM_RUNTIME_PROFILE` branch needs the same fix, not just the `#else` one, and so a *new* `DM_GAME_*` macro's two other
 required edits (a `gen_runtime_profile.py` table entry, and - only for a brace-initializer macro - a converted call site here) are not missed on the
-next sync (CRITIQUE-phase1.md F11: upstream added 6 macros in the 73 commits since the fork point).
+next sync (found in review: upstream added 6 macros in the 73 commits since the fork point).
 
 | File : site | Macro(s) | What the runtime branch does |
 |---|---|---|
@@ -120,6 +129,11 @@ next sync (CRITIQUE-phase1.md F11: upstream added 6 macros in the 73 commits sin
 | `dm/host/loader.c` `levels_apply()` | `RES_LEVELS` | reads `g_profile.res_levels[]` |
 | `dm/host/probe.c` `drs_install()` | `DRS_CTL` | reads `g_profile.drs_ctl[]` |
 | `dm/host/hle_fpslock.c` `k_steps`/`NSTEPS` | `FPS_STEPS`/`NFPS_STEPS` | `NSTEPS` becomes the profile's fixed row capacity (it also sizes other file-scope arrays); `k_steps` is a lazily-filled, `pthread_once`-guarded copy of `g_profile.fps_steps[]` |
+| `dm/host/hle_render.c` `k_rcfg`/`k_rq` | `RENDER_CFG`/`NRENDER_CFG`, `RENDER_QUALITY`, `RENDER_DEFAULT_OUT` | `k_rcfg` is `dm_pf_rcfg_rows()` (loader.c), `k_rq` is `g_profile.render_quality`; the count and default output are plain scalars |
+| `dm/host/loader.c` `dm_pf_rcfg_rows()` (new) | `RENDER_CFG` | builds `rcfg_row_t` rows (pointers into `g_profile.render_cfg[].build`) once, `pthread_once`; used by `render_cfg_row()`, `rt_pool_apply()` and hle_render.c |
+| `dm/host/loader.c` `render_cfg_row()`, `rt_pool_apply()` | `RENDER_CFG`/`NRENDER_CFG` | read `dm_pf_rcfg_rows()` instead of a `static const` array |
+| `dm/host/loader.c` `dm_pf_rtpool_rows()` (new), `rt_pool_apply()` | `RT_POOL`/`NRT_POOL` | builds `rtpool_row_t` rows over `g_profile.rt_pool[]` once, `pthread_once` |
+| (no site edit) | `EVENT_WAIT`, `OCCLUSION_SPLIT_PASS`, `LOW_RAM_PLACE_PART_MB`, `LOW_RAM_IMG_CACHE_MAX_MB`, `LOW_RAM_APP_POOL_MB` | scalars read at run time (vka_worker.c, vka_exec.c, vka_tex.c, hle_svc.c); `game_profile_generic.h` maps each to its `g_profile` field |
 | `dm/gfx/vk_android/vka_pso.c` | seed (`vk_prewarm_seed.h`) | not edited: `dm/peanuts/profile/vk_prewarm_seed_generic.h` defines the same `dm_vk_prewarm_seed`/`_len` symbols, set by `profile_rt_load_seed()` |
 | `dm/gfx/vk_android/vka_replay.c` `nxhost_replay()` top | - | calls `profile_rt_load()`/`profile_rt_load_seed()` too (nxreplay needs a profile for its `DM_GAME_ID` capture check) |
 
@@ -141,9 +155,167 @@ Also gated, but not `#ifdef`-paired with upstream code (new Peanuts-owned files/
 8. `dm/gfx/tools/shader_split.py` — on-device worker-pool split + comment-insensitive table compare
 9. `dm/gfx/tools/uepak.py` — off-Mac AES path (`_nxaes`) for the packer
 10. `dm/gfx/tools/vk_android_build.py` (exception, not edited directly, but referenced wiring in
-    `PackService.java`) — worker-pool/zstd-level changes, per CRITIQUE-phase1.md
+    `PackService.java`) — worker-pool/zstd-level changes, per review
+11. `scripts/pack_android.py`: `split_shaders` and `swap_in` move a listing's files by rename; on an exFAT/FAT drive
+    macOS moves each file's AppleDouble `._<name>` with it, so the listing's `._` entry is gone by its turn and the pack
+    stops with FileNotFoundError (found packing Link's Awakening from a .nup on an exFAT drive). Both skip an entry that is
+    gone. The same file's `peanuts_env` (the phone packer's DM_SPLIT_DIRECT=1 and DMSH_VK_ZSTD_LEVEL=6 for a computer's
+    pack) is Peanuts-specific and stays local
 
 `dm/host/hle_fpslock.c`'s new `EXTRA_VSYNCS_U8` lock kind is also upstream-worthy infra; its two
 per-game rows (Link's Awakening, Echoes of Wisdom) should instead move to a Peanuts-owned
 `dm/games/<id>/peanuts.tsv` overlay once that mechanism lands, so upstream's own `k_locks[]` table
 stops needing a local edit at all.
+
+## Round 3 (2026-11-13) — launcher support
+
+Two new upstream hunks, both one-liner hooks per PEANUTS.md rule 2 (its "Allowed hook sites" list was
+updated in the same change to name both sites explicitly):
+
+| File | Hunk | Marker |
+|---|---|---|
+| `android/app/src/main/java/dev/nxnative/android/GameActivity.java` | one new line in `onCreate`, right after the existing `dev.peanuts.Companion.start` hook: `dev.peanuts.launch.RecentGames.touch(...)` | trailing `// PEANUTS: last-3-played dynamic shortcuts (LAUNCHERS.md)` |
+| `android/app/src/main/AndroidManifest.xml` | one new `<activity-alias>` block, `dev.peanuts.launch.LaunchActivity`, beside the existing `${applicationId}.Launch` alias | a `<!-- PEANUTS: ... -->` comment directly above the block |
+
+Both files were already "marked" in the table above for earlier Peanuts hunks; this round adds one more
+hunk to each, still fully marked. No upstream-candidate general fix here: both lines only call out to
+Peanuts-owned code (`dev.peanuts.launch.*`) or declare a Peanuts-owned manifest component. Detail and the
+device-verification checklist: `peanuts/docs/LAUNCHERS.md`.
+
+## Round 4 (2026-11-13) — custom build folder
+
+One new upstream hunk, a minimal marked hook per PEANUTS.md rule 2 (the "Allowed hook sites" list was
+updated in the same change to name the new site):
+
+| File | Hunk | Marker |
+|---|---|---|
+| `android/app/src/main/java/dev/nxnative/android/AppStorage.java` | `pack()`: when app storage has no pack for the title yet, reads a build folder's `<title ID>/pack` (`dev.peanuts.PeanutsPrefs.buildPackDir`) instead of always returning `packs/<title ID>` | trailing/line-above `// PEANUTS: ...` on the new `if` block |
+
+No upstream-candidate general fix: the behaviour only exists because of the Peanuts-owned build-folder
+setting (Settings › Library › Build folder, `PeanutsPrefs.buildDir`); upstream has no such setting to
+route to. Every other site that needed to find a pack in either location (`Folders.packFor`,
+`PackFind.candidates`/`best`, `Prepare`'s job creation, `MainActivity`'s Manage sheet, the companion
+root beside the pack) already takes `AppStorage.pack(...)`'s return value as its one source of truth, so
+none of them needed their own edit — verified by reading each call site, not by a second hook. Details
+and the device-verification checklist: `PEANUTS.md`'s 2026-11-13 "build folder" status entry.
+
+## Round 5 (2026-11-13) — code mods wired into the on-device build
+
+Five upstream hunks, all additive and all behind "nothing given, nothing changes" guards (a normal,
+unmodded build takes none of `--modules`/`--mod-exefs`/`--mod-patches`, never sets `mod_args`, never
+calls `reuseShaders`):
+
+| File | Hunk | Marker |
+|---|---|---|
+| `scripts/pack_android.py` | `--modules`/`--mod-exefs`/`--mod-patches` argparse flags, `merge_mod_modules()`, `apply_mod_patches()`, the variant `profile.bin` write in `main()` | `PEANUTS begin`/`PEANUTS end` blocks (too much logic for a one-line hook, per rule 2's own documented exception for a "genuinely can't be a hook" feature) |
+| `android/app/src/ondevice/java/dev/nxnative/android/Job.java` | `modArgs()`/`modArgs(String)`/`reuseShaders(File)` | `PEANUTS begin`/`PEANUTS end` block after `adopt()` |
+| `android/app/src/ondevice/java/dev/nxnative/android/PackService.java` | the "rewrite" case appends `Job.modArgs()`'s tokens to its argv when not empty | `PEANUTS begin`/`PEANUTS end` block |
+| `android/app/src/main/java/dev/nxnative/android/AppStorage.java` | the class and `pack()` made `public` | a `PEANUTS:` comment directly above the class declaration |
+| `android/app/src/ondevice/AndroidManifest.xml` | one new `<service>` line, `dev.peanuts.build.ModBuildService`, beside the existing `BuildService` line | trailing `<!-- PEANUTS: ... -->` comment |
+
+No upstream-candidate general fix: every one of these exists only to carry a Peanuts-owned feature
+(build-time code mods) through files the normal, unmodded build also uses — none of it is a correctness
+fix to the normal path. `dm/peanuts/profile/gen_runtime_profile.py`'s new `profile-modules` subcommand
+and all of `dev.peanuts.build.ModdedBuild`/`ModBuildService`/`ModBuildPipeline`/`ModBuildRequest` and the
+`dev.peanuts.ui.Upstream.game()` addition are Peanuts-owned new code, not upstream edits, so they are out
+of scope for this file. `dev.peanuts.settings.ModsSection`'s and `dev.peanuts.ui.GameSheet`'s edits are
+Peanuts-owned files too. Full detail, the variant's on-disk layout and the device-test recipe: the mods
+build report (owner's session log) and `PEANUTS.md`'s 2026-11-13 "build-time half" status entry.
+
+## Round 6 (2026-11-14) — code mods whose modules branch into each other
+
+A mod made for the console may branch straight from one module into another (Luminescent Platinum for
+Pokemon Brilliant Diamond 1.3.0: 106 `b`/`bl` patched into main that go to the `subsdk1` it adds, and 1,228
+from that module into main), at the distances the modules have on the console. The packer works those out
+(`dm/tools/xmod.py`, new), the rewriter checks and lists them, the loader aims them again. Upstream hunks,
+all behind "a build without code mods takes none of this":
+
+| File | Hunk | Marker |
+|---|---|---|
+| `dm/tools/patch_nso.py` | `--xmod <layout file>` parsed with the other arguments; `xmod_table()` before the final summary line writes `<module>.xmod.tsv` or refuses the build. Without `--xmod` the output is byte for byte what it was (main and subsdk0 of Pokemon Brilliant Diamond 1.3.0 rewritten before and after: 16 of 16 output files the same, `build_src.sha256` apart, which records the rewriter's own hash), so the file before the change is kept as `dm/tools/rewriter_equiv/patch_nso.py.125819eecaa9` and existing packs stay up to date | a `PEANUTS:` comment and a `PEANUTS begin`/`PEANUTS end` block |
+| `dm/host/loader.c` | `xmod_apply()`/`xmod_apply_all()` and its one call in `load_modules()`, after every module is mapped and before relocation: each row's `imm26` set for the bases the modules got here | `PEANUTS begin`/`PEANUTS end` block, a `PEANUTS:` comment on the call |
+| `scripts/pack_android.py` | `cross_module()`, `xmod_keys()`, the `xmod` argument of `rewrite()`/`upgrade_keys()` (a module rewritten with a layout is keyed with it), an added module placed in the console's order (`merge_mod_modules`), `mod_build` rows in `pack.tsv` for the modules a mod supplies (a `build` row is compared with the game's own file, `BuildCheck.build`) | inside the existing `PEANUTS begin`/`PEANUTS end` blocks, `PEANUTS` comments on the single lines |
+| `android/app/src/ondevice/java/dev/nxnative/android/PackService.java` | the "pack" case appends `Job.modArgs()`'s tokens too: `pack.tsv` listed the game's own modules and the host never loaded the added one | `PEANUTS begin`/`PEANUTS end` block |
+
+Second pass, same day: the addresses such a module keeps as data. The mod's subsdk1 has 116 relative
+relocations whose addend lies outside the module (its GOT entries for globals and functions of main, at the
+console's distance); the first one read stopped the game at subsdk1+0x172b8. `patch_nso.py`'s `xmod_table()`
+lists them as `ptr` rows (the same block; the file before is `rewriter_equiv/patch_nso.py.e9e2bc834168`, the
+output without `--xmod` again byte for byte the same: main and subsdk0, 16 of 16 files), `loader.c`'s
+`xmod_apply()` stores the real address after `relocate()` (the same block, a second marked call),
+`pack_android.py`'s `cross_module()` reads them with `xmod.far_pointers()` (inside its block; `import struct`
+marked).
+
+No upstream-candidate general fix here either. `dm/tools/ips.py`, `dm/tools/patch_ips.py` (a patch's offsets
+count the NSO's 0x100-byte header, as Atmosphère applies them; a patch file named by the whole build ID),
+`dm/tools/xmod.py` and `dev.peanuts.build.ModBuild`/`ModdedBuild`/`Prepare` are Peanuts-owned files.
+
+## Round 7 (2026-11-14) — haptics and motion inside a game's page
+
+The launcher's haptics and motion (`dev.peanuts.ui.Haptics` / `Motion`, the vocabulary of `design/haptics-motion-proposal.md`) reach the page a
+held cover opens, which upstream draws. One hook per widget kind, each a call into `dev.peanuts.ui.Feel` (Peanuts-owned, all the logic); no call
+site of a row, a switch or a dialog is edited. Twelve hunks in four files, every one additive: a listener runs exactly as it did, with a haptic
+before it; with haptics off and motion reduced (Settings › Library) or in another process of the app (the game, the readiness check) the hooks do
+nothing.
+
+| File | Hunks | Hook | Marker |
+|---|---|---|---|
+| `android/app/src/main/java/dev/nxnative/android/Ui.java` | 5 | `Ui.Setting`'s constructor (`Feel.row`: a row's tap), `Ui.Setting.toggle` (`Feel.toggled`: a switch), `Ui.button` (`Feel.button`), `Ui.Segmented` (`Feel.picked`), `Ui.navItem` (`Feel.nav`: a rail entry, and its pane's entrance) | trailing `// PEANUTS: ...` on each line |
+| `android/app/src/main/java/dev/nxnative/android/PadFocus.java` | 2 | `Builder.create()` (`Feel.dialog`: a choice picked in the list), a `setPositiveButton` override (`Feel.confirm`: a confirm button with a listener) | trailing `// PEANUTS: ...`; a `PEANUTS begin`/`PEANUTS end` span |
+| `android/app/src/main/java/dev/nxnative/android/MainActivity.java` | 3 | `gameSettings()` (`Feel.page`: the page enters), `gameSettingsTop()` (`Feel.tab` around `build()`: a tab's tap and L1 / R1), `gameTab()`'s game-files list (`Feel.added`: the rows read off the main thread) | trailing `// PEANUTS: ...` on each line |
+| `android/app/src/main/java/dev/nxnative/android/GameSettings.java` | 2 | the header's Play (`Feel.launch`), `radio()` (`Feel.picked`: its dialog is a plain `AlertDialog.Builder`) | trailing `// PEANUTS: ...` on each line |
+
+`Ui.java` and `PadFocus.java` are shared with upstream's other screens, so those get the same feedback from the same hooks (Home's cards and
+Settings: rows, switches, buttons, choice dialogs, confirms); `dev.peanuts.ui.PUi` stays the copy without them (Peanuts' own screens call
+`Haptics` themselves). No upstream-candidate general fix: every line calls Peanuts-owned code. The list of what plays where:
+`android/app/src/main/java/dev/peanuts/settings/HOOKS.md`, section 4.
+
+## Round 8 (2026-11-14) — Console mode and Resolution scale
+
+Two settings for every game, each a Peanuts-owned file in upstream's launcher package (`Ui.Setting`, `Prefs.of` and `Profile` are package-private there) with
+one-line hooks: `ScreenMode.java` (Console mode: the host's `DM_OPMODE`) and `ResScale.java` (Resolution scale: the host's `DM_RES_SCALE`).
+
+Resolution scale is also a host feature, stage 1 of a general render-target scale. Its logic is in three Peanuts-owned files: `dm/gfx/vk_android/vka_resscale.h`
+(the arithmetic and the module scan, no Vulkan; `dm/host/tests/t_android_resscale.c`, `make android-resscale`), `dm/gfx/vk_android/vka_resscale.inc` (the images:
+included by `vka_tex.c`, since it works on the texture cache's tables under its lock) and `ResScale.java`. The hooks in upstream files, all guarded by
+`vka_rs_on()` or by an image's `rsc` flag (both false with the setting at 1x, where the replay records what it did before):
+
+| File | Hunks | Hook | Marker |
+|---|---|---|---|
+| `dm/gfx/vk_android/vka.h` | 3 | `vka_img.rsc` / `rs_no`; the declarations (`vka_rs_q`, `vka_rs_st`, `vka_rs_mu`, `vka_tex_rs_*`, `vka_rp_rs`, `vka_rs_rect`); `vka_shader.rs_fetch` | trailing `// PEANUTS: ...`; a `PEANUTS begin`/`PEANUTS end` span |
+| `dm/gfx/vk_android/vka_tex.c` | 8 | `g_rswant` and the scaled extent in `img_create_`; the include; `upload()` and the region writes never go into a scaled image; `img_storage_upgrade` and `vka_tex_id_storage_pending` make it 1x for a shader image binding; `rt_gpu` reads it through a 1x scratch image | trailing `// PEANUTS: ...`; a `PEANUTS begin`/`PEANUTS end` span |
+| `dm/gfx/vk_android/vka_draw.c` | 14 | `R.rsc` / `R.rsf`; `vka_rp_rs` (one scale per pass) and `rs_sc` (a scissor in the pass's pixels) with their three uses and `rp_begin`'s call; the viewport; `rs_support` (the support buffer's `render_scale`) and its call; `rs_fetch_fix` and its two calls; the memo's and the walk's resets; the NDSR stand-in's images at 1x | trailing `// PEANUTS: ...`; `PEANUTS begin`/`PEANUTS end` spans |
+| `dm/gfx/vk_android/vka_exec.c` | 9 | `scissored`; `clear_color` / `clear_ds` ask `vka_rp_rs`; `clear_tex`'s region; `copy_bt`; `copy_t2t`'s rectangles and the scaled / unscaled cases; the DLSS stand-in's images at 1x (2); the statistics line | trailing `// PEANUTS: ...`; a `PEANUTS begin`/`PEANUTS end` span |
+| `dm/gfx/vk_android/vka_present.c` | 3 | `present_one` reads the window texture under `vka_rs_mu` and scales the crop; the unlock; `present_main` takes it around `vka_fg_frame` | trailing `// PEANUTS: ...` |
+| `dm/gfx/vk_android/vka_framegen.c` | 1 | the crop in a scaled window texture's pixels | trailing `// PEANUTS: ...` |
+| `dm/gfx/vk_android/vka_shader.c` | 2 | `rs_scan` (what a shader does with the translator's scale code) and its call in `vka_shader_make` | a `PEANUTS begin`/`PEANUTS end` span; trailing `// PEANUTS: ...` |
+| `dm/gfx/vk_android/vka_dev.c` | 1 | `vka_rs_init()` before the present starts | trailing `// PEANUTS: ...` |
+| `dm/gfx/vk_android/vka_ctl.c` | 1 | `DM_RES_SCALE`, `DM_RES_SCALE_POT` in the restart-only names | `/* PEANUTS: ... */` |
+| `dm/host/tests/Makefile` | 1 | `t_android_resscale`, `android-resscale` | a `# PEANUTS begin`/`# PEANUTS end` span |
+| `docs/env_switches.tsv` | 2 rows | `DM_RES_SCALE`, `DM_RES_SCALE_POT` | `(PEANUTS; ...)` in the row |
+| `android/app/src/main/java/dev/nxnative/android/Prefs.java` | 1 | `console_mode`, `res_scale` in `GAME_SETTINGS` (Reset to defaults) | trailing `// PEANUTS: ...` |
+| `android/app/src/main/java/dev/nxnative/android/GameActivity.java` | 2 | `ScreenMode.env`, `ResScale.env` in `settingsEnv` | trailing `// PEANUTS: ...` on each line |
+| `android/app/src/main/java/dev/nxnative/android/GameSettings.java` | 2 | `ScreenMode.row`, `ResScale.row` in Picture | trailing `// PEANUTS: ...` on each line |
+| `android/app/src/main/java/dev/nxnative/android/MainActivity.java` | 2 | `ScreenMode.defaultRow`, `ResScale.defaultRow` in Game defaults | trailing `// PEANUTS: ...` on each line |
+
+Upstream candidate: the host side as a whole is general (nothing in it names a game or Peanuts), but it is a first slice (see the header of
+`vka_resscale.inc` for what scales and what falls back) and has not run on a device yet; not proposed upstream until it has.
+
+### Round 8, after the first device run (2026-11-15): queued region writes and forced image drops
+
+Breath of the Wild at 1.5x aborted after 131 s in `img_destroy` (a second free). The cache gives an image up whatever its reference count in two places
+(eviction, `vka_tex_prune_locked` / `img_evict_locked`, and `vka_tex_drop_pool`), and a queued region write (`mtl_tex_write_region`: WriteTexels) holds its
+image by pointer with a reference only. An image the game writes but has not drawn for two frames can be evicted and freed at once with writes still queued;
+the next prepare then copies into, and releases, whatever has taken the freed `vka_img`'s memory. With the resolution scale that can be the old image of an
+in-place swap (it was made right after a prune, with a count of 1), which the stray release destroys once more than its own callback. Without the scale the
+same stray release lands on a new image of the cache. This is the cause as far as reading the code and a model of it go
+(`dm/host/tests/t_android_imglife.c`, `make android-imglife`; `build/t_android_imglife old` shows the fault); it has not been confirmed on the device.
+
+| File | Hunks | Change | Marker |
+|---|---|---|---|
+| `dm/gfx/vk_android/vka.h` | 1 | `vka_img.rw_pend`: region writes queued for the image | `// PEANUTS: ...` |
+| `dm/gfx/vk_android/vka_tex.c` | 7 | `rw_cancel_locked` and its forward declaration; `mtl_tex_write_region` counts a queued write (and sends a write to a scaled image through the whole upload); the drain skips a cancelled entry and counts down; `vka_tex_prune_locked` does not evict an image with queued writes; `vka_tex_drop_pool` takes them back first | `// PEANUTS: ...` on or above each line |
+| `dm/host/tests/Makefile` | (same span) | `t_android_imglife`, `android-imglife` | inside the `# PEANUTS begin`/`# PEANUTS end` span of Round 8 |
+
+Upstream candidate: yes, the `rw_pend` part (eviction and pool drops against queued region writes) is a general fix, independent of the resolution scale.
+In `vka_resscale.inc` (Peanuts-owned): no prune inside a change of scale any more, and the old image's holder gets a count no stray release can bring to zero.

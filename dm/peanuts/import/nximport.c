@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include "nximport.h"
 #include "nx_internal.h"
+#include "nx_zip.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 int nx_jpeg_to_png(const uint8_t *jpg, size_t n, const char *out_png);   // nx_icon.c
 
@@ -174,7 +176,7 @@ void nximport_set_threads(int n) { nx_threads_setting = n; }
 static int thread_count(void) {
     int n = nx_threads_setting;
     if (n <= 0) { const char *e = getenv("NXIMPORT_THREADS"); if (e && *e) n = atoi(e); }
-    if (n <= 0) { long c = sysconf(_SC_NPROCESSORS_ONLN); n = c > 0 ? (int)c : 2; if (n > 6) n = 6; }
+    if (n <= 0) { int c = nx_cpu_count(); n = c > 0 ? c : 2; if (n > 6) n = 6; }
     return n > 64 ? 64 : n;
 }
 
@@ -466,27 +468,34 @@ out:
     free(b); return rc;
 }
 
-static int font_try_nca(FontJob *fj, const char *path) {
-    NxContainer c; if (nx_container_open(&c, path)) return 0;   // not an NCA we can read: skip
+// The common tail once an NCA's bytes are reachable through some (fd, off, size) — a plain file, or (below) a stored or inflated zip member. c is a
+// caller-built NxContainer naming only fd (no path, no kind): nx_nca_open only ever reads c->fd and e->off/e->size, so this needs nothing else.
+static int font_try_nca_fd(FontJob *fj, int fd, uint64_t off, uint64_t size) {
+    NxContainer c; memset(&c, 0, sizeof c); c.fd = fd;
+    NxEntry e; memset(&e, 0, sizeof e); snprintf(e.name, sizeof e.name, "nca"); e.off = off; e.size = size;
+    NxNca n; fj->found_ncas++;
+    if (nx_nca_open(&n, &c, &e)) return 0;   // header didn't decrypt to NCA3/NCA2, or too small: not a readable NCA, skip quietly
     int rc = 0;
-    if (c.kind == 2) {
-        NxNca n; fj->found_ncas++;
-        if (!nx_nca_open(&n, &c, &c.e[0]) && n.key_ok && (n.title_id == 0x0100000000000810ull || n.title_id == 0x0100000000000811ull)) {
-            int std = n.title_id == 0x0100000000000811ull;
-            if (!(std ? fj->got_std : fj->got_ext)) {
-                int s = nx_nca_find_section(&n, NX_FS_ROMFS); NxNode *root = s >= 0 ? nx_romfs_tree(&n, s) : NULL;
-                if (root) {
-                    NxNode *pick = NULL;
-                    for (int i = 0; i < root->nkids; i++) { NxNode *k = root->kids[i]; size_t l = strlen(k->name); if (k->is_dir || l < 6 || strcmp(k->name + l - 6, ".bfttf")) continue;
-                        if (!pick) pick = k;
-                        if (std ? strstr(k->name, "std") != NULL : (strstr(k->name, "ext_") != NULL && !strstr(k->name, "ext2"))) { pick = k; break; } }
-                    if (pick) { char out[1200]; snprintf(out, sizeof out, "%s/%s", fj->out_dir, std ? "standard.ttf" : "nintendo_ext.ttf"); if (write_bfttf(pick, out)) rc = -1; else *(std ? &fj->got_std : &fj->got_ext) = 1; }
-                    nx_node_free(root);
-                }
+    if (n.key_ok && (n.title_id == 0x0100000000000810ull || n.title_id == 0x0100000000000811ull)) {
+        int std = n.title_id == 0x0100000000000811ull;
+        if (!(std ? fj->got_std : fj->got_ext)) {
+            int s = nx_nca_find_section(&n, NX_FS_ROMFS); NxNode *root = s >= 0 ? nx_romfs_tree(&n, s) : NULL;
+            if (root) {
+                NxNode *pick = NULL;
+                for (int i = 0; i < root->nkids; i++) { NxNode *k = root->kids[i]; size_t l = strlen(k->name); if (k->is_dir || l < 6 || strcmp(k->name + l - 6, ".bfttf")) continue;
+                    if (!pick) pick = k;
+                    if (std ? strstr(k->name, "std") != NULL : (strstr(k->name, "ext_") != NULL && !strstr(k->name, "ext2"))) { pick = k; break; } }
+                if (pick) { char out[1200]; snprintf(out, sizeof out, "%s/%s", fj->out_dir, std ? "standard.ttf" : "nintendo_ext.ttf"); if (write_bfttf(pick, out)) rc = -1; else *(std ? &fj->got_std : &fj->got_ext) = 1; }
+                nx_node_free(root);
             }
         }
-        nx_nca_close(&n);
     }
+    nx_nca_close(&n); return rc;
+}
+
+static int font_try_nca(FontJob *fj, const char *path) {
+    NxContainer c; if (nx_container_open(&c, path)) return 0;   // not an NCA we can read: skip
+    int rc = c.kind == 2 ? font_try_nca_fd(fj, c.fd, c.e[0].off, c.e[0].size) : 0;
     nx_container_close(&c); return rc;
 }
 
@@ -505,12 +514,65 @@ static int font_scan(FontJob *fj, const char *dir, int depth) {
     closedir(d); return rc;
 }
 
+// ---------------------------------------------------------------- firmware fonts, from a .zip (nx_zip.c)
+// A stored member's bytes already sit at a fixed offset in the zip file: font_try_nca_fd reads straight from the zip's own fd, no copy, no zlib.
+// A deflated member has to be decompressed before anything can look at its header (deflate is a sequential stream, not randomly seekable), so it is
+// inflated to one scratch file in out_dir (which nximport_firmware_fonts has already created and is known writable), reusing font_try_nca on that
+// file, then the scratch file is removed either way. This is simpler than streaming the header out of a resumable z_stream and keeping it open in
+// case of a match: a firmware zip's two font archives are small, and most real firmware zips store their members uncompressed anyway (the NCAs
+// inside are already AES-encrypted and partly LZ4-compressed, so a general-purpose zip tool gains little by deflating them again) — the stored path
+// above is the one that actually matters for speed, and is the zero-copy one.
+static int font_try_zip_deflate(FontJob *fj, int zip_fd, uint64_t data_off, uint64_t comp_size, const char *out_dir) {
+    char tmp[1300]; snprintf(tmp, sizeof tmp, "%s/.fontscan.tmp", out_dir);
+    FILE *o = fopen(tmp, "wb"); if (!o) { nx_err("cannot create %s: %s", tmp, strerror(errno)); return -1; }
+    z_stream zs; memset(&zs, 0, sizeof zs);
+    if (inflateInit2(&zs, -15) != Z_OK) { fclose(o); unlink(tmp); nx_err("zip: zlib init failed"); return -1; }   // -15: raw deflate (no zlib/gzip header), the zip member format
+    uint8_t inbuf[1 << 16], outbuf[1 << 16];
+    uint64_t remaining = comp_size, pos = data_off;
+    int zrc = Z_OK, io_err = 0;
+    for (;;) {
+        if (zs.avail_in == 0) {
+            if (!remaining) { zrc = Z_BUF_ERROR; break; }   // ran out of compressed input before inflate reported the stream's end: truncated/bad member
+            size_t want = remaining < sizeof inbuf ? (size_t)remaining : sizeof inbuf;
+            if (nx_pread_all(zip_fd, inbuf, want, pos)) { io_err = 1; break; }
+            zs.next_in = inbuf; zs.avail_in = (unsigned)want; pos += want; remaining -= want;
+        }
+        zs.next_out = outbuf; zs.avail_out = sizeof outbuf;
+        zrc = inflate(&zs, Z_NO_FLUSH);
+        size_t have = sizeof outbuf - zs.avail_out;
+        if (have && fwrite(outbuf, 1, have, o) != have) { io_err = 1; break; }
+        if (zrc == Z_STREAM_END || zrc != Z_OK) break;
+    }
+    inflateEnd(&zs);
+    int close_err = fclose(o);
+    int rc;
+    if (io_err || close_err || zrc != Z_STREAM_END) { if (!io_err) nx_err("zip: inflate failed (zlib code %d)", zrc); unlink(tmp); return -1; }
+    rc = font_try_nca(fj, tmp);
+    unlink(tmp);
+    return rc;
+}
+
+static int font_scan_zip(FontJob *fj, const char *zip_path, const char *out_dir) {
+    NxZip z; if (nx_zip_open(&z, zip_path)) return -1;
+    int rc = 0;
+    for (int i = 0; i < z.n && !rc && fj->got_std + fj->got_ext < 2; i++) {
+        const NxZipEntry *e = &z.e[i];
+        if (e->method == 0) rc = font_try_nca_fd(fj, z.fd, e->data_off, e->size);
+        else if (e->method == 8) rc = font_try_zip_deflate(fj, z.fd, e->data_off, e->comp_size, out_dir);
+        // else: an unsupported compression method (not stored, not deflate) — skip it rather than fail the whole scan over one odd member
+    }
+    nx_zip_close(&z);
+    return rc;
+}
+
 int nximport_firmware_fonts(const char *firmware_dir, const char *out_dir) {
     if (!nx_keys.loaded) { nx_err("keys not loaded (nximport_keys)"); return -1; }
     FontJob fj = { 0, 0, out_dir, 0 };
-    struct stat st; if (stat(firmware_dir, &st) || !S_ISDIR(st.st_mode)) { nx_err("%s is not a folder", firmware_dir); return -1; }
-    if (mkdir(out_dir, 0755) && errno != EEXIST) { nx_err("cannot create %s: %s", out_dir, strerror(errno)); return -1; }
-    if (font_scan(&fj, firmware_dir, 0)) return -1;
+    struct stat st; if (stat(firmware_dir, &st)) { nx_err("cannot open %s: %s", firmware_dir, strerror(errno)); return -1; }
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) { nx_err("%s is neither a folder nor a file", firmware_dir); return -1; }
+    if (nx_mkdir(out_dir, 0755) && errno != EEXIST) { nx_err("cannot create %s: %s", out_dir, strerror(errno)); return -1; }
+    int rc = S_ISDIR(st.st_mode) ? font_scan(&fj, firmware_dir, 0) : font_scan_zip(&fj, firmware_dir, out_dir);
+    if (rc) return -1;
     if (!fj.got_std || !fj.got_ext) {
         nx_err("%s: %s not found among %d NCAs (FontStandard 0100000000000811%s, FontNintendoExtended 0100000000000810%s)", firmware_dir,
                fj.found_ncas ? "the shared font archives were" : "no NCA files", fj.found_ncas, fj.got_std ? " ok" : " missing", fj.got_ext ? " ok" : " missing");

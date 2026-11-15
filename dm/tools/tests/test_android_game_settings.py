@@ -57,7 +57,8 @@ class GameSettingsPage(unittest.TestCase):
         self.assertNotIn('Ui.sheet(this, null, box)', ma)
         self.assertIn('{"Performance", "Game", "Saves", "Storage"}', self.gs)
         self.assertIn('Ui.tabs(a, labels, t, ', self.gs)
-        self.assertIn('Ui.button(a, "Play", Ui.Kind.PRIMARY, v -> a.launch(g))', self.gs, 'Play in the header')
+        # PEANUTS: Play's tap goes through the launcher's feel (dev.peanuts.ui.Feel.launch: the haptic and the fade); what it does is still a.launch(g), in the header
+        self.assertIn('Ui.button(a, "Play", Ui.Kind.PRIMARY, dev.peanuts.ui.Feel.launch(v -> a.launch(g)))', self.gs.split('private static LinearLayout header(')[1].split('return out;')[0], 'Play in the header')   # PEANUTS
         self.assertIn('t.setMaxLines(2);', self.gs.split('private static LinearLayout header(')[1].split('return out;')[0], 'a long name wraps')
         m = ma.split('void gameTab(LinearLayout content, Game g, boolean savesTab) {')[1].split('\n    }\n')[0]
         for s in titles(m): self.assertLessEqual(len(s), MAX_TITLE, s)

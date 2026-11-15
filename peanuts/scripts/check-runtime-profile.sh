@@ -1,12 +1,12 @@
 #!/bin/sh
-# Equivalence gate for the generic host's runtime profile (design/platform/IMPL-GENERIC.md), to run BEFORE any Thor boot test and before trusting
+# Equivalence gate for the generic host's runtime profile, to run BEFORE any Thor boot test and before trusting
 # -PnxGenericHost=true for a real build. For every dm/games/<id> profile (131 at this writing, plus any under DM_GAMES_DIR):
 #   1. dm/games/game.py header <id> <tmp>/<id>/game_profile.h      -- the exact header the per-title Android host compiles today
 #   2. dm/peanuts/profile/gen_runtime_profile.py profile <id> <tmp>/<id>.profile.bin  -- the generic host's runtime data for the same title
 #   3. compiles dump_const (against step 1's header) and, once, dump_runtime (against profile_rt.c) -- both print every DM_GAME_* field as
 #      "name=value" / "name[i]=..." text, in the same order
 #   4. diffs the two outputs field by field; any difference is a real behavior divergence the generic host would have, not a formatting quirk
-#   5. (CRITIQUE-generic.md §2) gen_runtime_profile.py seed <id> <tmp>/<id>.seed, cmp'd against dm/games/<id>/vk_prewarm.bin (or an empty file when the
+#   5. (found in review) gen_runtime_profile.py seed <id> <tmp>/<id>.seed, cmp'd against dm/games/<id>/vk_prewarm.bin (or an empty file when the
 #      title has none) -- the seed is a verbatim byte copy, so this is the one new code path the field-by-field diff above never touches
 #
 # Exits non-zero on the first profile that fails gen_runtime_profile.py's own build guard (an unknown macro - see check-all) or whose dump or seed

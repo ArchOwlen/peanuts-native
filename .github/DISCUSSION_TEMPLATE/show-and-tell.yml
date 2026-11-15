@@ -3,7 +3,7 @@ body:
     attributes:
       value: |
         Show it running on your phone! Say the app version, phone, chip, RAM and GPU driver.
-        **No game files, keys, firmware or links to them**: don't share them, offer them or ask where to get them. Banana Native works with your own dump of a game you own. Posts that break this are edited or removed ([rules](https://github.com/moceure/BananaNative/discussions/23)).
+        **No game files, keys, firmware or links to them**: don't share them, offer them or ask where to get them. Peanuts Native works with your own dump of a game you own. Posts that break this are edited or removed.
   - type: textarea
     id: body
     attributes:

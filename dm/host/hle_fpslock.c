@@ -90,8 +90,17 @@ static const lock_t k_locks[] = {
     // it corroborates that this SDK build has its own present-interval choice to make, independent of main's chain. No side effects
     // (dialogue/animation speed, physics) are documented for either community fix: multiple reports describe "no game-breaking bugs",
     // "performance... mostly the same", consistent with Persona 5 Royal's engine stepping by real time rather than by the frame, unlike
-    // Animal Crossing: New Horizons (see dm/games/01006F8002326000/README.md and IMPL-FPS60.md, which found the opposite for that game).
+    // Animal Crossing: New Horizons (see dm/games/01006F8002326000/README.md, which found the opposite for that game).
     { "d4b150b29a931cd381e2a30318fc299f", "Persona 5 Royal present interval", 0x2327b90, 0xf14, VSYNCS_I32, 1, 0, 3, {0x10, 0x60, 0x8} },
+    // PEANUTS: per-game lock rows (Pokemon Sword / Shield 1.3.2, TICKS_U32)
+    // Game Freak's engine keeps a table of frame times in ns by present interval at main+0x203eeb0 (u64: 16666667, 33333334, 50000000, 66666667,
+    // 83333334; the same offset in both mains). The game runs in mode 1 (interval 2, 33333334 ns) and divides the measured frame time by its
+    // entry (Sword main+0x680fc4, main+0x687fc8). The community's 60 fps patch for 1.3.2 passes 1 to the present interval call (Sword
+    // main+0x18a2c88, Shield main+0x18a2d18) and makes the interval-2 entry 16666667; here the row writes the entry's low word (the high word
+    // is 0) and, being an engine row, makes presentation follow the cap instead of the game's interval 2 (hle_nvn.c fps_present_cap)
+    { "a3b75bcd3311385aeed67fbeeb79cbb7", "Game Freak frame time of interval 2", 0, 0x203eeb8, TICKS_U32, 1, 1000000000 },
+    { "a16802625e7826bf83b6f9708e475b91", "Game Freak frame time of interval 2", 0, 0x203eeb8, TICKS_U32, 1, 1000000000 },
+    // PEANUTS end
     // Pokemon Brilliant Diamond 1.3.0: Unity's Application.targetFrameRate. Its icall registration (main+0xe34e60) resolves to main+0xdc8e70 -> +0x5fa640,
     // which stores w0 at main+0x4afc868; the getter at +0x5fa630 reads the same int32. The game sets 30 when entering the field; display pacing alone does not remove that cap.
     { "94ceae325c205c4b9d6f7235552f28fd", "Unity targetFrameRate", 0, 0x4afc868, FPS_I32, 1 },
@@ -128,7 +137,7 @@ static const lock_t k_locks[] = {
 // 0..2 (STEPS_HOLD), which keeps it; 60 and 0 leave the game's own mode (it runs 2 steps on a frame that overran: full speed at 60 or below). Each step stays 1/60 s, so the race,
 // ghosts, time trials and online races step as at 60. DM_FPS_STEPS_ROWS: the unit tests' own rows
 typedef struct { const char *build; uint64_t ptr_off; uint32_t mode, count; uint8_t nderef; uint16_t deref[3]; } steps_row_t;
-#if defined(DM_RUNTIME_PROFILE) && !defined(DM_FPS_STEPS_ROWS)   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro (design/platform/IMPL-GENERIC.md)
+#if defined(DM_RUNTIME_PROFILE) && !defined(DM_FPS_STEPS_ROWS)   // PEANUTS: the generic host reads the profile's own table instead of a static const initialized from the macro
 // NSTEPS also sizes other file-scope static arrays below (NROWS, steps[], g_st[], nlog/over/orig/have_orig[]), which need a compile-time bound: use the
 // profile's fixed row capacity, not the runtime row count. Every slot past the real count has an empty build string (profile_rt.h/gen_runtime_profile.py
 // zero-pad unused rows), and every k_steps[] reader below already checks build[0] first, so the extra always-empty slots are inert, not a behavior change.
@@ -138,7 +147,7 @@ static void k_steps_fill(void) {   // dm_pf_fps_steps_t has the same field names
     for (int i = 0; i < NSTEPS; i++) { dm_pf_fps_steps_t *s = &g_profile.fps_steps[i];
         k_steps_buf[i] = (steps_row_t){ s->build, s->ptr_off, s->mode, s->count, (uint8_t)s->nderef, {(uint16_t)s->deref[0], (uint16_t)s->deref[1], (uint16_t)s->deref[2]} }; }
 }
-static const steps_row_t *k_steps_get(void) { pthread_once(&k_steps_once, k_steps_fill); return k_steps_buf; }   // CRITIQUE-generic.md hygiene: was an unguarded flag (a benign race in practice)
+static const steps_row_t *k_steps_get(void) { pthread_once(&k_steps_once, k_steps_fill); return k_steps_buf; }   // Found in review: was an unguarded flag (a benign race in practice)
 #define k_steps k_steps_get()
 #else
 #ifndef DM_FPS_STEPS_ROWS
@@ -426,7 +435,7 @@ static int32_t sead_rate_pick(double dt, double *debt) {
 static struct { uint64_t ctl; double debt, game_s, wall_s; uint32_t presents, frames; struct timespec last, last_log; int32_t rate; } g_sr;
 // On or off: the Android launcher's "Full game speed at low frame rates" (Game settings, and the in-game panel live: nxhost_fps_decouple_set), else DM_FPS_DECOUPLE
 // at the first frame (default on; the launcher passes DM_FPS_DECOUPLE=0 for a start with the setting off). Off, the gate leaves the controller's 60 / interval as it is
-// (the game as on the console) and lets go of the pin; on again, it starts from a fresh measurement. Read at every frame, so a change applies at the next one
+// (the game's own step; the pin still holds interval 1 where presentation follows the host's tick, sead_pin_wanted); on again, it starts from a fresh measurement. Read at every frame, so a change applies at the next one
 static _Atomic int g_decouple = -1;
 static const char *g_decouple_src;
 __attribute__((visibility("default"))) void nxhost_fps_decouple_set(int on) {
@@ -468,17 +477,30 @@ static void sead_rate_at(uint64_t *r, int param, struct timespec now) {
 // OBS_SEAD_RATE: on the game's main thread, once a frame, before the controller's sdiv. Also holds the controller's longest interval at 1 where the interval does not
 // pace the game (sead_pin)
 static void sead_pin(uint64_t ctl, int on);
+static int limit_raw(void);
+// Whether the controller's longest interval is held at 1. Wherever presentation follows the host's tick (DM_PRESENT_INTERVAL=display, the Android default of the profiles
+// that set it) with no frame rate cap, a frame lasts 1/60 s on screen whatever interval the game picked, so the game must not step 1/30 s (60 / 2) for it: that was the 2x
+// speed phases of #207 (Donkey Kong Bananza; the controller flips 1 <-> 2 after a few late frames). This holds whether or not Full game speed (decoupling) is on: decoupling
+// only changes the step's dividend (the measured rate), the pin keeps it from being the interval's. 0.2.4 pinned unconditionally; 0.2.9 (ad509ad8) made the pin follow
+// the setting, so off released it: the regression. Left free: a cap (dm_fps_target), where the cap's interval is the right step, and, with decoupling off, a frame limit below
+// 60 (the limiter then holds the presents to 30 or 40 and the game's own 60 / interval at its longer interval is the right step; interval 1 would run it slow). With decoupling
+// on, the measured rate is the step whatever the limit, so the limit does not matter
+static int g_sead_display = -1;   // the unit tests reset it
+static int sead_pin_wanted(int decoupled) {
+    if (g_sead_display < 0) { const char *m = getenv("DM_PRESENT_INTERVAL"); g_sead_display = m ? !strcmp(m, "display") : DM_GAME_PRESENT_DISPLAY; }
+    if (!g_sead_display || dm_fps_target() != 0) return 0;
+    int l = limit_raw();
+    return decoupled || l == 0 || l >= 60;
+}
 static void sead_rate_gate(uint64_t *r, int param, struct timespec now) {   // the gate's work, the platform aside (the unit tests call it)
     int c = (param >> 10) & 31;
-    if (!sead_rate_on()) {   // off: the game's own 60 / interval, and the controller free to switch intervals again
+    if (!sead_rate_on()) {   // off: the game's own 60 / interval (no measured rate), at interval 1 where the host presents on its own tick (sead_pin_wanted)
         g_sr.last = (struct timespec){0}; g_sr.debt = 0;
-        if (c <= 28 && r[c]) sead_pin(r[c], 0);
+        if (c <= 28 && r[c]) sead_pin(r[c], sead_pin_wanted(0));
         return;
     }
     sead_rate_at(r, param, now);
-    static int display = -1;
-    if (display < 0) { const char *m = getenv("DM_PRESENT_INTERVAL"); display = m ? !strcmp(m, "display") : DM_GAME_PRESENT_DISPLAY; }
-    if (g_sr.ctl) sead_pin(g_sr.ctl, display && dm_fps_target() == 0);
+    if (g_sr.ctl) sead_pin(g_sr.ctl, sead_pin_wanted(1));
 }
 static void sead_rate(uint64_t *r, int param) {
     if (!PLAT_ANDROID) return;   // Android only: elsewhere the game keeps its own division
@@ -494,10 +516,13 @@ __attribute__((constructor)) static void sead_rate_attach(void) { gate_obs_set(O
 // interval 1 and 3 alike), so its longest interval (+0x04) is held at 1 and the controller never switches; the game's own longest comes back with a cap that needs it.
 // Only where presentation follows the host's tick (DM_PRESENT_INTERVAL=display, the launcher's frame limit): where the interval paces the presents, interval 1 would trade a
 // steady 30 for an uneven rate. The controller is the one the gate saw (sead_rate). DM_FPS_PIN=0 off
+#ifndef DM_TEST_PIN
+#define DM_TEST_PIN 0
+#endif
 static int32_t g_pin_orig;
 static void sead_pin(uint64_t ctl, int on) {
     static int en = -1, nlog;
-    if (en < 0) { const char *e = getenv("DM_FPS_PIN"); en = PLAT_ANDROID && (!e || atoi(e) != 0); }   // Android only, like the rest of this pacing
+    if (en < 0) { const char *e = getenv("DM_FPS_PIN"); en = (PLAT_ANDROID || DM_TEST_PIN) && (!e || atoi(e) != 0); }   // Android only, like the rest of this pacing (DM_TEST_PIN: the unit tests run the pin on the Mac)
     int32_t v[2]; if (!rd(ctl, v, sizeof v) || v[0] < 1 || v[1] < 1 || v[1] > 8) return;   // +0 shortest, +4 longest interval
     int32_t *p = (int32_t *)(uintptr_t)(ctl + 4);
     if (on && en) {
@@ -691,7 +716,13 @@ void dm_fps_lock_tick(void) {
         if (!first) for (int r = 0; r < NROWS; r++) nlog[r] = over[r] = 0;
     }
     for (int r = 0; r < nrow; r++) if (rows[r]->kind == STEPS_I32) steps_tick(rows[r], r, target, src);   // every frame: the frame limit counts too, without a cap
-    if (!target) return;   // no cap (the decoupling and the pin run in sead_rate, the controller's own gate)
+    if (!target) {   // no cap: the decoupling and the pin run in sead_rate, the controller's own gate
+        // Without that gate in the pack (a pack the rewriter made before the profile opted in, or by a build that did not find the site) nothing else holds the pin, and the
+        // controller flipped 1 <-> 2 under the host's tick: the 2x speed phases of #207 again. The floor row names the same controller, so the pin is held from here
+        // with decoupling off (it cannot be on without the gate)
+        if (!gate_obs_present(OBS_SEAD_RATE)) for (int r = 0; r < nrow; r++) if (rows[r]->kind == MIN_VSYNCS_I32) { uint64_t obj = row_obj(rows[r]); if (obj) sead_pin(obj + rows[r]->field, sead_pin_wanted(0)); }
+        return;
+    }
     // The cap at start (DM_FPS_TARGET: the Android panel's saved cap, env.txt; or the profile) may be one this game cannot hold: 15 on Donkey Kong Bananza, whose controller goes to
     // 3 vsyncs at most. Once every floor's maximum is known, such a cap becomes 0, the game's own, so the front end and presentation show what the game really does
     if (start_cap) {

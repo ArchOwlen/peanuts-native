@@ -4,7 +4,7 @@ import android.content.Context;
 import android.util.Log;
 
 /**
- * The game sheet's Build button → agent C's pipeline (dev.peanuts.build.BuildPipeline: import the NSP/XCI into a .nup, add it to upstream's list and Prepare it,
+ * The game sheet's Build button → the build pipeline (dev.peanuts.build.BuildPipeline: import the NSP/XCI into a .nup, add it to upstream's list and Prepare it,
  * install the companion). Found through reflection: dev.peanuts.build.BuildPipeline implementing this interface with a public no-arg constructor (HOOKS.md); without
  * it the stub ends the build at once with "not available", so the sheet works before the pipeline lands.
  */
@@ -31,7 +31,7 @@ public interface BuildPort {
             try {
                 Class<?> k = Class.forName(PIPELINE_CLASS);
                 if (BuildPort.class.isAssignableFrom(k)) return (BuildPort) k.getDeclaredConstructor().newInstance();
-                return new Pipeline(k);   // agent C's static API: start(Context, BuildRequest, BuildListener)
+                return new Pipeline(k);   // the build pipeline's static API: start(Context, BuildRequest, BuildListener)
             } catch (Throwable t) {
                 Log.i("peanuts", "build pipeline not available: " + t);
             }

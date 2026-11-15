@@ -96,12 +96,20 @@ public:
         return true;
     }
     /// {address, size} of the guest mailbox installed by a load plan; {0,0} = none.
+    /// PNRT: set by the host once it has applied the package's load plan (peanuts_helper.cpp).
     [[nodiscard]] std::pair<u64, u64> GetDualScreenGuestMailbox() const {
-        return {0, 0};
+        return {guest_mailbox, guest_mailbox_size};
     }
     [[nodiscard]] u32 GetDualScreenGuestMailboxEpoch() const {
-        return 0;
+        return guest_mailbox_epoch;
     }
+    void SetDualScreenGuestMailbox(u64 address, u64 size, u32 epoch) {
+        guest_mailbox = address;
+        guest_mailbox_size = size;
+        guest_mailbox_epoch = epoch;
+    }
+    u64 guest_mailbox{}, guest_mailbox_size{};
+    u32 guest_mailbox_epoch{};
     /// PNRT: the game's romfs as a directory on disk ("romfs:" / "base:" assets), nullptr when
     /// the host gave none.
     [[nodiscard]] FileSys::VirtualDir RomfsRoot() const {
@@ -127,6 +135,10 @@ public:
     HID::HIDCore hid_core;
     Core::PerfStats perf_stats;
     FileSys::VirtualDir romfs_root;
+    FileSys::VirtualDir romfs_base_root; // the game's RomFS without its mods' folders ("base:"); empty: romfs_root
+    [[nodiscard]] FileSys::VirtualDir RomfsBaseRoot() const {
+        return romfs_base_root ? romfs_base_root : romfs_root;
+    }
     FileSys::VirtualDir save_root;
     FileSys::VirtualDir sysfont_root;
     u64 title_id{};

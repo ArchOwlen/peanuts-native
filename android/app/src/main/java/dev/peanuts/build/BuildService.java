@@ -185,15 +185,21 @@ public final class BuildService extends Service {
         if (r.base == null || !r.base.exists()) throw new BuildListener.Failure("The game's base file is missing" + (r.base == null ? "." : ": " + r.base), BuildListener.FILE_MISSING);
         if (r.update != null && !r.update.exists()) throw new BuildListener.Failure("The update file is missing: " + r.update, BuildListener.FILE_MISSING);
         if (!r.needsImport()) { progress("import", IMPORT_END, "Game file: " + r.base.getName()); return r.base; }
-        if (r.gameDir == null) throw new IOException("No game folder to write the .nup into (Setup).");
-        // SpaceEstimate's pre-flight (P4/AUDIT §3.2): warn-only (critique-phase1 must-fix 7 — the multiplier is uncalibrated, so it never blocks Build; a real
+        // PEANUTS: a build folder (Settings - Library - Build folder), when set, is where this title's .nup and pack both go (<build folder>/<title ID>/),
+        // instead of beside the game and in the app's own storage; PeanutsPrefs.buildGameDir validates the title ID and returns null without one set
+        File buildGameDir = dev.peanuts.PeanutsPrefs.buildGameDir(this, r.titleId);
+        if (buildGameDir == null && r.gameDir == null) throw new IOException("No game folder to write the .nup into (Setup).");
+        // SpaceEstimate's pre-flight (P4): warn-only (found in review — the multiplier is uncalibrated, so it never blocks Build; a real
         // ENOSPC further down still fails with OUT_OF_SPACE through category()). getExternalFilesDir(null), not getFilesDir(): AppStorage puts the pack there
-        // (critique-phase2a §A-3b). Importing: the pack's basis is the merged .nup's own size (importBytes again), same as the game-folder check
+        // (found in review). Importing: the pack's basis is the merged .nup's own size (importBytes again), same as the game-folder check
         List<File> inputs = r.inputs();
         long importNeed = SpaceEstimate.inputBytes(inputs);
-        String spaceWarn = SpaceEstimate.warning(importNeed, importNeed, true, r.gameDir, getExternalFilesDir(null));
+        // PEANUTS: both volumes move to the build folder when it is set (the .nup and the pack land under the same <title ID> folder there)
+        File importDest = buildGameDir != null ? buildGameDir : r.gameDir;
+        File packVolume = buildGameDir != null ? new File(buildGameDir, "pack") : getExternalFilesDir(null);
+        String spaceWarn = SpaceEstimate.warning(importNeed, importNeed, true, importDest, packVolume);
         if (spaceWarn != null) Log.w(TAG, "space: " + name + ": " + spaceWarn);
-        File dir = new File(r.gameDir, r.fileName()), out = new File(dir, r.fileName() + ".nup");
+        File dir = buildGameDir != null ? buildGameDir : new File(r.gameDir, r.fileName()), out = new File(dir, r.fileName() + ".nup");
         long newest = 0;
         for (File f : inputs) newest = Math.max(newest, f.lastModified());
         if (out.isFile() && out.length() > 0 && out.lastModified() >= newest) { progress("import", IMPORT_END, "Imported already: " + out.getName()); return out; }
@@ -250,8 +256,12 @@ public final class BuildService extends Service {
         }
         int need = RuntimeShaders.missing(jobFile);
         if (need <= 0 || !jobFile.isFile()) return pack;
-        if (!RuntimeShaders.compilesAtRunTime(this, r.titleId)) { Log.i(TAG, "runtime shaders: " + need + " missing from the pack of " + name + ", but the title compiles none at run time: nothing to capture"); return pack; }
+        boolean runtime;
+        try { runtime = RuntimeShaders.compilesAtRunTime(this, r.titleId); }
+        catch (IOException e) { Log.w(TAG, "runtime shaders: cannot tell whether " + name + " compiles shaders at run time (" + e.getMessage() + "); no capture"); return pack; }   // an APK without this title's profile: as before the detector, the build goes on
+        if (!runtime) { Log.i(TAG, "runtime shaders: " + need + " missing from the pack of " + name + ", but the title compiles none at run time: nothing to capture"); return pack; }
         Log.i(TAG, "runtime shaders: " + need + " missing from the pack of " + name + ": capturing");
+        int before = RuntimeShaders.captured(RuntimeShaders.captureDir(work));   // captures an earlier build already made
         boolean enough = new RuntimeShaders(this).capture(r.titleId, work, dump, pack, need, (pct, detail) -> progress("prepare", PREPARE_END - 5 + pct * 5 / 100, detail), () -> cancelled);
         if (cancelled) throw new IOException("Build cancelled.");
         if (!enough) {
@@ -261,7 +271,14 @@ public final class BuildService extends Service {
         }
         RuntimeShaders.rerun(work, jobFile);
         progress("prepare", IMPORT_END, "Making the pack again with the captured shaders");
-        return stepPrepare(r, dump);
+        File rebuilt = stepPrepare(r, dump);
+        int left = RuntimeShaders.missing(jobFile);
+        // Shaders still missing after the capture: when the capture made a difference (fewer missing), or its captures were already there from an earlier
+        // build, the rest are not run-time shaders (no game run makes them, as Mario Kart 8 Deluxe's 135 of another version): the pack is kept, with a log
+        // line, instead of asking for a Build again that could never get further. Only a capture that changed nothing on its first try is an error.
+        if (left > 0 && (left < need || before >= need)) { Log.w(TAG, "runtime shaders: " + left + " of " + name + "'s shaders are still missing after the capture; they are not made at run time, the pack is kept"); return rebuilt; }
+        if (left > 0) throw new IOException(name + " still lacks " + left + " shaders after the run-time capture. Some text or graphics may be missing. Tap Build again.");
+        return rebuilt;
     }
 
     /** (c) the companion beside the pack: <title ID>-work/peanuts/<Name>/ */
@@ -310,7 +327,7 @@ public final class BuildService extends Service {
     }
 
     private Notification done(boolean ok, String message) {
-        Notification.Builder b = new Notification.Builder(this, CHANNEL).setSmallIcon(ok ? android.R.drawable.stat_sys_download_done : android.R.drawable.stat_notify_error)
+        Notification.Builder b = new Notification.Builder(this, BuildPipeline.endChannel(nm, CHANNEL, !ok && cancelled)).setSmallIcon(ok ? android.R.drawable.stat_sys_download_done : android.R.drawable.stat_notify_error)
                 .setContentTitle(ok ? name + " is ready to play" : "Building " + name + " stopped").setContentText(message).setStyle(new Notification.BigTextStyle().bigText(message)).setAutoCancel(true);
         Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
         if (open != null) b.setContentIntent(PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));

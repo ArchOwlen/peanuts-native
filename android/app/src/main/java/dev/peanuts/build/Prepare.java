@@ -58,7 +58,7 @@ final class Prepare {
 
     /**
      * Runs the whole step; returns the pack folder of the ready game. Throws with a user-readable message when it cannot. consent: the player's explicit
-     * "Build anyway" on the sheet's Version row for THIS build (P1, critique-phase1 must-fix 2) — without it, a dump whose version is not one of the profile's
+     * "Build anyway" on the sheet's Version row for THIS build (P1) — without it, a dump whose version is not one of the profile's
      * builds stops and asks instead of being retried untested on its own (the old behaviour: see the otherBuild branch in run0)
      */
     File run(File dump, String titleId, boolean consent, Progress p) throws IOException {
@@ -90,7 +90,7 @@ final class Prepare {
             }
         }
         // 2. the dump. A version this app's profile does not list (otherBuild) used to be retried silently here ("Try anyway" done for the player without asking:
-        // critique-phase1 must-fix 2, the DQ3 HD-2D case — ~10 minutes lost on a build the sheet never warned about). Now it only goes on when the sheet's own
+        // found in review, the DQ3 HD-2D case — ~10 minutes lost on a build the sheet never warned about). Now it only goes on when the sheet's own
         // Version row got the player's explicit "Build anyway" for this request (consent); a resumed job that was already marked tryAnyway (anyBuild from the
         // existing job.json) still resumes as it was, since that choice was already made once
         Object r = Upstream.dumpCheck(dump, existing == null, anyBuild);
@@ -108,7 +108,7 @@ final class Prepare {
         }
         if (error != null) {
             // not a version mismatch (that already returned above): an incomplete/corrupt dump, no RomFS, the wrong title ID, a bad file name, … — a bad dump,
-            // not a missing one (critique-phase2a §A must-fix 4; this used to say FILE_MISSING and offer "pick the file again", which does not fix a bad dump)
+            // not a missing one (found in review; this used to say FILE_MISSING and offer "pick the file again", which does not fix a bad dump)
             boolean other = Boolean.TRUE.equals(Upstream.get(r, "otherBuild"));
             String detail = Upstream.str(Upstream.get(r, "detail"));
             throw new BuildListener.Failure((other ? "Untested game version: " : "Cannot prepare this dump: ") + error + (detail.isEmpty() ? "" : "\n" + detail),
@@ -123,7 +123,8 @@ final class Prepare {
             String s = Upstream.jobState(existing);
             boolean same = Upstream.jobDump(existing).getPath().equals(dumpR.getPath()) && Upstream.jobVersion(existing) == version;
             if (same && (s.equals("running") || s.equals("paused") || s.equals("failed") || s.equals("pending"))) job = existing;   // resumed where it stopped
-            else if (same && s.equals("done") && Upstream.jobPack(existing).isDirectory() && Upstream.packRead(Upstream.jobPack(existing)) != null) {
+            else if (same && s.equals("done") && Upstream.jobPack(existing).isDirectory() && Upstream.packRead(Upstream.jobPack(existing)) != null
+                    && current(Upstream.jobPack(existing), dumpR, id) && !noOrig(Upstream.jobPack(existing))) {   // (a pack an app update left behind is redone below: step 3; so is one without main.orig.bin)
                 // already prepared by an earlier run: the game only needs listing
                 p.on(100, "Already prepared");
                 Upstream.addGame(c, existing);
@@ -139,7 +140,12 @@ final class Prepare {
             if (pack != null && !Boolean.TRUE.equals(Upstream.get(pack, "simulated")) && id.equals(Upstream.str(Upstream.get(pack, "titleId")))) {
                 String blocking = Upstream.packBlocking(c, pack, dumpR);
                 String shaders = Upstream.packShaders(packDir, id);
-                boolean code = blocking != null, sh = shaders != null;
+                // The code is redone when it cannot be started (blocking) and also when it is another rewriter's: an app update with a changed rewriter or
+                // profile patch (PackCheck.code, the check Home's own Prepare makes: Metroid Dread's 60 fps patch never reached a pack built before it, 2026-11-14)
+                // ...and when main was rewritten before the rewriter kept the file's own bytes of what it changed (main.orig.bin, which a companion package's
+                // module reads: dm/peanuts/peanuts.c rt_orig). Such a pack still counts as up to date, so nothing rebuilds on its own; a build the user starts
+                // gives it the file (Octopath Traveler 0, 2026-11-14: Build again left its code as it was)
+                boolean code = blocking != null || noOrig(packDir) || Boolean.FALSE.equals(Upstream.packCode(c, pack, dumpR)), sh = shaders != null;
                 job = Upstream.jobAdopt(r, packDir, code, sh);
                 Upstream.jobSave(job);
                 Upstream.jobRemember(c, Upstream.jobFile(job));
@@ -159,13 +165,8 @@ final class Prepare {
         if (anyBuild && !Upstream.jobTryAnyway(job)) { Upstream.jobTryAnyway(job, true); Upstream.jobSave(job); }
         File file = Upstream.jobFile(job);
         boolean relaxed = false;   // one restart with the checks relaxed when the job fails for something Try anyway skips
-        // The packer's tools read <work>/ondevice/env.txt: four translator calls at once instead of upstream's two (on the Thor's eight cores the four workers sit on the
-        // fast cores at ~57 % each and the shader rate doubles, 8.5 → 18 a second; the split's Python feeder is then the limit). A line the file already has stays
-        try {
-            File env = new File(file.getParentFile(), "env.txt");
-            String text = env.isFile() ? new String(Files.readAllBytes(env.toPath()), StandardCharsets.UTF_8) : "";
-            if (!text.contains("DMSH_VK_XLATE_J=")) Files.write(env.toPath(), RuntimeShaders.withLine(text, "DMSH_VK_XLATE_J=4").getBytes(StandardCharsets.UTF_8));
-        } catch (IOException e) { Log.w(TAG, "prepare: env.txt " + e); }
+        // The translator calls at once (4 on a phone with 14 GB or more, 2 on an 8 GB one) are set by PackService from the phone's memory (BuildMemory), not by a line here:
+        // a fixed 4 in env.txt ran an 8 GB phone out of memory (Fire Emblem Engage on a Thor Base, issue #10). A line env.txt has still applies, up to that count
         // 4. the service, as the panel starts it
         bind();
         try {
@@ -231,6 +232,125 @@ final class Prepare {
                 throw new BuildListener.Failure("The packer stopped reporting progress. Resume from the game's card on the Home screen.", BuildListener.STALLED);
         }
         throw new BuildListener.Failure("Build cancelled. The job is saved: resume from the game's card on the Home screen.", BuildListener.CANCELLED);
+    }
+
+    /**
+     * A modded variant build (DESIGN-MODS.md "Code injection"/"ExeFS binary patch", ModdedBuild/ModBuild): the same dump/update as the normal
+     * build (no re-import), but its own work folder (workDir) and pack folder (packDir, never the normal build's own — AppStorage.pack(c,
+     * variantId) or a build-folder sibling), the rewrite step's extra argv (modArgs, {@code dev.peanuts.build.ModdedBuild.rewriteArgvJoined}),
+     * and the normal pack's shader library reused as-is (normalPackShaders, never re-translated — code mods never change shaders). Unlike
+     * {@link #run0}, this never adopts or resumes the *normal* job: workDir/packDir are the variant's own, so there is nothing of the normal
+     * build's to adopt, and a resume only ever means "this exact variant's own job is still going".
+     */
+    File runModded(File dump, String titleId, File workDir, File packDir, String modArgs, File normalPackShaders, Progress p) throws IOException {
+        try {
+            return runModded0(dump, titleId, workDir, packDir, modArgs, normalPackShaders, p);
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "modded prepare: upstream reflection", e);
+            throw new IOException("This build of the app has no on-device packer the build service knows (" + e.getMessage() + ").");
+        } finally {
+            unbind();
+        }
+    }
+
+    /** Whether the pack fits this APK as it is: startable code of this rewriter (PackCheck.blocking / code) and this APK's shader library (PackCheck.shaders) */
+    /** A pack whose main was rewritten before the rewriter kept the file's own bytes of what it changed (main.orig.bin) */
+    private static boolean noOrig(File packDir) { return new File(packDir, "main.changed.tsv").isFile() && !new File(packDir, "main.orig.bin").isFile(); }
+
+    private boolean current(File packDir, File dump, String id) {
+        try {
+            Object pack = Upstream.packRead(packDir);
+            return pack != null && Upstream.packBlocking(c, pack, dump) == null && !Boolean.FALSE.equals(Upstream.packCode(c, pack, dump)) && Upstream.packShaders(packDir, id) == null;
+        } catch (ReflectiveOperationException | RuntimeException e) { return true; }   // cannot judge: as before
+    }
+
+    private File runModded0(File dump, String titleId, File workDir, File packDir, String modArgs, File normalPackShaders, Progress p)
+            throws IOException, ReflectiveOperationException {
+        p.on(0, "Checking " + dump.getName());
+        String id = titleId;
+        try { id = Upstream.titleIdOf(dump); } catch (ReflectiveOperationException | RuntimeException e) { /* DumpCheck says what is wrong */ }
+        if (id == null || id.isEmpty()) id = titleId;
+        Object r = Upstream.dumpCheck(dump, true, true);   // true/true: the normal build already checked the version; a modded rebuild of the same dump never asks again
+        String error = (String) Upstream.get(r, "error");
+        if (error != null) throw new BuildListener.Failure("Cannot prepare this dump for a modded build: " + error, BuildListener.INVALID_DUMP);
+        String rid = Upstream.str(Upstream.get(r, "titleId"));
+        if (!rid.isEmpty()) id = rid;
+        // The variant's own work folder, not DumpCheck's fixed <dump>/../<id>-work convention (Job.create reads r.work directly)
+        Upstream.set(r, "work", workDir);
+        File jf = Upstream.jobFileOf(workDir);
+        Object job = null;
+        if (jf.isFile()) {
+            try {
+                Object existing = Upstream.jobRead(jf);
+                String s = Upstream.jobState(existing);
+                // resume this exact variant's own job where it stopped. A finished one is not the answer to Build / Rebuild with mods: the mod's files or the
+                // app's tools may have changed since (the variant's id is only the mods' names, versions and order), so a new job runs, and its rewrite step
+                // keeps every module whose key still fits (pack_android.py rewrite: "unchanged, kept") and redoes the others. Returning the finished pack here
+                // left a pack an earlier app built wrong as it was, whatever was tapped.
+                // Nor is a stopped one whose extra arguments are not this build's (the mod's patch folders changed, or an update of the app writes them
+                // another way): resumed, it went on with the folders and the module list it was created with
+                String had = Upstream.str(Upstream.call(existing.getClass(), existing, "modArgs", new Class<?>[0]));
+                if (!s.equals("done") && had.equals(modArgs == null ? "" : modArgs)) job = existing;
+            } catch (ReflectiveOperationException | RuntimeException e) { /* damaged: a fresh job replaces it */ }
+        }
+        if (job == null) {
+            job = Upstream.jobCreate(r, packDir);
+            Upstream.jobModArgs(job, modArgs == null ? "" : modArgs);
+            Upstream.jobReuseShaders(job, normalPackShaders);
+            Upstream.jobSave(job);
+            // Not Job.remember: Home's on-device panel follows the remembered job and puts a finished one's pack into the game list by title ID
+            // (Ondevice.Panel.addGame), so a remembered variant took over the game's own card (Pokémon Brilliant Diamond's Play pointed at the modded
+            // pack, 2026-11-13). This loop polls the job file itself and PackService gets it in the intent
+        }
+        File file = Upstream.jobFile(job);
+        bind();
+        try {
+            c.startForegroundService(Upstream.packStart(c, file));
+        } catch (RuntimeException e) {
+            Log.w(TAG, "PackService start refused (modded): " + e);
+            throw new BuildListener.Failure("Android did not let the packer start in the background. The modded build is saved; try again from the game's Mods section (hold the cover, Game tab).", BuildListener.CANCELLED);
+        }
+        p.on(1, STEP_TEXT[0]);
+        long startedAt = SystemClock.elapsedRealtime(), lastChange = startedAt;
+        String lastJson = null;
+        while (!cancelled) {
+            SystemClock.sleep(1000);
+            String json = read(file);
+            String fs = fromService;
+            if (fs != null && fromServiceAt > lastChange) json = fs;
+            if (json == null) {
+                if (SystemClock.elapsedRealtime() - startedAt > 30000) throw new BuildListener.Failure("The modded build's job file went missing: " + file, BuildListener.OTHER);
+                continue;
+            }
+            if (!json.equals(lastJson)) { lastJson = json; lastChange = SystemClock.elapsedRealtime(); }
+            JSONObject o;
+            try { o = new JSONObject(json); } catch (org.json.JSONException e) { continue; }
+            String state = o.optString("state"), reason = o.optString("reason"), step = o.optString("step");
+            int si = Math.max(0, java.util.Arrays.asList(STEPS).indexOf(step));
+            JSONObject st = o.optJSONObject("steps") != null ? o.optJSONObject("steps").optJSONObject(STEPS[si]) : null;
+            long done = st == null ? 0 : st.optLong("done"), total = st == null ? 0 : st.optLong("total");
+            String stage = st == null ? "" : st.optString("stage");
+            if (state.equals("done")) {
+                p.on(100, "Modded build finished");
+                return (File) Upstream.call(job.getClass(), job, "pack", new Class<?>[0]);
+            }
+            if (state.equals("failed")) {
+                throw new BuildListener.Failure("Building with mods failed at " + STEP_TEXT[si].toLowerCase(Locale.ROOT) + (o.optString("error").isEmpty() ? "." : ": " + o.optString("error"))
+                        + "\nRetry from the game's Mods section (hold the cover, Game tab).", BuildListener.TOOL_STOPPED);
+            }
+            int pct = pct(si, done, total);
+            if (state.equals("paused")) {
+                if (reason.equals("user") || reason.equals("timeout") || reason.equals("refused") || reason.equals("apk"))
+                    throw new BuildListener.Failure("Building with mods paused (" + reasonText(reason) + "). Retry from the game's Mods section (hold the cover, Game tab).", BuildListener.CANCELLED);
+                p.on(pct, "Paused: " + reasonText(reason) + ". " + stepText(si, done, total, stage));
+                lastChange = SystemClock.elapsedRealtime();
+                continue;
+            }
+            p.on(pct, stepText(si, done, total, stage));
+            if (SystemClock.elapsedRealtime() - lastChange > STALL_MS && !(link != null && link.alive))
+                throw new BuildListener.Failure("The packer stopped reporting progress. Retry from the game's Mods section (hold the cover, Game tab).", BuildListener.STALLED);
+        }
+        throw new BuildListener.Failure("Build cancelled.", BuildListener.CANCELLED);
     }
 
     private static int pct(int si, long done, long total) {

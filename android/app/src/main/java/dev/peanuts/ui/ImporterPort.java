@@ -5,7 +5,7 @@ import android.util.Log;
 import java.lang.reflect.Method;
 
 /**
- * The library's face of the importer (agent A's dev.peanuts.importer.Native: nximport.h through JNI). Reached through reflection, so this package compiles and runs
+ * The library's face of the importer (dev.peanuts.importer.Native: nximport.h through JNI). Reached through reflection, so this package compiles and runs
  * before the importer lands: without the class every call answers "not available" and the library shows NSP/XCI files by their file names, without icons.
  * <p>
  * Native's static methods, as DESIGN-library.md lists them: int keys(String prodKeysPath); String probe(String file) → a JSON array of {title_id, app_id, kind

@@ -297,15 +297,43 @@ static int player_of(uint32_t id) {   // the reported player on npad id; -1 when
     if (id == connected_id()) return 0;
     return id > 0 && id < DM_PLAYERS && reported((int)id) ? (int)id : -1;
 }
-static uint32_t style_for_player(uint32_t id, int p) { return p < 0 ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }
+// PEANUTS: no npad has a style until the game has set its supported styles (SetSupportedNpadStyleSet), as the hid service keeps an application's npads empty until
+// then. Pokemon Sword asks for No1's style between InitializeNpad and that call (main+0x65adb4 -> main+0x65af30): with a style there it made its four vibration
+// objects about 4,300 allocations early, and every object of its root heap after them lay 0x50 to 0xF0 bytes off where the console has it (a companion's
+// fixed addresses then read nothing: no live party). A game that reads a controller's state without ever setting its styles gets them from that read on
+// (styles_now), so no game is left without input. DM_HID_STYLE_EARLY=1: a style from the start, as before
+static _Atomic int g_styles_set = -1;
+static int styles_set(void) {
+    int v = atomic_load(&g_styles_set);
+    if (v < 0) {   // the first query reads the switch; a thread that set the styles meanwhile (styles_now) is not overwritten
+        const char *e = getenv("DM_HID_STYLE_EARLY"); int want = e && atoi(e) != 0;
+        if (atomic_compare_exchange_strong(&g_styles_set, &v, want)) v = want;
+    }
+    return v;
+}
+static uint32_t style_for_player(uint32_t id, int p) { return p < 0 || !styles_set() ? 0 : id == NPAD_HANDHELD ? STYLE_HANDHELD : STYLE_FULLKEY; }   // PEANUTS: styles_set
 static uint32_t style_of(uint32_t id) { return style_for_player(id, player_of(id)); }
 static int32_t ax(uint64_t v, int i) { return (int16_t)(v >> (16 * i)); }
 static int32_t pick(int32_t a, int32_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; }   // whichever of two sources is deflected more
 
 // Style update events bound per npad (BindNpadStyleSetUpdateEvent, No1..No8 by id): signalled when a player's controller comes or goes, as the hid
 // service does. The front end reports from its own thread, where an event cannot be bound, so only a bound one is signalled (one the game destroyed is not bound any more)
-static void *_Atomic g_style_ev[DM_PLAYERS];
-static void style_changed(uint32_t id) { void *ev = id < DM_PLAYERS ? atomic_load(&g_style_ev[id]) : NULL; if (ev) hle_signal_bound_system_event(ev); }
+// PEANUTS: the Handheld npad's event is kept too (slot DM_PLAYERS): it was signalled only at its binding, which with no style before the supported styles are set
+// (styles_set) is too early for a game that binds first, and it has to fire at a change of operation mode
+static void *_Atomic g_style_ev[DM_PLAYERS + 1];
+static int style_ev_slot(uint32_t id) { return id < DM_PLAYERS ? (int)id : id == NPAD_HANDHELD ? DM_PLAYERS : -1; }
+static void style_changed(uint32_t id) { int k = style_ev_slot(id); void *ev = k >= 0 ? atomic_load(&g_style_ev[k]) : NULL; if (ev) hle_signal_bound_system_event(ev); }
+// PEANUTS: the operation mode changed while the game runs (hle_oe.c oe_state_set: the in-game panel's Console mode): player 1 is on the Handheld npad in handheld mode and on
+// No1 docked (connected_id), so the styles of No1 and Handheld change (players 2 to 8 keep their npads); a game that waits for the style event (Link's Awakening) would
+// otherwise keep reading the npad that went away
+void dm_hid_opmode_changed(void) { style_changed(NPAD_NO1); style_changed(NPAD_HANDHELD); }
+// PEANUTS: the controllers appear (styles_set above): the style events bound before fire, as on a connect. why: what lifted it, for the log
+static void styles_now(const char *why) {
+    if (styles_set() || atomic_exchange(&g_styles_set, 1) == 1) return;   // once, whichever thread comes first
+    LOG("hid: controllers reported from now on (%s)", why);
+    for (uint32_t id = 0; id < DM_PLAYERS; id++) if (style_of(id)) style_changed(id);
+    if (style_of(NPAD_HANDHELD)) style_changed(NPAD_HANDHELD);
+}
 static void note_merged(void) {   // logs the players whose npad the game does not support, when that changes
     static _Atomic uint32_t last; uint32_t m = unsupported_players(), one = (uint32_t)one_player();
     if (atomic_exchange(&last, m | one << 31) == (m | one << 31)) return;
@@ -429,6 +457,7 @@ static void rec_start(void) {
 }
 
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
+    styles_now("[RED] the game reads a controller's state without having set its supported styles");   // PEANUTS: a no-op once they are set
     memset(s, 0, sizeof *s);
     s->sampling = atomic_fetch_add(&g_sampling, 1) + 1;
     int pl = player_of(id);
@@ -513,7 +542,9 @@ HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "supported controller ids; 
 }
 static uint32_t g_styles_supported = 0xffffffffu;
 HLE_FORCE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "supported controller styles; the host records them and picks the reported style from them", void, h_hid_SetStyles, uint32_t styles) {
-    if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles; }
+    if (styles != g_styles_supported) LOG("hid supported controller styles %#x", styles); g_styles_supported = styles;
+    if (styles) styles_now("the game set its supported styles");   // PEANUTS
+}
 HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "controller style query; follows DM_OPMODE", uint32_t, h_hid_GetStyle, const uint32_t *id) { return style_of(*id); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", "full-key controller states", int, h_hid_StatesFullKey, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_FULLKEY); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "handheld controller states", int, h_hid_StatesHandheld, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_HANDHELD); }
@@ -808,7 +839,7 @@ HLE_FORCE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", "merge single Joy-Cons; 
 HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "controller style update event: bound, signaled once for a connected controller and on connect / disconnect", void, h_hid_BindStyleEv,
           const uint32_t *id, void *ev, int clear) {
     hle_bind_system_event(ev, clear);
-    if (*id < DM_PLAYERS) atomic_store(&g_style_ev[*id], ev);
+    { int k = style_ev_slot(*id); if (k >= 0) atomic_store(&g_style_ev[k], ev); }   // PEANUTS: Handheld's too (style_ev_slot)
     if (style_of(*id)) hle_signal_system_event(ev);
 }
 // The Switch's player LEDs by npad (No1 1, No2 1-2, No3 1-3, No4 1-4, No5 1+4, No6 1+3, No7 1+3+4, No8 2+3; bit 0 = LED 1); Handheld and Other light LED 1 as before
